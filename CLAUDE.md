@@ -2,9 +2,28 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## 当前状态
+## 命令
 
-**尚无代码、构建系统或依赖。** 搭好脚手架后回来补充「构建与测试命令」一节。
+包管理器是 **pnpm**。
+
+```bash
+pnpm dev          # 开发服务器 :5173
+pnpm build        # tsc -b && vite build
+pnpm typecheck    # 只做类型检查
+pnpm test         # vitest 单跑一次
+pnpm test:watch   # vitest watch
+```
+
+跑单个测试文件:`pnpm exec vitest run src/core/math.test.ts`
+跑单个用例:`pnpm exec vitest run -t "旋转差值走最短路径"`
+
+## 当前进度
+
+实现顺序第 1 步完成:`core/` 的变换数学与骨骼层级、PixiJS 渲染层、编辑器状态与撤销重做。
+可以点击选中骨骼、拖动旋转、Ctrl+Z 撤销。
+
+**尚未做:** 图集与切图导入、slot/attachment 的实际渲染(`RenderCommand` 类型已定义但还没有生产者)、时间轴。
+`BoneData.inheritRotation / inheritScale` 的非默认值会在 `Skeleton` 构造时抛错,不是静默忽略。
 
 ## 先读这些
 
