@@ -19,11 +19,20 @@ pnpm test:watch   # vitest watch
 
 ## 当前进度
 
-实现顺序第 1 步完成:`core/` 的变换数学与骨骼层级、PixiJS 渲染层、编辑器状态与撤销重做。
-可以点击选中骨骼、拖动旋转、Ctrl+Z 撤销。
+**已完成第 1 步和第 3 步**(第 2 步的切图导入跳过了,时间轴不依赖它):
 
-**尚未做:** 图集与切图导入、slot/attachment 的实际渲染(`RenderCommand` 类型已定义但还没有生产者)、时间轴。
-`BoneData.inheritRotation / inheritScale` 的非默认值会在 `Skeleton` 构造时抛错,不是静默忽略。
+- `core/` 变换数学、骨骼层级、动画求值(线性/stepped/贝塞尔曲线)
+- PixiJS 渲染层、撤销重做(不可变快照 + merge key 合并)
+- 时间轴:播放、擦洗、打关键帧、删关键帧
+
+编辑器有两个模式,**同样是拖骨骼,行为不同**:
+`setup` 改绑定姿势,`animate` 在当前时刻打关键帧(值 = 绝对角 − 绑定姿势角)。
+
+**尚未做:** 图集与切图导入、slot/attachment 的实际渲染(`RenderCommand` 类型已定义但还没有生产者)、
+曲线编辑器 UI(贝塞尔在 `core/` 里已实现,但没有编辑界面)、IK、网格形变、任何导出器。
+
+**已知限制(刻意抛错而非静默忽略):**
+`BoneData.inheritRotation / inheritScale` 的非默认值会在 `Skeleton` 构造时抛错。
 
 ## 先读这些
 
