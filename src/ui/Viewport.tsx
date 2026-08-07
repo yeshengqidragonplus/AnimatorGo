@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef } from 'react'
 import { Application, Container, Graphics, Point } from 'pixi.js'
 import { RAD_TO_DEG, Skeleton } from '@core/index.ts'
+import { applyAnimation } from '@core/animation.ts'
 import { SkeletonRenderer } from '@render/pixi/SkeletonRenderer.ts'
 import { useEditorStore } from '@store/editorStore.ts'
 import { pickBone } from './hitTest.ts'
@@ -19,7 +20,7 @@ function buildGrid(): Graphics {
   }
   g.stroke({ width: 1, color: GRID_COLOR })
 
-  // 原点轴线。注意 Y 向上 —— 世界坐标系约定见 docs/FORMAT.md
+  // 原点轴线。注意 Y 向上 —— 坐标系约定见 docs/FORMAT.md
   g.moveTo(-GRID_EXTENT, 0).lineTo(GRID_EXTENT, 0)
   g.moveTo(0, -GRID_EXTENT).lineTo(0, GRID_EXTENT)
   g.stroke({ width: 1.5, color: AXIS_COLOR })
@@ -33,15 +34,14 @@ export function Viewport() {
   const rendererRef = useRef<SkeletonRenderer | null>(null)
 
   const doc = useEditorStore((s) => s.doc)
+  const mode = useEditorStore((s) => s.mode)
+  const time = useEditorStore((s) => s.time)
+  const playing = useEditorStore((s) => s.playing)
+  const currentAnimation = useEditorStore((s) => s.currentAnimation)
   const selectedBone = useEditorStore((s) => s.selectedBone)
 
-  const skeleton = useMemo(() => {
-    const s = new Skeleton(doc.skeleton)
-    s.updateWorldTransform()
-    return s
-  }, [doc.skeleton])
-
-  // 事件回调里要用到最新的骨架和选中项,用 ref 避免重新绑定监听器
+  // 骨架实例只在骨骼数据变化时重建;播放头移动只是重新摆姿势,不重建
+  const skeleton = useMemo(() => new Skeleton(doc.skeleton), [doc.skeleton])
   const skeletonRef = useRef(skeleton)
   skeletonRef.current = skeleton
 
@@ -62,15 +62,14 @@ export function Viewport() {
         resizeTo: host,
       })
       .then(() => {
-        // StrictMode 下 effect 会跑两次,第二次挂载前要确保第一次的实例被丢弃
+        // StrictMode 下 effect 跑两次,第二次挂载前要丢弃第一次的实例
         if (disposed) {
           app.destroy(true, { children: true })
           return
         }
 
         const world = new Container()
-        // Y 向上:翻转 Y 轴,并把原点放到视口中心
-        world.scale.set(1, -1)
+        world.scale.set(1, -1) // Y 向上
         world.addChild(buildGrid())
 
         const renderer = new SkeletonRenderer()
@@ -86,8 +85,6 @@ export function Viewport() {
         const centre = () => world.position.set(app.screen.width / 2, app.screen.height * 0.72)
         centre()
         app.renderer.on('resize', centre)
-
-        renderer.draw(skeletonRef.current, useEditorStore.getState().selectedBone)
       })
 
     return () => {
@@ -101,18 +98,49 @@ export function Viewport() {
     }
   }, [])
 
-  // ── 骨架或选中项变化时重画 ─────────────────────────────────────────────────
+  // ── 摆姿势 + 重画 ──────────────────────────────────────────────────────────
   useEffect(() => {
+    const animation = doc.animations.get(currentAnimation)
+
+    if (mode === 'animate' && animation !== undefined) {
+      applyAnimation(skeleton, animation, time)
+    } else {
+      skeleton.setToSetupPose()
+    }
+    skeleton.updateWorldTransform()
+
     rendererRef.current?.draw(skeleton, selectedBone)
-  }, [skeleton, selectedBone])
+  }, [skeleton, doc.animations, currentAnimation, mode, time, selectedBone])
+
+  // ── 播放 ───────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!playing) return
+
+    const animation = doc.animations.get(currentAnimation)
+    const duration = animation?.duration ?? 0
+    if (duration <= 0) return
+
+    let raf = 0
+    let last = performance.now()
+
+    const tick = (now: number) => {
+      const dt = (now - last) / 1000
+      last = now
+      const { time: t, setTime } = useEditorStore.getState()
+      setTime((t + dt) % duration) // 循环播放
+      raf = requestAnimationFrame(tick)
+    }
+
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+  }, [playing, doc.animations, currentAnimation])
 
   // ── 输入:点击选中,拖动旋转 ───────────────────────────────────────────────
   useEffect(() => {
     const host = hostRef.current
     if (host === null) return
 
-    // 每次手势一个唯一 key —— 整个拖动合并成一条撤销记录,松手后失效。
-    // 见 editorStore.ts 的 merge key 说明。
+    // 每次手势一个唯一 key —— 整段拖动合并成一条撤销记录,松手后失效
     let dragBone: string | null = null
     let dragKey = ''
     let gestureId = 0
@@ -136,7 +164,8 @@ export function Viewport() {
         dragBone = hit
         gestureId += 1
         dragKey = `rotate:${hit}:${gestureId}`
-        // 指针已经失效时会抛 NotFoundError,拖动本身不依赖捕获,忽略即可
+        useEditorStore.getState().setPlaying(false) // 开始编辑就停止播放
+        // 指针已失效时会抛 NotFoundError,拖动本身不依赖捕获
         try {
           host.setPointerCapture(e.pointerId)
         } catch {
@@ -153,11 +182,11 @@ export function Viewport() {
       const bone = skeletonRef.current.getBone(dragBone)
       if (bone === undefined) return
 
-      // 鼠标在世界空间,但要写回的是局部旋转 —— 换算到父空间再取角度
+      // 鼠标在世界空间,写回的是局部旋转 —— 换算到父空间再取角度
       const [mx, my] = bone.worldToParent(p.x, p.y)
       const rotation = Math.atan2(my - bone.y, mx - bone.x) * RAD_TO_DEG
 
-      useEditorStore.getState().setBonePose(dragBone, { rotation }, dragKey)
+      useEditorStore.getState().setBoneRotation(dragBone, rotation, dragKey)
     }
 
     const endDrag = (e: PointerEvent) => {

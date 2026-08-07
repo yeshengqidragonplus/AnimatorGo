@@ -1,3 +1,4 @@
+import type { AnimationData, BoneTimelines, RotateKey } from './animation.ts'
 import type { BoneData, SkeletonData } from './types.ts'
 
 /** 省掉在 fixture 里重复写默认值 */
@@ -53,4 +54,35 @@ export const SAMPLE_SKELETON: SkeletonData = {
   slots: [],
   skins: new Map(),
   defaultSkin: 'default',
+}
+
+/** [时间, 值] 简写。值是**相对绑定姿势的偏移**,不是绝对角度。 */
+function rot(...pairs: [number, number][]): BoneTimelines {
+  const keys: RotateKey[] = pairs.map(([time, value]) => ({ time, value }))
+  return { rotate: keys }
+}
+
+/**
+ * 手写的走路循环,1 秒一圈。和 SAMPLE_SKELETON 一样是临时的,
+ * 时间轴编辑做好之后就该由用户自己 K 帧了。
+ *
+ * 两条腿差半个周期,手臂和对侧腿同相 —— 这样看起来才像走路。
+ */
+export const SAMPLE_WALK: AnimationData = {
+  name: 'walk',
+  duration: 1,
+  bones: new Map([
+    ['torso', rot([0, 0], [0.25, 3], [0.5, 0], [0.75, -3], [1, 0])],
+
+    ['thigh_l', rot([0, -22], [0.25, 0], [0.5, 22], [0.75, 0], [1, -22])],
+    ['shin_l', rot([0, 4], [0.25, -28], [0.5, 0], [0.75, -12], [1, 4])],
+    ['thigh_r', rot([0, 22], [0.25, 0], [0.5, -22], [0.75, 0], [1, 22])],
+    ['shin_r', rot([0, 0], [0.25, -12], [0.5, 4], [0.75, -28], [1, 0])],
+
+    // 手臂与同侧腿反相
+    ['arm_l', rot([0, 18], [0.5, -18], [1, 18])],
+    ['forearm_l', rot([0, -8], [0.5, -20], [1, -8])],
+    ['arm_r', rot([0, -18], [0.5, 18], [1, -18])],
+    ['forearm_r', rot([0, 20], [0.5, 8], [1, 20])],
+  ]),
 }

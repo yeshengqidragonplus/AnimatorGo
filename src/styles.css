@@ -144,6 +144,11 @@ body {
   color: var(--accent);
 }
 
+/* 动画驱动的骨骼 —— 和纯绑定姿势区分开 */
+.bone-rot.is-animated {
+  color: #6fc3a0;
+}
+
 /* ── 视口 ───────────────────────────────────────────────────────────────── */
 
 .viewport {
@@ -156,4 +161,218 @@ body {
 
 .viewport canvas {
   display: block;
+}
+
+/* ── 模式切换 ───────────────────────────────────────────────────────────── */
+
+.mode-switch {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-right: 4px;
+}
+
+.mode-switch button {
+  border: none;
+  border-radius: 0;
+  background: #1a1f2a;
+  padding: 4px 10px;
+}
+
+.mode-switch button.is-active {
+  background: var(--accent);
+  color: #1a1300;
+  font-weight: 600;
+}
+
+.mode-switch button.is-active:hover {
+  background: var(--accent);
+}
+
+/* ── 时间轴 ─────────────────────────────────────────────────────────────── */
+
+.timeline {
+  flex-shrink: 0;
+  height: 210px;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+
+.timeline-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  height: 34px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.timeline-controls button {
+  background: #1e2430;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  width: 28px;
+  height: 22px;
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.timeline-controls button:hover:not(:disabled) {
+  background: #272f3e;
+}
+
+.timeline-controls button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.play-btn {
+  color: var(--accent) !important;
+}
+
+.time-readout {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+
+.anim-name {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.timeline-note {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.timeline-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.track-labels {
+  width: 110px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+}
+
+.track-label {
+  display: block;
+  width: 100%;
+  height: 22px;
+  padding: 0 10px;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.track-label:hover {
+  color: var(--text);
+}
+
+.track-label.is-selected {
+  color: var(--accent);
+}
+
+.ruler-spacer {
+  height: 24px;
+  cursor: default;
+  border-bottom: 1px solid var(--border);
+}
+
+.track-area {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.ruler {
+  position: relative;
+  height: 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+.tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid var(--border);
+}
+
+.tick span {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  font-size: 10px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.track {
+  position: relative;
+  height: 22px;
+  border-bottom: 1px solid #1b202b;
+}
+
+.track.is-selected {
+  background: #1c222e;
+}
+
+.keyframe {
+  position: absolute;
+  top: 50%;
+  width: 9px;
+  height: 9px;
+  margin: -5px 0 0 -5px;
+  padding: 0;
+  background: #7d879b;
+  border: 1px solid #0f1218;
+  border-radius: 1px;
+  transform: rotate(45deg);
+  cursor: pointer;
+}
+
+.keyframe:hover {
+  background: var(--text);
+}
+
+.track.is-selected .keyframe {
+  background: var(--accent);
+}
+
+.playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: #ff5f56;
+  pointer-events: none;
+}
+
+.playhead::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -4px;
+  border-left: 4.5px solid transparent;
+  border-right: 4.5px solid transparent;
+  border-top: 7px solid #ff5f56;
 }
