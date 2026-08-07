@@ -87,11 +87,43 @@ PolyRig($5.99,Godot 插件,Early Access)提供自动网格生成和智能权重,
 3. 闭源、Early Access、单人维护
 4. **最关键的:它只服务 Godot。** 本项目要跨三个引擎,它帮不上忙
 
-### 技术栈:TypeScript + PixiJS + React · 已定 · 2026-08-06
+### 技术栈:Electron + TypeScript + React + PixiJS · 已定 · 2026-08-07
 
-纯网页版,不打包。浏览器即跨平台,省掉打包与签名。需要本地文件系统读写时再用 Tauri 包一层,`core/` 不动。
+**桌面应用,不是网页应用。** 用户的硬性要求是编辑器能在 Windows 和 macOS 上运行。
 
-**否决的替代方案:Rust + wgpu + egui。** 性能更好,但时间会消耗在渲染管线而非时间轴 UI 上 —— 而时间轴 UI 才是本项目的实际难点。
+**为什么是 Electron 而不是 Tauri:**
+
+1. 现有的 React + PixiJS 前端代码一行不用改,只是换壳
+2. 不需要 Rust 工具链(Tauri 在 Windows 上还要装 MSVC build tools)
+3. **能从一台机器打出 Windows 和 macOS 两个包。** Tauri 无法从 Windows 交叉编译到 macOS ——
+   那意味着必须有台 Mac 才能出 Mac 版
+4. 代价是安装包大(~150MB)。个人工具,不构成问题
+
+**文件读写全部隔离在 `platform/` 一层**,以后若要换 Tauri(为了体积或性能),只动那一层,
+`core/` / `render/` / `ui/` 都不受影响。
+
+**否决的替代方案:**
+- **纯网页版** —— 曾一度采用(2026-08-06),但那是误判:用户从未要求网页版,只要求跨平台。
+  浏览器的文件系统限制(File System Access API 只有 Chrome/Edge 支持)是白白付出的代价。
+- **Rust + wgpu + egui** —— 性能更好,但时间会消耗在渲染管线而非时间轴 UI 上,
+  而时间轴 UI 才是本项目的实际难点。
+
+### 工程存储:项目目录,不是单文件包 · 已定 · 2026-08-07
+
+```
+项目目录/
+  images/        原始切图。用户直接往这里丢文件,不必经过编辑器
+  project.json   骨架 + 动画 + slot/attachment 绑定
+  export/        导出产物(atlas.png + atlas.txt + 各引擎数据文件)
+```
+
+**关键理由:`project.json` 是文本,能 git diff 和 merge。**
+
+Spine 最被诟病的问题之一就是 `.spine` 工程文件是二进制的 —— 无法 diff、无法 merge、
+多人协作只能靠喊。既然自建,就不要重蹈覆辙。
+
+单文件包(把图打进一个 .zip 式容器)已评估否决:省下的那点整洁度不值得放弃可 diff 性,
+而且美术改图必须经过编辑器,工作流更差。
 
 ### License:MIT · 已定 · 2026-08-06
 

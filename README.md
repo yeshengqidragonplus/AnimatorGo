@@ -70,9 +70,11 @@ render/   薄适配层,每引擎一个
 
 ## 技术栈
 
-TypeScript + PixiJS + React,纯网页版,不打包。
+**Electron + TypeScript + React + PixiJS** —— 桌面应用,Windows / macOS 双平台。
 
-浏览器即跨平台,省掉打包与签名。需要本地文件系统读写时再用 Tauri 包一层,`core/` 不动。
+文件读写隔离在 `platform/` 一层,将来若换 Tauri 只动那一层。
+
+**否决 Tauri 的关键理由:它无法从 Windows 交叉编译到 macOS**,那意味着必须有台 Mac 才能出 Mac 版。
 
 ## 实现顺序
 
