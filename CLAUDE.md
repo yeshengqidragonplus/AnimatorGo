@@ -4,15 +4,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 命令
 
-包管理器是 **pnpm**。
+包管理器是 **pnpm**。这是 **Electron 桌面应用**,不是网页应用。
 
 ```bash
-pnpm dev          # 开发服务器 :5173
-pnpm build        # tsc -b && vite build
-pnpm typecheck    # 只做类型检查
+pnpm dev          # 启动桌面应用(Vite + esbuild 打包主进程 + 拉起 Electron)
+pnpm build        # 类型检查 + 构建 dist/ 和 dist-electron/
+pnpm build:win    # 打包 Windows 安装程序 → release/
+pnpm build:mac    # 打包 macOS dmg → release/
+pnpm typecheck
 pnpm test         # vitest 单跑一次
-pnpm test:watch   # vitest watch
+pnpm test:watch
 ```
+
+`pnpm dev:web` 只起 Vite(浏览器里打开会因为没有 `platform/` 而报错,仅用于调试渲染层)。
+
+**关掉 Electron 窗口 = 结束 `pnpm dev`**,这是 [scripts/dev.mjs](scripts/dev.mjs) 里有意为之的。
+
+远程桌面或虚拟机里 GPU 进程会崩,用 `ANIMATORGO_DISABLE_GPU=1 pnpm dev` 走软件渲染。
+
+**没有用 `vite-plugin-electron`** —— 它当前版本按 rolldown 接口传参,和 Vite 6 对不上,
+能构建但启动不了 Electron。主进程由 [scripts/electron-bundle.mjs](scripts/electron-bundle.mjs) 用 esbuild 单独打包。
 
 跑单个测试文件:`pnpm exec vitest run src/core/math.test.ts`
 跑单个用例:`pnpm exec vitest run -t "旋转差值走最短路径"`

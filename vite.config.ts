@@ -2,6 +2,13 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { fileURLToPath, URL } from 'node:url'
 
+/**
+ * 只负责渲染进程。主进程和 preload 由 esbuild 单独打包,
+ * 见 scripts/dev.mjs 与 scripts/build-electron.mjs。
+ *
+ * 刻意不用 vite-plugin-electron —— 它当前版本按 rolldown 的接口传参,
+ * 和 Vite 6 对不上,能构建但启动不了 Electron。手写这几十行反而可控。
+ */
 export default defineConfig({
   plugins: [react()],
   resolve: {
@@ -10,7 +17,10 @@ export default defineConfig({
       '@render': fileURLToPath(new URL('./src/render', import.meta.url)),
       '@store': fileURLToPath(new URL('./src/store', import.meta.url)),
       '@ui': fileURLToPath(new URL('./src/ui', import.meta.url)),
+      '@platform': fileURLToPath(new URL('./src/platform', import.meta.url)),
     },
   },
-  server: { port: 5173 },
+  // Electron 生产环境用 file:// 加载,必须是相对路径
+  base: './',
+  server: { port: 5173, strictPort: true },
 })

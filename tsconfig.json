@@ -20,13 +20,16 @@
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
 
+    "types": ["node", "vite/client"],
+
     "baseUrl": ".",
     "paths": {
       "@core/*": ["src/core/*"],
       "@render/*": ["src/render/*"],
       "@store/*": ["src/store/*"],
-      "@ui/*": ["src/ui/*"]
+      "@ui/*": ["src/ui/*"],
+      "@platform/*": ["src/platform/*"]
     }
   },
-  "include": ["src"]
+  "include": ["src", "electron", "vite.config.ts"]
 }

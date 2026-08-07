@@ -48,3 +48,7 @@ src-tauri/target/
 
 # Claude Code 本地个人设置(.claude/settings.json 是共享配置,可以进库)
 .claude/settings.local.json
+
+# Electron 构建产物
+dist-electron/
+release/
