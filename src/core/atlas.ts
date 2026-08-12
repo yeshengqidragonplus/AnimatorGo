@@ -4,17 +4,22 @@
  * 这个格式和 Spine 的 `.atlas` 一致 —— 刻意的,这样导入 Spine 资源不需要第二套解析器。
  * 同时支持新旧两种写法(4.x 的 `bounds/offsets` 与 3.8 的 `xy/size/orig/offset`)。
  *
- * ⚠️ **两个语义必须记牢,弄反了所有切图锚点都会无规律偏移:**
+ * ⚠️ **三个语义必须记牢,弄反了所有切图锚点都会无规律偏移:**
  *
- *   `bounds: x, y, w, h`
- *       w/h 是**图集里的占位尺寸,已经算上旋转**。rotate 为 90 时,
- *       w 是原图的高、h 是原图的宽。
+ *   `bounds: x, y, w, h` / 旧写法 `xy:` + `size:`
+ *       x/y 是在图集里的左上角位置。
+ *       **w/h 是「摆正后」的裁剪尺寸,不含旋转** —— rotate 为 90 时,
+ *       该区域在图集里实际占的是 h×w(见 packedSize)。
  *
- *   `offsets: dx, dy, origW, origH`
+ *   `offsets: dx, dy, origW, origH` / 旧写法 `offset:` + `orig:`
  *       dx/dy 是打包时从**左边和下边**裁掉的透明像素数(Y 向上!),
- *       origW/origH 是**未旋转、未裁剪**的原始尺寸。
+ *       origW/origH 是未旋转、未裁剪的原始尺寸。
  *
- *   `rotate` 表示在图集里被**逆时针**转了 90°。
+ *   `rotate` 表示在图集里被**逆时针**转了 90°,渲染时要转回来。
+ *
+ * w/h 的含义曾按官方文档措辞实现成「图集占位尺寸」,用 res/BBQ 的真实图集
+ * (51 区域 / 36 个带旋转)验证时 31 处违例,改成现在这样后 0 违例。
+ * **不要凭文档措辞改回去,要改先跑真实图集。**
  */
 
 export interface AtlasPage {
@@ -32,9 +37,10 @@ export interface AtlasRegion {
   /** 在图集中的左上角位置 */
   readonly x: number
   readonly y: number
-  /** 在图集中的占位尺寸(已含旋转) */
-  readonly packedWidth: number
-  readonly packedHeight: number
+
+  /** **摆正后**的裁剪尺寸(不含旋转)。图集里的实际占位见 packedSize() */
+  readonly width: number
+  readonly height: number
 
   /** 0 或 90。90 表示在图集里被逆时针转了 90° */
   readonly rotate: number
@@ -56,14 +62,12 @@ export interface Atlas {
 }
 
 /**
- * 去掉旋转影响后的尺寸 —— 即「裁剪过但摆正」的尺寸。
+ * 该区域在图集里实际占据的矩形宽高。
  *
- * 渲染时切图在画面上占的就是这个大小(再加上 offset 的位移)。
+ * rotate 为 90 时是交换的 —— 一张竖图横躺着塞进图集,占位自然是宽高调过来。
  */
-export function trimmedSize(region: AtlasRegion): [number, number] {
-  return region.rotate === 90
-    ? [region.packedHeight, region.packedWidth]
-    : [region.packedWidth, region.packedHeight]
+export function packedSize(region: AtlasRegion): [number, number] {
+  return region.rotate === 90 ? [region.height, region.width] : [region.width, region.height]
 }
 
 // ─── 解析 ────────────────────────────────────────────────────────────────────
@@ -84,8 +88,8 @@ interface MutableRegion {
   page: string
   x: number
   y: number
-  packedWidth: number
-  packedHeight: number
+  width: number
+  height: number
   rotate: number
   offsetX: number
   offsetY: number
@@ -95,11 +99,10 @@ interface MutableRegion {
 }
 
 function finishRegion(r: MutableRegion): AtlasRegion {
-  // 旧格式没有 orig 时,原始尺寸就等于摆正后的尺寸(说明没裁过)
+  // 没有 orig/offsets 时,原始尺寸就等于摆正尺寸(说明没裁过)
   if (r.originalWidth === 0 && r.originalHeight === 0) {
-    const [w, h] = trimmedSize(r as AtlasRegion)
-    r.originalWidth = w
-    r.originalHeight = h
+    r.originalWidth = r.width
+    r.originalHeight = r.height
   }
   return r as AtlasRegion
 }
@@ -154,7 +157,6 @@ export function parseAtlas(text: string): Atlas {
     if (entry === null) {
       flushRegion()
       if (currentPage === null) {
-        flushPage()
         currentPage = line
         pageWidth = 0
         pageHeight = 0
@@ -163,7 +165,7 @@ export function parseAtlas(text: string): Atlas {
         region = {
           name: line,
           page: currentPage,
-          x: 0, y: 0, packedWidth: 0, packedHeight: 0,
+          x: 0, y: 0, width: 0, height: 0,
           rotate: 0,
           offsetX: 0, offsetY: 0, originalWidth: 0, originalHeight: 0,
           index: -1,
@@ -193,8 +195,8 @@ export function parseAtlas(text: string): Atlas {
         const [x, y, w, h] = parseNumbers(value)
         region.x = x ?? 0
         region.y = y ?? 0
-        region.packedWidth = w ?? 0
-        region.packedHeight = h ?? 0
+        region.width = w ?? 0
+        region.height = h ?? 0
         break
       }
       case 'offsets': {
@@ -219,8 +221,8 @@ export function parseAtlas(text: string): Atlas {
       }
       case 'size': {
         const [w, h] = parseNumbers(value)
-        region.packedWidth = w ?? 0
-        region.packedHeight = h ?? 0
+        region.width = w ?? 0
+        region.height = h ?? 0
         break
       }
       case 'orig': {
@@ -256,29 +258,33 @@ export function parseAtlas(text: string): Atlas {
  * 算出一个区域的四角 UV,顺序为 **左下 → 右下 → 右上 → 左上**
  * (和 RenderCommand.vertices 一致)。
  *
- * 旋转在这里处理掉 —— 上层拿到的 UV 已经是摆正的,不需要再关心 rotate。
+ * 旋转在这里抵消掉 —— 上层拿到的 UV 已经摆正,不需要再关心 rotate。
+ *
+ * 图集坐标 Y 向下(左上为原点),所以 v0 是上边、v1 是下边。
  */
 export function regionUVs(region: AtlasRegion, page: AtlasPage): Float32Array {
-  const u0 = region.x / page.width
-  const v0 = region.y / page.height
-  const u1 = (region.x + region.packedWidth) / page.width
-  const v1 = (region.y + region.packedHeight) / page.height
+  const [pw, ph] = packedSize(region)
 
-  // 图集坐标 Y 向下(左上原点),所以 v0 是上边
+  const u0 = region.x / page.width
+  const u1 = (region.x + pw) / page.width
+  const v0 = region.y / page.height
+  const v1 = (region.y + ph) / page.height
+
   if (region.rotate === 90) {
-    // 逆时针转了 90°:把 UV 也转回去,四个角依次错开一位
+    // 打包时逆时针转了 90°,显示时要顺时针转回来:
+    // 摆正后的左下角,对应图集里那块的右下角,依此类推。
     return new Float32Array([
-      u1, v0,
-      u1, v1,
-      u0, v1,
-      u0, v0,
+      u1, v1, // 左下
+      u1, v0, // 右下
+      u0, v0, // 右上
+      u0, v1, // 左上
     ])
   }
 
   return new Float32Array([
-    u0, v1,
-    u1, v1,
-    u1, v0,
-    u0, v0,
+    u0, v1, // 左下
+    u1, v1, // 右下
+    u1, v0, // 右上
+    u0, v0, // 左上
   ])
 }

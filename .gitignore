@@ -52,3 +52,6 @@ src-tauri/target/
 # Electron 构建产物
 dist-electron/
 release/
+
+# 美术资源 —— 用户的授权素材,不进公开仓库
+res/
