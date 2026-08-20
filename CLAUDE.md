@@ -30,17 +30,20 @@ pnpm test:watch
 
 ## 当前进度
 
-**已完成第 1 步和第 3 步**(第 2 步的切图导入跳过了,时间轴不依赖它):
+**已完成骨骼、时间轴和图片部件 MVP 的基础设施**：
 
 - `core/` 变换数学、骨骼层级、动画求值(线性/stepped/贝塞尔曲线)
-- PixiJS 渲染层、撤销重做(不可变快照 + merge key 合并)
+- PixiJS 骨骼渲染层、原图预览层、撤销重做(不可变快照 + merge key 合并)
 - 时间轴:播放、擦洗、打关键帧、删关键帧
+- 项目打开/保存、图片导入、添加骨骼、图片绑定到骨骼
+- `ProjectData` / JSON 文档转换、构建期 importer / exporter 插件注册表
 
 编辑器有两个模式,**同样是拖骨骼,行为不同**:
 `setup` 改绑定姿势,`animate` 在当前时刻打关键帧(值 = 绝对角 − 绑定姿势角)。
 
-**尚未做:** 图集与切图导入、slot/attachment 的实际渲染(`RenderCommand` 类型已定义但还没有生产者)、
-曲线编辑器 UI(贝塞尔在 `core/` 里已实现,但没有编辑界面)、IK、网格形变、任何导出器。
+**尚未做:** 完整 TRS 编辑、slot/attachment 编辑面板与绘制顺序、正式图集打包、Spine 导入/导出、Godot / Unity / Cocos 导出、曲线编辑器 UI(贝塞尔在 `core/` 里已实现,但没有编辑界面)、IK、网格形变。
+
+当前交接状态和下一步请先读 [docs/PROGRESS.md](docs/PROGRESS.md)。
 
 **已知限制(刻意抛错而非静默忽略):**
 `BoneData.inheritRotation / inheritScale` 的非默认值会在 `Skeleton` 构造时抛错。
@@ -87,7 +90,7 @@ render/   薄适配层。PixiJS / Godot / Unity / Cocos 各一个
 
 以下均已评估否决,理由见 [docs/DECISIONS.md](docs/DECISIONS.md)。不要因为「技术上可行」重提:
 
-- Spine 格式导出
+- 复制、移植或翻译 Spine Runtime 源码（兼容导入/导出必须自行实现）
 - Live2D `.moc3` 导出
 - DragonBones 格式作为中间格式
 - 导出引擎原生动画格式(替代运行时路线)
@@ -96,14 +99,13 @@ render/   薄适配层。PixiJS / Godot / Unity / Cocos 各一个
 
 ## 实现顺序
 
-1. `core/` 骨架 + 格式定义
-2. 渲染 + 切图导入 + 图集打包 + 骨骼层级(静态角色)
-3. 时间轴 + TRS 关键帧 ← **到这里就是可用工具**
-4. Godot 运行时(第一个,映射最干净)
-5. 网格形变(CDT + Lloyd Relaxation + Geodesic IDW + 权重刷)
-6. IK
-7. 动画融合
-8. Unity / Cocos Creator 运行时
+1. 内部项目格式与 importer/exporter 插件 SDK
+2. 项目管理、图片部件、图集、slot/attachment 可视化编辑
+3. 骨骼绑定 + TRS 时间轴 + 实时预览 ← **首个可用闭环**
+4. Spine JSON + atlas 导入插件
+5. Godot / Unity / Cocos 自有格式导出插件与最小运行时
+6. Spine 3.8 / 4.1 JSON + atlas 兼容导出插件
+7. 网格形变、IK、动画融合
 
 ## 动手前必须知道的坑
 

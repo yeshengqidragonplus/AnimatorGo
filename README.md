@@ -1,14 +1,14 @@
 # AnimatorGo
 
-个人自用的 2D 骨骼动画编辑器。切图输入,骨骼 + 网格形变动画输出,导出到 Godot / Unity / Cocos Creator。
+个人自用的、类似 Spine 的 2D 动画编辑器。它以图片部件、图层、骨骼、网格和时间轴为核心，骨骼动画是核心能力之一，而不是产品的全部。
 
-**当前状态:设计阶段,尚无代码。**
+**当前状态：编辑器 MVP 开发中。** 已具备项目打开/保存、图片导入、骨骼层级、图片绑定、旋转动画、时间轴、撤销重做与图片预览；完整 TRS、slot 编辑、正式图集和格式插件尚未完成。详见 [docs/PROGRESS.md](docs/PROGRESS.md)。
 
 ---
 
 ## 这是什么
 
-一个类似 Spine 的 2D 骨骼动画工具:
+一个类似 Spine 的 2D 动画工具：
 
 - 导入切图,自动打包图集
 - 搭骨骼层级,绑定切图
@@ -16,7 +16,9 @@
 - 网格形变(自动三角化 + 自动权重 + 权重刷)
 - IK
 - 动画融合(混合、分层)
-- 导出到 Godot / Unity / Cocos Creator,各引擎有对应运行时负责播放
+- 通过插件导入外部资产；首批支持 Spine JSON + atlas
+- 通过插件导出自有格式到 Godot / Unity / Cocos Creator，各引擎有对应运行时负责播放
+- 通过兼容导出插件生成 Spine 3.8 / 4.1 的 JSON + atlas 资产
 
 ## 核心理念
 
@@ -53,7 +55,7 @@ render/   薄适配层,每引擎一个
 
 | 方案 | 原因 |
 |---|---|
-| Spine 格式导出 | 已决定不做 |
+| Spine Runtime 源码移植或复制 | 版权与许可证不兼容；兼容导出插件可自行实现格式写入 |
 | Live2D `.moc3` 导出 | 闭源二进制,SDK 授权禁止逆向,且模型不同构 |
 | DragonBones 格式 | 生态多年无人维护 |
 | 导出引擎原生动画格式 | 有损,只能承载特性交集 |
@@ -65,6 +67,8 @@ render/   薄适配层,每引擎一个
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构、分层、导出职责、各引擎能力矩阵 |
 | [docs/FORMAT.md](docs/FORMAT.md) | **格式规范** —— 坐标系约定、数据模型、图集格式。这是所有运行时的共同契约 |
+| [docs/PLUGINS.md](docs/PLUGINS.md) | importer / exporter 插件边界、SDK 契约与首批插件 |
+| [docs/PROGRESS.md](docs/PROGRESS.md) | 当前实现、未完成项、验证状态与交接说明 |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | 已否决方案及理由 |
 | [CLAUDE.md](CLAUDE.md) | 给 Claude Code 的操作性约束 |
 
@@ -78,14 +82,13 @@ render/   薄适配层,每引擎一个
 
 ## 实现顺序
 
-1. `core/` 骨架 + 格式定义
-2. 渲染 + 切图导入 + 图集打包 + 骨骼层级(静态角色)
-3. 时间轴 + TRS 关键帧 ← **到这里就是可用工具,立刻拿它做一个真实动画自测**
-4. Godot 运行时(第一个,映射最干净,用它验证全链路)
-5. 网格形变(CDT + Lloyd Relaxation + Geodesic IDW + 权重刷)
-6. IK
-7. 动画融合
-8. Unity / Cocos Creator 运行时
+1. 内部项目格式与 importer/exporter 插件 SDK
+2. 项目管理、图片部件、切图/图集、slot/attachment 可视化编辑
+3. 骨骼绑定 + TRS 时间轴 + 实时预览 ← **首个可用闭环**
+4. Spine JSON + atlas 导入插件
+5. Godot / Unity / Cocos 自有格式导出插件与最小运行时
+6. Spine 3.8 / 4.1 JSON + atlas 兼容导出插件
+7. 网格形变(CDT + Lloyd Relaxation + Geodesic IDW + 权重刷)、IK、动画融合
 
 ## License
 
