@@ -18,6 +18,8 @@ export default defineConfig({
       '@store': fileURLToPath(new URL('./src/store', import.meta.url)),
       '@ui': fileURLToPath(new URL('./src/ui', import.meta.url)),
       '@platform': fileURLToPath(new URL('./src/platform', import.meta.url)),
+      '@project': fileURLToPath(new URL('./src/project', import.meta.url)),
+      '@plugins': fileURLToPath(new URL('./src/plugins', import.meta.url)),
     },
   },
   // Electron 生产环境用 file:// 加载,必须是相对路径

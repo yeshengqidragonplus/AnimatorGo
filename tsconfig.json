@@ -28,7 +28,9 @@
       "@render/*": ["src/render/*"],
       "@store/*": ["src/store/*"],
       "@ui/*": ["src/ui/*"],
-      "@platform/*": ["src/platform/*"]
+      "@platform/*": ["src/platform/*"],
+      "@project/*": ["src/project/*"],
+      "@plugins/*": ["src/plugins/*"]
     }
   },
   "include": ["src", "electron", "vite.config.ts"]
