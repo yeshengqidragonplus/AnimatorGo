@@ -1,8 +1,10 @@
 import { create } from 'zustand'
 import type { AnimationData, RotateKey } from '@core/animation.ts'
 import { putKeyframe, removeKeyframe, TIME_EPSILON } from '@core/animation.ts'
-import type { BoneData, SkeletonData } from '@core/types.ts'
+import type { BoneData, RegionAttachment, SkeletonData, SlotData } from '@core/types.ts'
 import { SAMPLE_SKELETON, SAMPLE_WALK } from '@core/sample.ts'
+import { PROJECT_FORMAT_VERSION, type ProjectData } from '@project/types.ts'
+import type { ImageAsset } from '@project/types.ts'
 
 /**
  * 编辑器状态与撤销重做。
@@ -24,17 +26,21 @@ import { SAMPLE_SKELETON, SAMPLE_WALK } from '@core/sample.ts'
 
 export type EditorMode = 'setup' | 'animate'
 
-export interface EditorDoc {
-  readonly skeleton: SkeletonData
-  readonly animations: ReadonlyMap<string, AnimationData>
-}
-
 const MAX_HISTORY = 200
 
+const SAMPLE_PROJECT: ProjectData = {
+  formatVersion: PROJECT_FORMAT_VERSION,
+  name: 'sample',
+  images: [],
+  atlases: [],
+  skeleton: SAMPLE_SKELETON,
+  animations: new Map([[SAMPLE_WALK.name, SAMPLE_WALK]]),
+}
+
 interface EditorState {
-  doc: EditorDoc
-  past: EditorDoc[]
-  future: EditorDoc[]
+  doc: ProjectData
+  past: ProjectData[]
+  future: ProjectData[]
   lastMergeKey: string | null
 
   // 视图状态 —— 不进历史
@@ -43,8 +49,9 @@ interface EditorState {
   time: number
   playing: boolean
   selectedBone: string | null
+  projectDir: string | null
 
-  commit: (next: EditorDoc, mergeKey?: string) => void
+  commit: (next: ProjectData, mergeKey?: string) => void
   undo: () => void
   redo: () => void
 
@@ -52,6 +59,11 @@ interface EditorState {
   selectBone: (name: string | null) => void
   setTime: (time: number) => void
   setPlaying: (playing: boolean) => void
+  setProjectDir: (dir: string | null) => void
+  replaceProject: (project: ProjectData) => void
+  addImages: (images: readonly ImageAsset[]) => void
+  bindImageToBone: (imageId: string, boneName: string) => void
+  addBone: (parentName: string | null) => string
 
   /**
    * 拖动骨骼的落点。传入的是**绝对局部旋转角**,由模式决定写到哪:
@@ -82,10 +94,7 @@ function withRotateKey(anim: AnimationData, boneName: string, key: RotateKey): A
 }
 
 export const useEditorStore = create<EditorState>()((set, get) => ({
-  doc: {
-    skeleton: SAMPLE_SKELETON,
-    animations: new Map([[SAMPLE_WALK.name, SAMPLE_WALK]]),
-  },
+  doc: SAMPLE_PROJECT,
   past: [],
   future: [],
   lastMergeKey: null,
@@ -95,6 +104,7 @@ export const useEditorStore = create<EditorState>()((set, get) => ({
   time: 0,
   playing: false,
   selectedBone: null,
+  projectDir: null,
 
   commit: (next, mergeKey) => {
     const { doc, past, lastMergeKey } = get()
@@ -129,6 +139,79 @@ export const useEditorStore = create<EditorState>()((set, get) => ({
   selectBone: (name) => set({ selectedBone: name }),
   setTime: (time) => set({ time: Math.max(0, time) }),
   setPlaying: (playing) => set({ playing }),
+  setProjectDir: (projectDir) => set({ projectDir }),
+  replaceProject: (doc) => set({ doc, past: [], future: [], lastMergeKey: null, time: 0, playing: false, selectedBone: null }),
+  addImages: (images) => {
+    if (images.length === 0) return
+    const { doc, commit } = get()
+    const ids = new Set(doc.images.map((image) => image.id))
+    const duplicates = images.find((image) => ids.has(image.id))
+    if (duplicates !== undefined) throw new Error(`图片资源 ID 重复: ${duplicates.id}`)
+    commit({ ...doc, images: [...doc.images, ...images] })
+  },
+  bindImageToBone: (imageId, boneName) => {
+    const { doc, commit } = get()
+    const image = doc.images.find((candidate) => candidate.id === imageId)
+    const bone = doc.skeleton.bones.findIndex((candidate) => candidate.name === boneName)
+    if (image === undefined) throw new Error(`找不到图片资源: ${imageId}`)
+    if (bone < 0) throw new Error(`找不到骨骼: ${boneName}`)
+
+    const existingSlot = doc.skeleton.slots.findIndex((slot) => slot.attachment === imageId)
+    const slotIndex = existingSlot < 0 ? doc.skeleton.slots.length : existingSlot
+    const slot: SlotData = {
+      name: existingSlot < 0 ? `slot_${imageId}` : doc.skeleton.slots[existingSlot]!.name,
+      bone,
+      attachment: imageId,
+      color: { r: 1, g: 1, b: 1, a: 1 },
+      blend: 'normal',
+    }
+    const slots = doc.skeleton.slots.slice()
+    if (existingSlot < 0) slots.push(slot)
+    else slots[existingSlot] = slot
+
+    const attachment: RegionAttachment = {
+      type: 'region', name: imageId, path: imageId, x: 0, y: 0, rotation: 0,
+      scaleX: 1, scaleY: 1, width: image.width, height: image.height,
+    }
+    const skins = new Map(doc.skeleton.skins)
+    const defaultSkin = new Map(skins.get(doc.skeleton.defaultSkin) ?? [])
+    const attachments = new Map(defaultSkin.get(slotIndex) ?? [])
+    attachments.set(imageId, attachment)
+    defaultSkin.set(slotIndex, attachments)
+    skins.set(doc.skeleton.defaultSkin, defaultSkin)
+
+    commit({ ...doc, skeleton: { ...doc.skeleton, slots, skins } })
+  },
+  addBone: (parentName) => {
+    const { doc, commit } = get()
+    const parent = parentName === null ? -1 : doc.skeleton.bones.findIndex((bone) => bone.name === parentName)
+    if (parentName !== null && parent < 0) throw new Error(`找不到父骨骼: ${parentName}`)
+
+    let serial = doc.skeleton.bones.length + 1
+    let name = `bone_${serial}`
+    const names = new Set(doc.skeleton.bones.map((bone) => bone.name))
+    while (names.has(name)) {
+      serial += 1
+      name = `bone_${serial}`
+    }
+    const parentBone = parent < 0 ? undefined : doc.skeleton.bones[parent]
+    const bone: BoneData = {
+      name,
+      parent,
+      x: parentBone?.length ?? 0,
+      y: 0,
+      rotation: 0,
+      scaleX: 1,
+      scaleY: 1,
+      shearX: 0,
+      shearY: 0,
+      length: 80,
+      inheritRotation: true,
+      inheritScale: true,
+    }
+    commit({ ...doc, skeleton: { ...doc.skeleton, bones: [...doc.skeleton.bones, bone] } })
+    return name
+  },
 
   setBoneRotation: (boneName, localRotation, mergeKey) => {
     const { doc, mode, currentAnimation, time, commit } = get()

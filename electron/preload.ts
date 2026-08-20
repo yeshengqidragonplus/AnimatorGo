@@ -20,6 +20,8 @@ contextBridge.exposeInMainWorld('animatorGo', {
 
   listImages: (dir: string): Promise<string[]> => ipcRenderer.invoke('images:list', dir),
 
+  importImages: (dir: string): Promise<string[]> => ipcRenderer.invoke('images:import', dir),
+
   readImage: (dir: string, name: string): Promise<Uint8Array> =>
     ipcRenderer.invoke('images:read', dir, name),
 

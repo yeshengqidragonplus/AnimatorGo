@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { useEditorStore } from './editorStore.ts'
 import { SAMPLE_SKELETON, SAMPLE_WALK } from '@core/sample.ts'
+import { PROJECT_FORMAT_VERSION } from '@project/types.ts'
 
 const store = () => useEditorStore.getState()
 
@@ -15,6 +16,10 @@ const keyAt = (name: string, time: number) => keysOf(name).find((k) => k.time ==
 beforeEach(() => {
   useEditorStore.setState({
     doc: {
+      formatVersion: PROJECT_FORMAT_VERSION,
+      name: 'sample',
+      images: [],
+      atlases: [],
       skeleton: SAMPLE_SKELETON,
       animations: new Map([[SAMPLE_WALK.name, SAMPLE_WALK]]),
     },
@@ -26,6 +31,7 @@ beforeEach(() => {
     time: 0,
     playing: false,
     selectedBone: null,
+    projectDir: null,
   })
 })
 
@@ -88,6 +94,56 @@ describe('动画模式', () => {
     store().deleteKeyframe('thigh_l', 0.25)
     expect(keysOf('thigh_l')).toHaveLength(before - 1)
     expect(keyAt('thigh_l', 0.25)).toBeUndefined()
+  })
+})
+
+describe('图片部件绑定', () => {
+  const image = { id: 'image:body.png', path: 'body.png', width: 64, height: 128 }
+
+  it('导入图片创建可撤销的项目资源记录', () => {
+    store().addImages([image])
+    expect(store().doc.images).toEqual([image])
+    expect(store().past).toHaveLength(1)
+  })
+
+  it('把图片绑定到骨骼时创建 slot 和 region attachment', () => {
+    store().addImages([image])
+    store().bindImageToBone(image.id, 'torso')
+
+    const slotIndex = store().doc.skeleton.slots.findIndex((slot) => slot.attachment === image.id)
+    expect(slotIndex).toBeGreaterThanOrEqual(0)
+    expect(store().doc.skeleton.slots[slotIndex]?.bone).toBe(2)
+    expect(store().doc.skeleton.skins.get('default')?.get(slotIndex)?.get(image.id)).toMatchObject({
+      type: 'region', path: image.id, width: 64, height: 128,
+    })
+  })
+
+  it('重复绑定同一图片会换骨骼而不是创建重叠 slot', () => {
+    store().addImages([image])
+    store().bindImageToBone(image.id, 'torso')
+    store().bindImageToBone(image.id, 'head')
+
+    expect(store().doc.skeleton.slots.filter((slot) => slot.attachment === image.id)).toHaveLength(1)
+    expect(store().doc.skeleton.slots.find((slot) => slot.attachment === image.id)?.bone).toBe(3)
+  })
+})
+
+describe('骨骼编辑', () => {
+  it('给选中骨骼添加子骨骼，父骨骼保持在数组之前', () => {
+    const name = store().addBone('torso')
+    const child = store().doc.skeleton.bones.find((bone) => bone.name === name)!
+    expect(child.parent).toBe(2)
+    expect(store().doc.skeleton.bones.indexOf(child)).toBeGreaterThan(child.parent)
+  })
+
+  it('空项目可以从根骨骼开始', () => {
+    useEditorStore.setState({ doc: {
+      formatVersion: PROJECT_FORMAT_VERSION, name: 'empty', images: [], atlases: [],
+      skeleton: { name: 'empty', bones: [], slots: [], skins: new Map([['default', new Map()]]), defaultSkin: 'default' },
+      animations: new Map(),
+    } })
+    const name = store().addBone(null)
+    expect(store().doc.skeleton.bones.find((bone) => bone.name === name)?.parent).toBe(-1)
   })
 })
 

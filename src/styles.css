@@ -70,7 +70,8 @@ body {
 }
 
 .history-depth,
-.hint {
+.hint,
+.project-status {
   color: var(--text-dim);
   font-size: 12px;
 }
@@ -144,6 +145,74 @@ body {
   color: var(--accent);
 }
 
+.panel-title-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.panel-title-actions button {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  background: #1e2430;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.asset-panel {
+  border-top: 1px solid var(--border);
+}
+
+.asset-empty {
+  margin: 8px 12px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.asset-list {
+  display: flex;
+  flex-direction: column;
+  padding: 4px 0;
+}
+
+.asset-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 10px;
+  color: var(--text);
+  overflow: hidden;
+}
+
+.asset-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.asset-row small {
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.asset-row button {
+  background: #1e2430;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.asset-row button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
 /* 动画驱动的骨骼 —— 和纯绑定姿势区分开 */
 .bone-rot.is-animated {
   color: #6fc3a0;
@@ -161,6 +230,23 @@ body {
 
 .viewport canvas {
   display: block;
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+}
+
+.image-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.attachment-image {
+  position: absolute;
+  inset: 0 auto auto 0;
+  transform-origin: 0 0;
+  user-select: none;
 }
 
 /* ── 模式切换 ───────────────────────────────────────────────────────────── */

@@ -137,6 +137,42 @@ ipcMain.handle('images:list', async (_e, projectDir: string): Promise<string[]> 
   }
 })
 
+/** 由用户挑选的源图片复制进项目 images/；同名文件自动加序号，绝不覆盖已有素材。 */
+ipcMain.handle('images:import', async (_e, projectDir: string): Promise<string[]> => {
+  if (mainWindow === null) return []
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '导入图片部件',
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: '图片', extensions: [...IMAGE_EXTENSIONS].map((extension) => extension.slice(1)) }],
+  })
+  if (result.canceled) return []
+
+  const imagesDir = resolveInside(projectDir, IMAGES_DIR)
+  await fs.mkdir(imagesDir, { recursive: true })
+  const imported: string[] = []
+
+  for (const source of result.filePaths) {
+    const parsed = path.parse(source)
+    if (!IMAGE_EXTENSIONS.has(parsed.ext.toLowerCase())) continue
+
+    let name = parsed.base
+    let suffix = 2
+    while (true) {
+      try {
+        await fs.access(resolveInside(projectDir, IMAGES_DIR, name))
+        name = `${parsed.name}-${suffix}${parsed.ext}`
+        suffix += 1
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') break
+        throw error
+      }
+    }
+    await fs.copyFile(source, resolveInside(projectDir, IMAGES_DIR, name))
+    imported.push(name)
+  }
+  return imported
+})
+
 ipcMain.handle('images:read', async (_e, projectDir: string, name: string): Promise<Uint8Array> => {
   const buf = await fs.readFile(resolveInside(projectDir, IMAGES_DIR, name))
   return new Uint8Array(buf)

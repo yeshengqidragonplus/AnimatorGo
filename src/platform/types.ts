@@ -23,6 +23,9 @@ export interface Platform {
   /** 列出 images/ 下的图片文件名(已排序) */
   listImages(dir: string): Promise<string[]>
 
+  /** 用户选择外部图片后复制进 images/，同名素材自动改名；返回项目内文件名。 */
+  importImages(dir: string): Promise<string[]>
+
   readImage(dir: string, name: string): Promise<Uint8Array>
 
   /** 写入 export/ 下的文件,父目录自动创建 */

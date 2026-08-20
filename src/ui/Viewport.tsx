@@ -1,10 +1,13 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Application, Container, Graphics, Point } from 'pixi.js'
-import { RAD_TO_DEG, Skeleton } from '@core/index.ts'
+import { buildRenderCommands, RAD_TO_DEG, Skeleton } from '@core/index.ts'
 import { applyAnimation } from '@core/animation.ts'
+import type { RenderCommand } from '@core/types.ts'
+import { createLooseImageAtlas } from '@project/index.ts'
 import { SkeletonRenderer } from '@render/pixi/SkeletonRenderer.ts'
 import { useEditorStore } from '@store/editorStore.ts'
 import { pickBone } from './hitTest.ts'
+import { ImageOverlay } from './ImageOverlay.tsx'
 
 const BG_COLOR = 0x161a23
 const GRID_COLOR = 0x232936
@@ -32,6 +35,8 @@ export function Viewport() {
   const appRef = useRef<Application | null>(null)
   const worldRef = useRef<Container | null>(null)
   const rendererRef = useRef<SkeletonRenderer | null>(null)
+  const [commands, setCommands] = useState<readonly RenderCommand[]>([])
+  const [screen, setScreen] = useState<{ width: number; height: number } | null>(null)
 
   const doc = useEditorStore((s) => s.doc)
   const mode = useEditorStore((s) => s.mode)
@@ -39,6 +44,8 @@ export function Viewport() {
   const playing = useEditorStore((s) => s.playing)
   const currentAnimation = useEditorStore((s) => s.currentAnimation)
   const selectedBone = useEditorStore((s) => s.selectedBone)
+  const projectDir = useEditorStore((s) => s.projectDir)
+  const atlas = useMemo(() => createLooseImageAtlas(doc.images), [doc.images])
 
   // 骨架实例只在骨骼数据变化时重建;播放头移动只是重新摆姿势,不重建
   const skeleton = useMemo(() => new Skeleton(doc.skeleton), [doc.skeleton])
@@ -82,7 +89,10 @@ export function Viewport() {
         worldRef.current = world
         rendererRef.current = renderer
 
-        const centre = () => world.position.set(app.screen.width / 2, app.screen.height * 0.72)
+        const centre = () => {
+          world.position.set(app.screen.width / 2, app.screen.height * 0.72)
+          setScreen({ width: app.screen.width, height: app.screen.height })
+        }
         centre()
         app.renderer.on('resize', centre)
       })
@@ -110,7 +120,8 @@ export function Viewport() {
     skeleton.updateWorldTransform()
 
     rendererRef.current?.draw(skeleton, selectedBone)
-  }, [skeleton, doc.animations, currentAnimation, mode, time, selectedBone])
+    setCommands(buildRenderCommands(skeleton, atlas))
+  }, [skeleton, doc.animations, currentAnimation, mode, time, selectedBone, atlas])
 
   // ── 播放 ───────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -208,5 +219,9 @@ export function Viewport() {
     }
   }, [])
 
-  return <div className="viewport" ref={hostRef} />
+  return (
+    <div className="viewport" ref={hostRef}>
+      <ImageOverlay commands={commands} images={doc.images} projectDir={projectDir} screen={screen} />
+    </div>
+  )
 }

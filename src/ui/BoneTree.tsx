@@ -29,6 +29,7 @@ export function BoneTree() {
   const time = useEditorStore((s) => s.time)
   const selectedBone = useEditorStore((s) => s.selectedBone)
   const selectBone = useEditorStore((s) => s.selectBone)
+  const addBone = useEditorStore((s) => s.addBone)
 
   const rows: Row[] = useMemo(() => {
     const depths = depthsOf(bones)
@@ -47,7 +48,15 @@ export function BoneTree() {
 
   return (
     <div className="panel">
-      <div className="panel-title">骨骼{mode === 'animate' ? ' · 当前姿势' : ' · 绑定姿势'}</div>
+      <div className="panel-title panel-title-actions">
+        <span>骨骼{mode === 'animate' ? ' · 当前姿势' : ' · 绑定姿势'}</span>
+        <button
+          title={selectedBone === null ? '添加根骨骼' : `添加 ${selectedBone} 的子骨骼`}
+          onClick={() => selectBone(addBone(selectedBone))}
+        >
+          +
+        </button>
+      </div>
       <div className="bone-list">
         {rows.map(({ bone, depth, rotation, animated }) => (
           <button
