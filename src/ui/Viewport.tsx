@@ -121,7 +121,9 @@ export function Viewport() {
 
     rendererRef.current?.draw(skeleton, selectedBone)
     setCommands(buildRenderCommands(skeleton, atlas))
-  }, [skeleton, doc.animations, currentAnimation, mode, time, selectedBone, atlas])
+    // 依赖 screen:Pixi 初始化是异步的,首次挂载时本 effect 先于 init 完成执行,
+    // rendererRef 还是 null。init 完成后 setScreen 触发这里补画,否则冷启动画布是空的
+  }, [skeleton, doc.animations, currentAnimation, mode, time, selectedBone, atlas, screen])
 
   // ── 播放 ───────────────────────────────────────────────────────────────────
   useEffect(() => {
