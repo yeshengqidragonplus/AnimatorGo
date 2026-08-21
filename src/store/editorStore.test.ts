@@ -169,6 +169,49 @@ describe('TRS 编辑', () => {
   })
 })
 
+describe('动画管理', () => {
+  it('新建动画自动命名、切换为当前动画、可撤销', () => {
+    const name = store().addAnimation()
+    expect(name).toBe('anim_2') // 样例项目已有 walk
+    expect(store().currentAnimation).toBe('anim_2')
+    expect(store().doc.animations.get('anim_2')).toMatchObject({ duration: 1 })
+
+    store().undo()
+    expect(store().doc.animations.has('anim_2')).toBe(false)
+  })
+
+  it('空项目新建动画后即可打关键帧', () => {
+    useEditorStore.setState({ doc: {
+      formatVersion: PROJECT_FORMAT_VERSION, name: 'empty', images: [], atlases: [],
+      skeleton: { name: 'empty', bones: [], slots: [], skins: new Map([['default', new Map()]]), defaultSkin: 'default' },
+      animations: new Map(),
+    }, currentAnimation: '' })
+    const bone = store().addBone(null)
+    store().addAnimation()
+    useEditorStore.setState({ mode: 'animate', time: 0.3 })
+
+    store().setBoneRotation(bone, 45)
+    const keys = store().doc.animations.get(store().currentAnimation)?.bones.get(bone)?.rotate
+    expect(keys?.[0]).toMatchObject({ time: 0.3, value: 45 })
+  })
+
+  it('replaceProject 把当前动画指向新项目的第一个动画', () => {
+    store().replaceProject({
+      formatVersion: PROJECT_FORMAT_VERSION, name: 'other', images: [], atlases: [],
+      skeleton: { name: 'other', bones: [], slots: [], skins: new Map([['default', new Map()]]), defaultSkin: 'default' },
+      animations: new Map([['idle', { name: 'idle', duration: 2, bones: new Map() }]]),
+    })
+    expect(store().currentAnimation).toBe('idle')
+
+    store().replaceProject({
+      formatVersion: PROJECT_FORMAT_VERSION, name: 'empty', images: [], atlases: [],
+      skeleton: { name: 'empty', bones: [], slots: [], skins: new Map([['default', new Map()]]), defaultSkin: 'default' },
+      animations: new Map(),
+    })
+    expect(store().currentAnimation).toBe('')
+  })
+})
+
 describe('slot 编辑', () => {
   const imageA = { id: 'image:a.png', path: 'a.png', width: 10, height: 10 }
   const imageB = { id: 'image:b.png', path: 'b.png', width: 10, height: 10 }

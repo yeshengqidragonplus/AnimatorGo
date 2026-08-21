@@ -59,12 +59,29 @@ export function ImageOverlay({ commands, images, projectDir, screen }: Props) {
 
   const originX = screen.width / 2
   const originY = screen.height * 0.72
+  const tinted = commands.filter((c) => c.color.r !== 1 || c.color.g !== 1 || c.color.b !== 1)
   return (
     <div className="image-overlay">
+      {/* slot 染色:feColorMatrix 做逐通道乘法,与引擎里「顶点色 × 纹理」语义一致 */}
+      {tinted.length > 0 && (
+        <svg width="0" height="0" style={{ position: 'absolute' }} aria-hidden>
+          <defs>
+            {tinted.map((c, i) => (
+              <filter key={c.slotName} id={`ag-tint-${i}`} colorInterpolationFilters="sRGB">
+                <feColorMatrix
+                  type="matrix"
+                  values={`${c.color.r} 0 0 0 0  0 ${c.color.g} 0 0 0  0 0 ${c.color.b} 0 0  0 0 0 1 0`}
+                />
+              </filter>
+            ))}
+          </defs>
+        </svg>
+      )}
       {commands.map((command) => {
         const image = imageByPath.get(command.path)
         const url = urls.get(command.path)
         if (image === undefined || url === undefined) return null
+        const tintIndex = tinted.indexOf(command)
         return (
           <img
             key={command.slotName}
@@ -76,6 +93,7 @@ export function ImageOverlay({ commands, images, projectDir, screen }: Props) {
               height: image.height,
               opacity: command.color.a,
               mixBlendMode: BLEND_TO_CSS[command.blend],
+              filter: tintIndex >= 0 ? `url(#ag-tint-${tintIndex})` : undefined,
               transform: toScreenMatrix(command.vertices, image.width, image.height, originX, originY),
             }}
           />

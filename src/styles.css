@@ -614,9 +614,18 @@ body {
   color: var(--text-dim);
 }
 
-.anim-name {
+.anim-select {
+  background: #10141c;
   color: var(--accent);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: inherit;
   font-weight: 600;
+  max-width: 160px;
+}
+
+.anim-add {
+  width: 22px !important;
 }
 
 .timeline-note {

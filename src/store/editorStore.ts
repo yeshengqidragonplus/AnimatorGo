@@ -65,6 +65,10 @@ interface EditorState {
   setMode: (mode: EditorMode) => void
   setTool: (tool: EditorTool) => void
   selectBone: (name: string | null) => void
+  /** 切换当前动画。播放头归零并停止播放。 */
+  selectAnimation: (name: string) => void
+  /** 新建空动画(自动命名 anim_N,时长 1s)并切换过去,返回动画名 */
+  addAnimation: () => string
   setTime: (time: number) => void
   setPlaying: (playing: boolean) => void
   setProjectDir: (dir: string | null) => void
@@ -200,10 +204,36 @@ export const useEditorStore = create<EditorState>()((set, get) => ({
   setMode: (mode) => set({ mode, playing: false }),
   setTool: (tool) => set({ tool }),
   selectBone: (name) => set({ selectedBone: name }),
+  selectAnimation: (name) => set({ currentAnimation: name, time: 0, playing: false }),
+  addAnimation: () => {
+    const { doc, commit } = get()
+    let serial = doc.animations.size + 1
+    let name = `anim_${serial}`
+    while (doc.animations.has(name)) {
+      serial += 1
+      name = `anim_${serial}`
+    }
+    const animations = new Map(doc.animations)
+    animations.set(name, { name, duration: 1, bones: new Map() })
+    commit({ ...doc, animations })
+    set({ currentAnimation: name, time: 0, playing: false })
+    return name
+  },
   setTime: (time) => set({ time: Math.max(0, time) }),
   setPlaying: (playing) => set({ playing }),
   setProjectDir: (projectDir) => set({ projectDir }),
-  replaceProject: (doc) => set({ doc, past: [], future: [], lastMergeKey: null, time: 0, playing: false, selectedBone: null }),
+  replaceProject: (doc) =>
+    set({
+      doc,
+      past: [],
+      future: [],
+      lastMergeKey: null,
+      time: 0,
+      playing: false,
+      selectedBone: null,
+      // 别让当前动画指向上一个项目的名字 —— 新项目没有同名动画时打帧会全部静默失败
+      currentAnimation: doc.animations.keys().next().value ?? '',
+    }),
   addImages: (images) => {
     if (images.length === 0) return
     const { doc, commit } = get()

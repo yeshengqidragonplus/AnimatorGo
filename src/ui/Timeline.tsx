@@ -122,6 +122,10 @@ export function Timeline() {
   const setTime = useEditorStore((s) => s.setTime)
   const selectBone = useEditorStore((s) => s.selectBone)
   const deleteKeyframe = useEditorStore((s) => s.deleteKeyframe)
+  const selectAnimation = useEditorStore((s) => s.selectAnimation)
+  const addAnimation = useEditorStore((s) => s.addAnimation)
+
+  const animationNames = [...doc.animations.keys()]
 
   return (
     <div className="timeline">
@@ -140,7 +144,24 @@ export function Timeline() {
         <span className="time-readout">
           {time.toFixed(2)} / {duration.toFixed(2)}s
         </span>
-        <span className="anim-name">{currentAnimation}</span>
+        {animationNames.length > 0 ? (
+          <select
+            className="anim-select"
+            value={animation !== undefined ? currentAnimation : ''}
+            onChange={(e) => selectAnimation(e.target.value)}
+            title="切换动画"
+          >
+            {animation === undefined && <option value="">(选择动画)</option>}
+            {animationNames.map((name) => (
+              <option key={name} value={name}>{name}</option>
+            ))}
+          </select>
+        ) : (
+          <span className="timeline-note">没有动画 —— 点 + 新建</span>
+        )}
+        <button className="anim-add" title="新建动画" onClick={() => addAnimation()}>
+          +
+        </button>
         {mode !== 'animate' && <span className="timeline-note">绑定姿势模式 —— 切到「动画」才能播放</span>}
       </div>
 
