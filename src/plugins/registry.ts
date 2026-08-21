@@ -15,14 +15,15 @@ export class PluginRegistry {
     this.plugins.set(manifest.id, plugin)
   }
 
+  // 用方法存在性收窄联合类型 —— manifest.kind 嵌在一层里,TS 无法据此收窄外层
   getImporter(id: string): ImporterPlugin<unknown> | undefined {
     const plugin = this.plugins.get(id)
-    return plugin?.manifest.kind === 'importer' ? plugin : undefined
+    return plugin !== undefined && 'import' in plugin ? plugin : undefined
   }
 
   getExporter(id: string): ExporterPlugin<unknown> | undefined {
     const plugin = this.plugins.get(id)
-    return plugin?.manifest.kind === 'exporter' ? plugin : undefined
+    return plugin !== undefined && 'export' in plugin ? plugin : undefined
   }
 
   list(): readonly Plugin[] {

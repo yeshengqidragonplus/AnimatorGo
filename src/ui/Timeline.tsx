@@ -1,11 +1,32 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react'
-import { useEditorStore } from '@store/editorStore.ts'
+import type { RotateKey, Vec2Key } from '@core/animation.ts'
+import { useEditorStore, type BoneChannel } from '@store/editorStore.ts'
 
 /** 刻度线的候选间隔,按 duration 选一个不至于太密的 */
 const TICK_STEPS = [0.05, 0.1, 0.25, 0.5, 1, 2, 5]
 
 function pickTickStep(duration: number): number {
   return TICK_STEPS.find((s) => duration / s <= 12) ?? TICK_STEPS[TICK_STEPS.length - 1]!
+}
+
+const CHANNEL_ORDER: readonly BoneChannel[] = ['rotate', 'translate', 'scale', 'shear']
+const CHANNEL_LABEL: Record<BoneChannel, string> = {
+  rotate: '旋转',
+  translate: '平移',
+  scale: '缩放',
+  shear: '斜切',
+}
+
+interface TrackRow {
+  readonly bone: string
+  readonly channel: BoneChannel
+  readonly keys: readonly (RotateKey | Vec2Key)[]
+}
+
+function keyTooltip(row: TrackRow, key: RotateKey | Vec2Key): string {
+  const value =
+    'value' in key ? `${key.value.toFixed(1)}°` : `(${key.x.toFixed(1)}, ${key.y.toFixed(1)})`
+  return `${row.bone} · ${CHANNEL_LABEL[row.channel]} @ ${key.time}s = ${value}  (右键删除)`
 }
 
 export function Timeline() {
@@ -21,12 +42,26 @@ export function Timeline() {
   const animation = doc.animations.get(currentAnimation)
   const duration = animation?.duration ?? 1
 
-  /** 有关键帧的骨骼,加上当前选中的(即使它还没有帧,也要能看到自己在哪一行) */
-  const rows = useMemo(() => {
-    const names = new Set(animation?.bones.keys() ?? [])
-    if (selectedBone !== null) names.add(selectedBone)
+  /**
+   * 每根骨骼的每条有关键帧的通道一行。当前选中的骨骼即使一帧都没有,
+   * 也给一个空的旋转行 —— 让用户看到自己会打在哪一行。
+   */
+  const rows: TrackRow[] = useMemo(() => {
+    const out: TrackRow[] = []
     // 按骨架顺序排,和左侧骨骼树一致
-    return doc.skeleton.bones.map((b) => b.name).filter((n) => names.has(n))
+    for (const bone of doc.skeleton.bones) {
+      const timelines = animation?.bones.get(bone.name)
+      let any = false
+      for (const channel of CHANNEL_ORDER) {
+        const keys = timelines?.[channel]
+        if (keys !== undefined && keys.length > 0) {
+          out.push({ bone: bone.name, channel, keys })
+          any = true
+        }
+      }
+      if (!any && bone.name === selectedBone) out.push({ bone: bone.name, channel: 'rotate', keys: [] })
+    }
+    return out
   }, [animation, selectedBone, doc.skeleton.bones])
 
   const ticks = useMemo(() => {
@@ -112,13 +147,14 @@ export function Timeline() {
       <div className="timeline-body">
         <div className="track-labels">
           <div className="track-label ruler-spacer" />
-          {rows.map((name) => (
+          {rows.map((row) => (
             <button
-              key={name}
-              className={`track-label${name === selectedBone ? ' is-selected' : ''}`}
-              onClick={() => selectBone(name)}
+              key={`${row.bone}:${row.channel}`}
+              className={`track-label${row.bone === selectedBone ? ' is-selected' : ''}`}
+              onClick={() => selectBone(row.bone)}
+              title={`${row.bone} · ${CHANNEL_LABEL[row.channel]}`}
             >
-              {name}
+              {row.bone} <small>{CHANNEL_LABEL[row.channel]}</small>
             </button>
           ))}
         </div>
@@ -132,22 +168,25 @@ export function Timeline() {
             ))}
           </div>
 
-          {rows.map((name) => (
-            <div key={name} className={`track${name === selectedBone ? ' is-selected' : ''}`}>
-              {(animation?.bones.get(name)?.rotate ?? []).map((k) => (
+          {rows.map((row) => (
+            <div
+              key={`${row.bone}:${row.channel}`}
+              className={`track${row.bone === selectedBone ? ' is-selected' : ''}`}
+            >
+              {row.keys.map((k) => (
                 <button
                   key={k.time}
                   className="keyframe"
                   style={{ left: pct(k.time) }}
-                  title={`${name} @ ${k.time}s = ${k.value.toFixed(1)}°  (右键删除)`}
+                  title={keyTooltip(row, k)}
                   onClick={() => {
                     setPlaying(false)
                     setTime(k.time)
-                    selectBone(name)
+                    selectBone(row.bone)
                   }}
                   onContextMenu={(e) => {
                     e.preventDefault()
-                    deleteKeyframe(name, k.time)
+                    deleteKeyframe(row.bone, row.channel, k.time)
                   }}
                 />
               ))}

@@ -35,7 +35,7 @@ export function ImageOverlay({ commands, images, projectDir, screen }: Props) {
       const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
       const url = URL.createObjectURL(new Blob([buffer]))
       created.push(url)
-      return [image.id, url] as const
+      return [image.path, url] as const
     })).then((entries) => {
       if (disposed) {
         for (const [, url] of entries) URL.revokeObjectURL(url)
@@ -53,7 +53,8 @@ export function ImageOverlay({ commands, images, projectDir, screen }: Props) {
     }
   }, [images, projectDir])
 
-  const imageById = useMemo(() => new Map(images.map((image) => [image.id, image])), [images])
+  // RenderCommand.path 是图集区域名 = 图片文件名,见 looseAtlas.ts
+  const imageByPath = useMemo(() => new Map(images.map((image) => [image.path, image])), [images])
   if (screen === null) return null
 
   const originX = screen.width / 2
@@ -61,7 +62,7 @@ export function ImageOverlay({ commands, images, projectDir, screen }: Props) {
   return (
     <div className="image-overlay">
       {commands.map((command) => {
-        const image = imageById.get(command.path)
+        const image = imageByPath.get(command.path)
         const url = urls.get(command.path)
         if (image === undefined || url === undefined) return null
         return (
@@ -74,6 +75,7 @@ export function ImageOverlay({ commands, images, projectDir, screen }: Props) {
               width: image.width,
               height: image.height,
               opacity: command.color.a,
+              mixBlendMode: BLEND_TO_CSS[command.blend],
               transform: toScreenMatrix(command.vertices, image.width, image.height, originX, originY),
             }}
           />
@@ -82,6 +84,17 @@ export function ImageOverlay({ commands, images, projectDir, screen }: Props) {
     </div>
   )
 }
+
+/**
+ * 编辑期预览的混合模式近似。additive 用 plus-lighter(Chromium 支持),
+ * 与引擎里的加法混合视觉接近;精确程度以肉眼不出问题为准。
+ */
+const BLEND_TO_CSS = {
+  normal: 'normal',
+  additive: 'plus-lighter',
+  multiply: 'multiply',
+  screen: 'screen',
+} as const satisfies Record<RenderCommand['blend'], string>
 
 /** 把 core 的 Y 向上四角转换成 CSS 的 Y 向下仿射矩阵，图片局部原点是左上。 */
 function toScreenMatrix(

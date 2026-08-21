@@ -12,10 +12,12 @@ export interface ImageAsset {
   readonly height: number
 }
 
-/** 图集页引用哪张项目图片。区域数据沿用 core 的 Atlas 模型，在读取 atlas 文件后生成。 */
+/** 打包产物的一页大图。区域数据不入库 —— 从 .atlas 文本解析(parseAtlas)即可复原。 */
 export interface AtlasPageAsset {
+  /** .atlas 文本里的页名,即 PNG 文件名 */
   readonly name: string
-  readonly imageId: string
+  /** 相对项目目录,例如 `atlases/character.png` */
+  readonly path: string
 }
 
 export interface AtlasAsset {

@@ -5,8 +5,11 @@ import type { ImageAsset } from '@project/types.ts'
 import { selectCanRedo, selectCanUndo, useEditorStore } from '@store/editorStore.ts'
 import { Viewport } from './Viewport.tsx'
 import { BoneTree } from './BoneTree.tsx'
+import { BonePanel } from './BonePanel.tsx'
 import { Timeline } from './Timeline.tsx'
 import { AssetPanel } from './AssetPanel.tsx'
+import { SlotPanel } from './SlotPanel.tsx'
+import { AtlasPanel } from './AtlasPanel.tsx'
 
 function projectNameFromDir(dir: string): string {
   return dir.split(/[\\/]/).filter(Boolean).at(-1) ?? 'Untitled'
@@ -32,6 +35,12 @@ function imageSize(bytes: Uint8Array): Promise<{ width: number; height: number }
 function useShortcuts() {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      // 焦点在输入框里时不要抢按键 —— 属性面板输入数字不能触发快捷键
+      const target = e.target as HTMLElement | null
+      if (target !== null && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT')) {
+        return
+      }
+
       const s = useEditorStore.getState()
 
       if (e.ctrlKey || e.metaKey) {
@@ -46,13 +55,20 @@ function useShortcuts() {
         return
       }
 
+      const key = e.key.toLowerCase()
       if (e.key === ' ') {
         // 必须 preventDefault:否则焦点在按钮上时空格会触发点击
         e.preventDefault()
         if (s.mode === 'animate') s.setPlaying(!s.playing)
-      } else if (e.key.toLowerCase() === 'k' && s.selectedBone !== null && s.mode === 'animate') {
+      } else if (key === 'k' && s.selectedBone !== null && s.mode === 'animate') {
         e.preventDefault()
         s.keyBoneAtTime(s.selectedBone)
+      } else if (key === 'r') {
+        s.setTool('rotate')
+      } else if (key === 't') {
+        s.setTool('translate')
+      } else if (key === 's') {
+        s.setTool('scale')
       }
     }
 
@@ -72,6 +88,8 @@ export function App() {
   const historyDepth = useEditorStore((s) => s.past.length)
   const mode = useEditorStore((s) => s.mode)
   const setMode = useEditorStore((s) => s.setMode)
+  const tool = useEditorStore((s) => s.tool)
+  const setTool = useEditorStore((s) => s.setTool)
   const selectedBone = useEditorStore((s) => s.selectedBone)
   const keyBoneAtTime = useEditorStore((s) => s.keyBoneAtTime)
   const projectDir = useEditorStore((s) => s.projectDir)
@@ -150,6 +168,30 @@ export function App() {
           </button>
         </div>
 
+        <div className="mode-switch">
+          <button
+            className={tool === 'rotate' ? 'is-active' : ''}
+            onClick={() => setTool('rotate')}
+            title="拖动骨骼旋转 (R)"
+          >
+            旋转
+          </button>
+          <button
+            className={tool === 'translate' ? 'is-active' : ''}
+            onClick={() => setTool('translate')}
+            title="拖动骨骼平移 (T)"
+          >
+            平移
+          </button>
+          <button
+            className={tool === 'scale' ? 'is-active' : ''}
+            onClick={() => setTool('scale')}
+            title="拖动骨骼缩放 (S)"
+          >
+            缩放
+          </button>
+        </div>
+
         <button onClick={undo} disabled={!canUndo} title="Ctrl+Z">
           撤销
         </button>
@@ -168,15 +210,18 @@ export function App() {
         {status !== '' && <span className="project-status">{status}</span>}
         <span className="hint">
           {mode === 'animate'
-            ? '空格播放 · 拖动骨骼在当前时刻打帧 · 右键关键帧删除'
-            : '拖动骨骼修改绑定姿势'}
+            ? '空格播放 · 拖动骨骼在当前时刻打帧 · 右键关键帧删除 · R/T/S 换工具'
+            : '拖动骨骼修改绑定姿势 · R/T/S 换工具'}
         </span>
       </header>
 
       <main className="workspace">
         <aside className="sidebar">
           <BoneTree />
+          <BonePanel />
+          <SlotPanel />
           <AssetPanel />
+          <AtlasPanel />
         </aside>
         <Viewport />
       </main>

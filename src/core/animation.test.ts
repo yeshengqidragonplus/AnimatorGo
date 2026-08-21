@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { Skeleton } from './Skeleton.ts'
-import { applyAnimation, putKeyframe, removeKeyframe, type AnimationData } from './animation.ts'
+import { applyAnimation, putKeyframe, removeKeyframe, samplePose, type AnimationData } from './animation.ts'
 import type { BoneData, SkeletonData } from './types.ts'
 
 function bone(name: string, parent: number, rotation = 0, x = 0): BoneData {
@@ -47,6 +47,17 @@ describe('关键帧语义', () => {
     applyAnimation(s, anim(new Map([['arm', { translate: [{ time: 0, x: 7, y: -3 }] }]])), 0)
     near(s.getBone('arm')!.x, 17) // 绑定 10 + 7
     near(s.getBone('arm')!.y, -3)
+  })
+
+  it('shear 叠加在绑定姿势上', () => {
+    const data: SkeletonData = {
+      ...DATA,
+      bones: [bone('root', -1), { ...bone('arm', 0), shearX: 5, shearY: -5 }],
+    }
+    const s = new Skeleton(data)
+    applyAnimation(s, anim(new Map([['arm', { shear: [{ time: 0, x: 10, y: 20 }] }]])), 0)
+    near(s.getBone('arm')!.shearX, 15) // 5 + 10
+    near(s.getBone('arm')!.shearY, 15) // -5 + 20
   })
 
   it('没有时间轴的骨骼保持绑定姿势', () => {
@@ -120,6 +131,29 @@ describe('插值', () => {
     near(at(a, 0), 42)
     near(at(a, 0.5), 42)
     near(at(a, 9), 42)
+  })
+})
+
+describe('samplePose', () => {
+  it('返回各通道在时刻 t 的偏移,没有时间轴的通道给单位值', () => {
+    const a = anim(new Map([['arm', {
+      rotate: [{ time: 0, value: 0 }, { time: 1, value: 100 }],
+      scale: [{ time: 0, x: 2, y: 4 }],
+    }]]))
+    const pose = samplePose(a, 'arm', 0.5)
+    near(pose.rotation, 50)
+    near(pose.scaleX, 2)
+    near(pose.scaleY, 4)
+    // 没碰过的通道:translate/shear 是 0
+    near(pose.x, 0)
+    near(pose.shearX, 0)
+  })
+
+  it('完全没有时间轴的骨骼返回单位偏移(scale 为 1)', () => {
+    const pose = samplePose(anim(new Map()), 'arm', 0.5)
+    near(pose.rotation, 0)
+    near(pose.scaleX, 1)
+    near(pose.scaleY, 1)
   })
 })
 

@@ -30,18 +30,24 @@ pnpm test:watch
 
 ## 当前进度
 
-**已完成骨骼、时间轴和图片部件 MVP 的基础设施**：
+**骨骼、时间轴、图片部件、slot 编辑和图集打包的 MVP 已完成**：
 
-- `core/` 变换数学、骨骼层级、动画求值(线性/stepped/贝塞尔曲线)
+- `core/` 变换数学、骨骼层级、动画求值(rotate/translate/scale/shear 四通道,线性/stepped/贝塞尔曲线)
 - PixiJS 骨骼渲染层、原图预览层、撤销重做(不可变快照 + merge key 合并)
-- 时间轴:播放、擦洗、打关键帧、删关键帧
+- 时间轴:播放、擦洗、按通道分行、打关键帧(K 固化全部已有通道)、删关键帧
+- 完整 TRS 编辑:视口工具 R/T/S 拖拽 + 属性面板数值编辑
+- Slot 编辑:绘制顺序、改名、解绑、颜色、混合模式(皮肤下标自动重排)
+- 正式图集打包:MaxRects + 裁透明边 + 旋转,写 `atlases/*.png` + `.atlas`,带预览
 - 项目打开/保存、图片导入、添加骨骼、图片绑定到骨骼
 - `ProjectData` / JSON 文档转换、构建期 importer / exporter 插件注册表
 
 编辑器有两个模式,**同样是拖骨骼,行为不同**:
-`setup` 改绑定姿势,`animate` 在当前时刻打关键帧(值 = 绝对角 − 绑定姿势角)。
+`setup` 改绑定姿势,`animate` 在当前时刻打关键帧(值 = 绝对值 − 绑定值,scale 是 ÷)。
 
-**尚未做:** 完整 TRS 编辑、slot/attachment 编辑面板与绘制顺序、正式图集打包、Spine 导入/导出、Godot / Unity / Cocos 导出、曲线编辑器 UI(贝塞尔在 `core/` 里已实现,但没有编辑界面)、IK、网格形变。
+**图集区域名和 `attachment.path` 用图片文件名(`image.path`),不是 imageId** ——
+imageId 的冒号会撞上 `.atlas` 文本语法;文件名两边一致,重新打包不用动任何绑定。
+
+**尚未做:** 桌面应用视觉验证、动画管理 UI(新建/切换动画)、曲线编辑器 UI(贝塞尔在 `core/` 里已实现,但没有编辑界面)、Spine 导入/导出、Godot / Unity / Cocos 导出、IK、网格形变。
 
 当前交接状态和下一步请先读 [docs/PROGRESS.md](docs/PROGRESS.md)。
 

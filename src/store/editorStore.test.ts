@@ -91,9 +91,138 @@ describe('动画模式', () => {
 
   it('右键删除关键帧', () => {
     const before = keysOf('thigh_l').length
-    store().deleteKeyframe('thigh_l', 0.25)
+    store().deleteKeyframe('thigh_l', 'rotate', 0.25)
     expect(keysOf('thigh_l')).toHaveLength(before - 1)
     expect(keyAt('thigh_l', 0.25)).toBeUndefined()
+  })
+})
+
+describe('TRS 编辑', () => {
+  const timelinesOf = (name: string) =>
+    store().doc.animations.get(store().currentAnimation)?.bones.get(name)
+
+  describe('绑定姿势模式', () => {
+    it('平移/缩放/斜切写入绑定姿势', () => {
+      store().setBoneTranslation('torso', 5, -3)
+      store().setBoneScale('torso', 2, 0.5)
+      store().setBoneShear('torso', 10, -10)
+      const bone = store().doc.skeleton.bones.find((b) => b.name === 'torso')!
+      expect([bone.x, bone.y]).toEqual([5, -3])
+      expect([bone.scaleX, bone.scaleY]).toEqual([2, 0.5])
+      expect([bone.shearX, bone.shearY]).toEqual([10, -10])
+    })
+
+    it('length 只影响绑定数据,动画模式下也一样', () => {
+      useEditorStore.setState({ mode: 'animate' })
+      store().setBoneLength('torso', 120)
+      expect(store().doc.skeleton.bones.find((b) => b.name === 'torso')!.length).toBe(120)
+      expect(timelinesOf('torso')?.translate).toBeUndefined()
+    })
+  })
+
+  describe('动画模式', () => {
+    beforeEach(() => useEditorStore.setState({ mode: 'animate', time: 0.5 }))
+
+    it('平移关键帧存偏移:绝对值 − 绑定值', () => {
+      // torso 绑定位置 (0, 40)
+      const bind = store().doc.skeleton.bones.find((b) => b.name === 'torso')!
+      store().setBoneTranslation('torso', bind.x + 7, bind.y - 2)
+      expect(timelinesOf('torso')?.translate?.[0]).toMatchObject({ time: 0.5, x: 7, y: -2 })
+      // 不动绑定姿势
+      expect(store().doc.skeleton.bones.find((b) => b.name === 'torso')!.x).toBe(bind.x)
+    })
+
+    it('缩放关键帧存比值:绝对值 ÷ 绑定值', () => {
+      store().setBoneScale('torso', 2, 0.5) // 绑定 scale 是 1,1
+      expect(timelinesOf('torso')?.scale?.[0]).toMatchObject({ time: 0.5, x: 2, y: 0.5 })
+    })
+
+    it('斜切关键帧存偏移', () => {
+      store().setBoneShear('torso', 15, -5)
+      expect(timelinesOf('torso')?.shear?.[0]).toMatchObject({ time: 0.5, x: 15, y: -5 })
+    })
+
+    it('打关键帧固化所有已有通道在当前时刻的插值结果', () => {
+      // thigh_l 在 SAMPLE_WALK 里有 rotate 时间轴;再补一条 translate
+      store().setBoneTranslation('thigh_l', 4, 0)
+      useEditorStore.setState({ time: 0.6 })
+      store().keyBoneAtTime('thigh_l')
+
+      const timelines = timelinesOf('thigh_l')!
+      expect(timelines.rotate!.some((k) => k.time === 0.6)).toBe(true)
+      expect(timelines.translate!.some((k) => k.time === 0.6)).toBe(true)
+      // 没碰过的通道不会被打帧
+      expect(timelines.scale).toBeUndefined()
+    })
+
+    it('一条时间轴都没有时,打关键帧落一个 rotate 零帧', () => {
+      store().keyBoneAtTime('head')
+      expect(timelinesOf('head')?.rotate?.[0]).toMatchObject({ time: 0.5, value: 0 })
+    })
+
+    it('按通道删除关键帧,不影响其他通道', () => {
+      store().setBoneTranslation('thigh_l', 4, 0)
+      store().deleteKeyframe('thigh_l', 'translate', 0.5)
+      expect(timelinesOf('thigh_l')?.translate).toHaveLength(0)
+      expect(timelinesOf('thigh_l')?.rotate?.length).toBeGreaterThan(0)
+    })
+  })
+})
+
+describe('slot 编辑', () => {
+  const imageA = { id: 'image:a.png', path: 'a.png', width: 10, height: 10 }
+  const imageB = { id: 'image:b.png', path: 'b.png', width: 10, height: 10 }
+
+  const slotNames = () => store().doc.skeleton.slots.map((slot) => slot.name)
+  const skinOf = (index: number) => store().doc.skeleton.skins.get('default')?.get(index)
+
+  beforeEach(() => {
+    store().addImages([imageA, imageB])
+    store().bindImageToBone(imageA.id, 'torso')
+    store().bindImageToBone(imageB.id, 'head')
+  })
+
+  it('改名保留绑定,拒绝重名', () => {
+    store().renameSlot('slot_image:a.png', 'body')
+    expect(slotNames()).toContain('body')
+    expect(store().doc.skeleton.slots.find((slot) => slot.name === 'body')?.attachment).toBe(imageA.id)
+    expect(() => store().renameSlot('slot_image:b.png', 'body')).toThrow('slot 名称重复')
+  })
+
+  it('删除 slot 时皮肤下标跟着重排', () => {
+    // slot 0 = a,slot 1 = b;删掉 0 之后 b 的 attachment 必须还能查到
+    store().removeSlot('slot_image:a.png')
+    expect(slotNames()).toEqual(['slot_image:b.png'])
+    expect(skinOf(0)?.get(imageB.id)).toBeDefined()
+    expect(skinOf(1)).toBeUndefined()
+  })
+
+  it('调整绘制顺序时皮肤下标跟着交换', () => {
+    store().moveSlot('slot_image:a.png', 1)
+    expect(slotNames()).toEqual(['slot_image:b.png', 'slot_image:a.png'])
+    expect(skinOf(0)?.get(imageB.id)).toBeDefined()
+    expect(skinOf(1)?.get(imageA.id)).toBeDefined()
+
+    // 已在顶层,再往上是空操作
+    store().moveSlot('slot_image:a.png', 1)
+    expect(slotNames()).toEqual(['slot_image:b.png', 'slot_image:a.png'])
+  })
+
+  it('颜色和混合模式可编辑、可撤销', () => {
+    store().setSlotColor('slot_image:a.png', { r: 1, g: 0, b: 0, a: 0.5 })
+    store().setSlotBlend('slot_image:a.png', 'additive')
+    const slot = () => store().doc.skeleton.slots.find((s) => s.name === 'slot_image:a.png')!
+    expect(slot().color).toEqual({ r: 1, g: 0, b: 0, a: 0.5 })
+    expect(slot().blend).toBe('additive')
+
+    store().undo()
+    expect(slot().blend).toBe('normal')
+  })
+
+  it('重复绑定同一图片保留已改的颜色和混合模式', () => {
+    store().setSlotColor('slot_image:a.png', { r: 0, g: 1, b: 0, a: 1 })
+    store().bindImageToBone(imageA.id, 'head')
+    expect(store().doc.skeleton.slots.find((s) => s.attachment === imageA.id)?.color).toEqual({ r: 0, g: 1, b: 0, a: 1 })
   })
 })
 
@@ -113,8 +242,9 @@ describe('图片部件绑定', () => {
     const slotIndex = store().doc.skeleton.slots.findIndex((slot) => slot.attachment === image.id)
     expect(slotIndex).toBeGreaterThanOrEqual(0)
     expect(store().doc.skeleton.slots[slotIndex]?.bone).toBe(2)
+    // attachment.path 用图片文件名 —— 和图集区域名一致,见 looseAtlas.ts
     expect(store().doc.skeleton.skins.get('default')?.get(slotIndex)?.get(image.id)).toMatchObject({
-      type: 'region', path: image.id, width: 64, height: 128,
+      type: 'region', path: image.path, width: 64, height: 128,
     })
   })
 

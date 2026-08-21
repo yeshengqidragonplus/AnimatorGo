@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      maxrects-packer:
+        specifier: ^2.7.3
+        version: 2.7.3
       pixi.js:
         specifier: ^8.6.6
         version: 8.19.0
@@ -1560,6 +1563,9 @@ packages:
   math-intrinsics@1.1.0:
     resolution: {integrity: sha512-/IXtbwEk5HTPyEwyKX6hGkYXxM9nbj64B+ilVJnC/R6B0pH5G4V3b0pVbL7DBj4tkhBAppbQUlf6F6Xl9LHu1g==}
     engines: {node: '>= 0.4'}
+
+  maxrects-packer@2.7.3:
+    resolution: {integrity: sha512-bG6qXujJ1QgttZVIH4WDanhoJtvbud/xP/XPyf6A69C9RdA61BM4TomFALCq2nrTa+tARRIBB4LuIFsnUQU2wA==}
 
   mime-db@1.52.0:
     resolution: {integrity: sha512-sPU4uV7dYlvtWJxwwxHD0PuihVNiE7TyAbQ5SWxDCB9mUYvOgroQOwYQQOKPJ8CIbE+1ETVlOoK1UC2nU3gYvg==}
@@ -3657,6 +3663,8 @@ snapshots:
     optional: true
 
   math-intrinsics@1.1.0: {}
+
+  maxrects-packer@2.7.3: {}
 
   mime-db@1.52.0: {}
 

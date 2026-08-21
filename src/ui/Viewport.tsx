@@ -146,15 +146,22 @@ export function Viewport() {
     return () => cancelAnimationFrame(raf)
   }, [playing, doc.animations, currentAnimation])
 
-  // ── 输入:点击选中,拖动旋转 ───────────────────────────────────────────────
+  // ── 输入:点击选中,按当前工具拖动(旋转/平移/缩放)────────────────────────
   useEffect(() => {
     const host = hostRef.current
     if (host === null) return
 
     // 每次手势一个唯一 key —— 整段拖动合并成一条撤销记录,松手后失效
     let dragBone: string | null = null
+    let dragTool: 'rotate' | 'translate' | 'scale' = 'rotate'
     let dragKey = ''
     let gestureId = 0
+    // 抓取时刻的状态,平移/缩放需要:按下点不一定是骨骼原点
+    let grabDX = 0
+    let grabDY = 0
+    let grabDist = 0
+    let grabScaleX = 1
+    let grabScaleY = 1
 
     const toWorld = (e: PointerEvent): { x: number; y: number } | null => {
       const world = worldRef.current
@@ -173,9 +180,22 @@ export function Viewport() {
 
       if (hit !== null) {
         dragBone = hit
+        dragTool = useEditorStore.getState().tool
         gestureId += 1
-        dragKey = `rotate:${hit}:${gestureId}`
+        dragKey = `${dragTool}:${hit}:${gestureId}`
         useEditorStore.getState().setPlaying(false) // 开始编辑就停止播放
+
+        const bone = skeletonRef.current.getBone(hit)
+        if (bone !== undefined) {
+          // 骨骼当前姿势下,按下点在父空间中相对骨骼原点的位置
+          const [px, py] = bone.worldToParent(p.x, p.y)
+          grabDX = px - bone.x
+          grabDY = py - bone.y
+          grabDist = Math.hypot(grabDX, grabDY)
+          grabScaleX = bone.scaleX
+          grabScaleY = bone.scaleY
+        }
+
         // 指针已失效时会抛 NotFoundError,拖动本身不依赖捕获
         try {
           host.setPointerCapture(e.pointerId)
@@ -193,11 +213,22 @@ export function Viewport() {
       const bone = skeletonRef.current.getBone(dragBone)
       if (bone === undefined) return
 
-      // 鼠标在世界空间,写回的是局部旋转 —— 换算到父空间再取角度
+      // 鼠标在世界空间,写回的是局部值 —— 先换算到父空间
       const [mx, my] = bone.worldToParent(p.x, p.y)
-      const rotation = Math.atan2(my - bone.y, mx - bone.x) * RAD_TO_DEG
+      const store = useEditorStore.getState()
 
-      useEditorStore.getState().setBoneRotation(dragBone, rotation, dragKey)
+      if (dragTool === 'rotate') {
+        const rotation = Math.atan2(my - bone.y, mx - bone.x) * RAD_TO_DEG
+        store.setBoneRotation(dragBone, rotation, dragKey)
+      } else if (dragTool === 'translate') {
+        // 保持按下点相对骨骼原点的偏移,骨骼不会跳到鼠标下面
+        store.setBoneTranslation(dragBone, mx - grabDX, my - grabDY, dragKey)
+      } else {
+        // 均匀缩放:距骨骼原点的距离比。抓在原点上时距离比没有意义,忽略
+        if (grabDist < 1e-3) return
+        const factor = Math.hypot(mx - bone.x, my - bone.y) / grabDist
+        store.setBoneScale(dragBone, grabScaleX * factor, grabScaleY * factor, dragKey)
+      }
     }
 
     const endDrag = (e: PointerEvent) => {

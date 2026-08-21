@@ -39,6 +39,7 @@ app.on('child-process-gone', (_e, details) => {
 const IMAGES_DIR = 'images'
 const PROJECT_FILE = 'project.json'
 const EXPORT_DIR = 'export'
+const ATLASES_DIR = 'atlases'
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp'])
 
@@ -103,6 +104,7 @@ ipcMain.handle('project:open', async (): Promise<string | null> => {
 ipcMain.handle('project:scaffold', async (_e, projectDir: string): Promise<void> => {
   await fs.mkdir(resolveInside(projectDir, IMAGES_DIR), { recursive: true })
   await fs.mkdir(resolveInside(projectDir, EXPORT_DIR), { recursive: true })
+  await fs.mkdir(resolveInside(projectDir, ATLASES_DIR), { recursive: true })
 })
 
 ipcMain.handle('project:read', async (_e, projectDir: string): Promise<string | null> => {
@@ -186,6 +188,20 @@ ipcMain.handle(
     await fs.writeFile(target, data)
   },
 )
+
+ipcMain.handle(
+  'atlas:write',
+  async (_e, projectDir: string, name: string, data: string | Uint8Array): Promise<void> => {
+    const target = resolveInside(projectDir, ATLASES_DIR, name)
+    await fs.mkdir(path.dirname(target), { recursive: true })
+    await fs.writeFile(target, data)
+  },
+)
+
+ipcMain.handle('atlas:read', async (_e, projectDir: string, name: string): Promise<Uint8Array> => {
+  const buf = await fs.readFile(resolveInside(projectDir, ATLASES_DIR, name))
+  return new Uint8Array(buf)
+})
 
 // ─── 应用生命周期 ────────────────────────────────────────────────────────────
 

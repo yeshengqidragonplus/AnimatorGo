@@ -88,6 +88,7 @@ export interface BoneTimelines {
   readonly rotate?: readonly RotateKey[]
   readonly translate?: readonly Vec2Key[]
   readonly scale?: readonly Vec2Key[]
+  readonly shear?: readonly Vec2Key[]
 }
 
 export interface AnimationData {
@@ -177,6 +178,11 @@ export function applyAnimation(skeleton: Skeleton, animation: AnimationData, tim
       bone.scaleX = bone.data.scaleX * sx // scale 是乘不是加
       bone.scaleY = bone.data.scaleY * sy
     }
+    if (timelines.shear !== undefined && timelines.shear.length > 0) {
+      const [shx, shy] = evalVec2(timelines.shear, time)
+      bone.shearX = bone.data.shearX + shx
+      bone.shearY = bone.data.shearY + shy
+    }
   }
 }
 
@@ -192,6 +198,36 @@ export function sampleRotation(
 ): number {
   const keys = animation.bones.get(boneName)?.rotate
   return keys === undefined || keys.length === 0 ? 0 : evalRotate(keys, time)
+}
+
+/**
+ * 某根骨骼在时刻 t 的完整姿势**偏移**(相对绑定姿势)。
+ *
+ * 没有时间轴的通道返回单位值:rotate / translate / shear 为 0,scale 为 1。
+ * 「最终值 = 绑定 + 偏移(scale 是 ×)」由调用方套用,见 docs/FORMAT.md 第 1 节。
+ */
+export interface BonePoseOffset {
+  readonly rotation: number
+  readonly x: number
+  readonly y: number
+  readonly scaleX: number
+  readonly scaleY: number
+  readonly shearX: number
+  readonly shearY: number
+}
+
+export function samplePose(animation: AnimationData, boneName: string, time: number): BonePoseOffset {
+  const timelines = animation.bones.get(boneName)
+  const sample = (keys: readonly Vec2Key[] | undefined, unit: number): [number, number] =>
+    keys === undefined || keys.length === 0 ? [unit, unit] : evalVec2(keys, time)
+
+  const [x, y] = sample(timelines?.translate, 0)
+  const [scaleX, scaleY] = sample(timelines?.scale, 1)
+  const [shearX, shearY] = sample(timelines?.shear, 0)
+  return {
+    rotation: timelines?.rotate === undefined || timelines.rotate.length === 0 ? 0 : evalRotate(timelines.rotate, time),
+    x, y, scaleX, scaleY, shearX, shearY,
+  }
 }
 
 // ─── 编辑关键帧 ──────────────────────────────────────────────────────────────

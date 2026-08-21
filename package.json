@@ -14,6 +14,7 @@
     "dev:web": "vite"
   },
   "dependencies": {
+    "maxrects-packer": "^2.7.3",
     "pixi.js": "^8.6.6",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

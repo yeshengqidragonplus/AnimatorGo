@@ -30,6 +30,10 @@ export interface Platform {
 
   /** 写入 export/ 下的文件,父目录自动创建 */
   writeExport(dir: string, relativePath: string, data: string | Uint8Array): Promise<void>
+
+  /** 读写 atlases/ 下的打包产物(页 PNG 与 .atlas 文本) */
+  writeAtlasFile(dir: string, name: string, data: string | Uint8Array): Promise<void>
+  readAtlasFile(dir: string, name: string): Promise<Uint8Array>
 }
 
 declare global {

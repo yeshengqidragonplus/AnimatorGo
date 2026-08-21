@@ -27,4 +27,10 @@ contextBridge.exposeInMainWorld('animatorGo', {
 
   writeExport: (dir: string, relativePath: string, data: string | Uint8Array): Promise<void> =>
     ipcRenderer.invoke('export:write', dir, relativePath, data),
+
+  writeAtlasFile: (dir: string, name: string, data: string | Uint8Array): Promise<void> =>
+    ipcRenderer.invoke('atlas:write', dir, name, data),
+
+  readAtlasFile: (dir: string, name: string): Promise<Uint8Array> =>
+    ipcRenderer.invoke('atlas:read', dir, name),
 })
