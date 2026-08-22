@@ -12,6 +12,7 @@ import { Timeline } from './Timeline.tsx'
 import { AssetPanel } from './AssetPanel.tsx'
 import { SlotPanel } from './SlotPanel.tsx'
 import { AtlasPanel } from './AtlasPanel.tsx'
+import { ExportPanel } from './ExportPanel.tsx'
 
 function projectNameFromDir(dir: string): string {
   return dir.split(/[\\/]/).filter(Boolean).at(-1) ?? 'Untitled'
@@ -222,6 +223,7 @@ export function App() {
           <SlotPanel />
           <AssetPanel />
           <AtlasPanel />
+          <ExportPanel />
         </aside>
         <Viewport />
       </main>
