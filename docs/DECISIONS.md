@@ -101,6 +101,24 @@ Godot 的 tscn/tres、Cocos 的 anim),用户不需要装任何我们的库。
 
 硬约束。见 [ARCHITECTURE.md](ARCHITECTURE.md#core-与-render-分层)。
 
+### 引擎运行时采用原生语言，不建设 C++ 共用库 · 已定 · 2026-08-22
+
+Godot、Unity、Cocos 分别用各自最合适的语言和渲染接口实现运行时：
+
+| 引擎 | 运行时语言 / 模块 |
+|---|---|
+| Godot | GDScript（必要时 Godot 原生 2D 节点 / Mesh API） |
+| Unity | C# `MonoBehaviour` + `Mesh` / `Renderer` |
+| Cocos Creator | TypeScript `Component` + 自定义 `RenderComponent` / assembler |
+
+三者共享的是导出数据规范、坐标约定和 `core/` 的数学语义；公式按语言翻译，不共享二进制库。
+
+**否决当前阶段的 C++ 共用 core。** 它需要同时维护 Godot GDExtension、Unity Native Plugin +
+P/Invoke、Cocos JSB 桥接，以及各平台 ABI、构建、调试和发布流程；渲染与资源加载仍不能共用，
+会在功能尚未验证前引入更大复杂度。
+
+只有在三套原生运行时均已验证、且纯数学求值被确认是性能瓶颈时，才重新评估抽取 C++ 算法库。
+
 ---
 
 ## 正确性标准

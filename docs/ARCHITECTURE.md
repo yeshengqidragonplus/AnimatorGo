@@ -43,6 +43,20 @@ plugins/
 
 完整 SDK 契约见 [PLUGINS.md](PLUGINS.md)。首版只加载随应用发布的本地插件；把第三方任意 JavaScript 加载进 Electron 进程属于独立的安全设计，不纳入 MVP。
 
+## 运行时实现方式
+
+运行时不使用跨引擎 C++ 动态库。数据格式和数学语义统一，代码按引擎原生方式实现：
+
+| 引擎 | 实现 | 模板目录 |
+|---|---|---|
+| Godot | GDScript + 2D / Mesh API | [`runtime-templates/godot/`](../runtime-templates/godot/) |
+| Unity | C# `MonoBehaviour` + `Mesh` / `Renderer` | [`runtime-templates/unity/`](../runtime-templates/unity/) |
+| Cocos Creator | TypeScript `Component` + 自定义 assembler | [`runtime-templates/cocos/`](../runtime-templates/cocos/) |
+
+导出时生成统一 `animatorgo.json`、`manifest.json` 与图集/原图资源。每个模板都可复制进目标工程；
+之后补齐各自的动画采样、世界变换和 attachment 绘制即可。C++ 共享库不在当前路线内，理由见
+[DECISIONS.md](DECISIONS.md#引擎运行时采用原生语言不建设-c-共用库--已定--2026-08-22)。
+
 ## 为什么是「自建格式 + N 个运行时」
 
 已评估并否决的替代方案是「导出各引擎原生动画格式」。否决理由:
