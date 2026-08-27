@@ -78,7 +78,10 @@ render/   薄适配层,每引擎一个
 
 文件读写隔离在 `platform/` 一层,将来若换 Tauri 只动那一层。
 
-**否决 Tauri 的关键理由:它无法从 Windows 交叉编译到 macOS**,那意味着必须有台 Mac 才能出 Mac 版。
+否决 Tauri 的理由:需要引入 Rust 工具链(Windows 上还要装 MSVC build tools),对本项目没有相称的收益。
+
+⚠️ **打包是绑平台的:`.dmg` 必须在 macOS 上构建**,electron-builder 不能交叉编译。
+这一点 Electron 和 Tauri 相同,不构成两者之间的差别。见 [docs/DECISIONS.md](docs/DECISIONS.md)。
 
 ## 实现顺序
 

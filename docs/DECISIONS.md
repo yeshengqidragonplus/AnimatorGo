@@ -152,9 +152,15 @@ PolyRig($5.99,Godot 插件,Early Access)提供自动网格生成和智能权重,
 
 1. 现有的 React + PixiJS 前端代码一行不用改,只是换壳
 2. 不需要 Rust 工具链(Tauri 在 Windows 上还要装 MSVC build tools)
-3. **能从一台机器打出 Windows 和 macOS 两个包。** Tauri 无法从 Windows 交叉编译到 macOS ——
-   那意味着必须有台 Mac 才能出 Mac 版
-4. 代价是安装包大(~150MB)。个人工具,不构成问题
+3. 代价是安装包大(~150MB)。个人工具,不构成问题
+
+**⚠️ 曾列出的第三条理由「能从一台机器打出两个平台的包」是错的,已删除(2026-08-12 更正)。**
+electron-builder **不能交叉编译**:`.dmg` 需要 macOS 自带的工具链,在 Windows 上构建会失败。
+这一点上 Electron 和 Tauri 完全相同,不构成两者之间的差别。上面两条理由依然成立,决定不变。
+
+**出 macOS 包的办法:** 在 Mac 上跑 `pnpm build:mac`,或用 GitHub Actions 的 macOS runner
+(本仓库公开,该 runner 免费)。未签名未公证的 Mac 应用首次打开会被 Gatekeeper 拦,
+自用可右键→打开绕过;正式分发需要 Apple 开发者账号。
 
 **文件读写全部隔离在 `platform/` 一层**,以后若要换 Tauri(为了体积或性能),只动那一层,
 `core/` / `render/` / `ui/` 都不受影响。
