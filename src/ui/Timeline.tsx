@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react'
 import type { RotateKey, Vec2Key } from '@core/animation.ts'
 import { useEditorStore, type BoneChannel } from '@store/editorStore.ts'
+import { useT, type TranslationKey } from '@i18n/index.ts'
 
 /** 刻度线的候选间隔,按 duration 选一个不至于太密的 */
 const TICK_STEPS = [0.05, 0.1, 0.25, 0.5, 1, 2, 5]
@@ -10,11 +11,12 @@ function pickTickStep(duration: number): number {
 }
 
 const CHANNEL_ORDER: readonly BoneChannel[] = ['rotate', 'translate', 'scale', 'shear']
-const CHANNEL_LABEL: Record<BoneChannel, string> = {
-  rotate: '旋转',
-  translate: '平移',
-  scale: '缩放',
-  shear: '斜切',
+/** 通道名 → 翻译 key。不直接存中文,否则常量求值早于语言选择 */
+const CHANNEL_KEY: Record<BoneChannel, TranslationKey> = {
+  rotate: 'channel.rotate',
+  translate: 'channel.translate',
+  scale: 'channel.scale',
+  shear: 'channel.shear',
 }
 
 interface TrackRow {
@@ -23,13 +25,21 @@ interface TrackRow {
   readonly keys: readonly (RotateKey | Vec2Key)[]
 }
 
-function keyTooltip(row: TrackRow, key: RotateKey | Vec2Key): string {
+type Translate = ReturnType<typeof useT>
+
+function keyTooltip(t: Translate, row: TrackRow, key: RotateKey | Vec2Key): string {
   const value =
     'value' in key ? `${key.value.toFixed(1)}°` : `(${key.x.toFixed(1)}, ${key.y.toFixed(1)})`
-  return `${row.bone} · ${CHANNEL_LABEL[row.channel]} @ ${key.time}s = ${value}  (右键删除)`
+  return t('timeline.keyTooltip', {
+    bone: row.bone,
+    channel: t(CHANNEL_KEY[row.channel]),
+    time: key.time,
+    value,
+  })
 }
 
 export function Timeline() {
+  const t = useT()
   const trackAreaRef = useRef<HTMLDivElement>(null)
 
   const doc = useEditorStore((s) => s.doc)
@@ -134,11 +144,11 @@ export function Timeline() {
           className="play-btn"
           onClick={() => setPlaying(!playing)}
           disabled={mode !== 'animate'}
-          title="空格"
+          title={t(playing ? 'timeline.pause' : 'timeline.play')}
         >
           {playing ? '⏸' : '▶'}
         </button>
-        <button onClick={() => setTime(0)} title="回到开头">
+        <button onClick={() => setTime(0)} title={t('timeline.toStart')}>
           ⏮
         </button>
         <span className="time-readout">
@@ -149,20 +159,20 @@ export function Timeline() {
             className="anim-select"
             value={animation !== undefined ? currentAnimation : ''}
             onChange={(e) => selectAnimation(e.target.value)}
-            title="切换动画"
+            title={t('timeline.switchAnimation')}
           >
-            {animation === undefined && <option value="">(选择动画)</option>}
+            {animation === undefined && <option value="">{t('timeline.selectAnimation')}</option>}
             {animationNames.map((name) => (
               <option key={name} value={name}>{name}</option>
             ))}
           </select>
         ) : (
-          <span className="timeline-note">没有动画 —— 点 + 新建</span>
+          <span className="timeline-note">{t('timeline.noAnimations')}</span>
         )}
-        <button className="anim-add" title="新建动画" onClick={() => addAnimation()}>
+        <button className="anim-add" title={t('timeline.newAnimation')} onClick={() => addAnimation()}>
           +
         </button>
-        {mode !== 'animate' && <span className="timeline-note">绑定姿势模式 —— 切到「动画」才能播放</span>}
+        {mode !== 'animate' && <span className="timeline-note">{t('timeline.setupModeNote')}</span>}
       </div>
 
       <div className="timeline-body">
@@ -173,9 +183,9 @@ export function Timeline() {
               key={`${row.bone}:${row.channel}`}
               className={`track-label${row.bone === selectedBone ? ' is-selected' : ''}`}
               onClick={() => selectBone(row.bone)}
-              title={`${row.bone} · ${CHANNEL_LABEL[row.channel]}`}
+              title={t('timeline.trackLabel', { bone: row.bone, channel: t(CHANNEL_KEY[row.channel]) })}
             >
-              {row.bone} <small>{CHANNEL_LABEL[row.channel]}</small>
+              {row.bone} <small>{t(CHANNEL_KEY[row.channel])}</small>
             </button>
           ))}
         </div>
@@ -199,7 +209,7 @@ export function Timeline() {
                   key={k.time}
                   className="keyframe"
                   style={{ left: pct(k.time) }}
-                  title={keyTooltip(row, k)}
+                  title={keyTooltip(t, row, k)}
                   onClick={() => {
                     setPlaying(false)
                     setTime(k.time)

@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { createEmptyProject, fromProjectDocument, toProjectDocument } from '@project/types.ts'
 import { platform } from '@platform/index.ts'
+import { tt, useT } from '@i18n/index.ts'
+import { LanguageSwitch } from './LanguageSwitch.tsx'
 import type { ImageAsset } from '@project/types.ts'
 import { selectCanRedo, selectCanUndo, useEditorStore } from '@store/editorStore.ts'
 import { Viewport } from './Viewport.tsx'
@@ -26,7 +28,7 @@ function imageSize(bytes: Uint8Array): Promise<{ width: number; height: number }
     }
     image.onerror = () => {
       URL.revokeObjectURL(url)
-      reject(new Error('无法读取图片尺寸'))
+      reject(new Error(tt('error.imageSize')))
     }
     image.src = url
   })
@@ -79,6 +81,7 @@ function useShortcuts() {
 
 export function App() {
   useShortcuts()
+  const t = useT()
   const [status, setStatus] = useState('')
 
   const canUndo = useEditorStore(selectCanUndo)
@@ -106,14 +109,14 @@ export function App() {
       const text = await platform().readProject(dir)
       if (text === null) {
         replaceProject(createEmptyProject(projectNameFromDir(dir)))
-        setStatus('已创建新项目目录')
+        setStatus(t('status.projectCreated'))
       } else {
         replaceProject(fromProjectDocument(JSON.parse(text)))
-        setStatus('项目已打开')
+        setStatus(t('status.projectOpened'))
       }
       setProjectDir(dir)
     } catch (error) {
-      setStatus(`打开失败: ${error instanceof Error ? error.message : String(error)}`)
+      setStatus(t('status.openFailed', { error: error instanceof Error ? error.message : String(error) }))
     }
   }
 
@@ -121,9 +124,9 @@ export function App() {
     if (projectDir === null) return
     try {
       await platform().writeProject(projectDir, JSON.stringify(toProjectDocument(doc), null, 2))
-      setStatus('已保存')
+      setStatus(t('status.saved'))
     } catch (error) {
-      setStatus(`保存失败: ${error instanceof Error ? error.message : String(error)}`)
+      setStatus(t('status.saveFailed', { error: error instanceof Error ? error.message : String(error) }))
     }
   }
 
@@ -136,9 +139,9 @@ export function App() {
         return { id: `image:${name}`, path: name, ...size }
       }))
       addImages(images)
-      setStatus(images.length === 0 ? '' : `已导入 ${images.length} 张图片`)
+      setStatus(images.length === 0 ? '' : t('status.imagesImported', { n: images.length }))
     } catch (error) {
-      setStatus(`导入失败: ${error instanceof Error ? error.message : String(error)}`)
+      setStatus(t('status.importFailed', { error: error instanceof Error ? error.message : String(error) }))
     }
   }
 
@@ -147,24 +150,24 @@ export function App() {
       <header className="toolbar">
         <span className="brand">AnimatorGo</span>
 
-        <button onClick={() => void openProject()}>打开项目</button>
-        <button onClick={() => void saveProject()} disabled={projectDir === null}>保存</button>
-        <button onClick={() => void importImages()} disabled={projectDir === null}>导入图片</button>
+        <button onClick={() => void openProject()}>{t('toolbar.openProject')}</button>
+        <button onClick={() => void saveProject()} disabled={projectDir === null}>{t('toolbar.save')}</button>
+        <button onClick={() => void importImages()} disabled={projectDir === null}>{t('toolbar.importImages')}</button>
 
         <div className="mode-switch">
           <button
             className={mode === 'setup' ? 'is-active' : ''}
             onClick={() => setMode('setup')}
-            title="编辑绑定姿势"
+            title={t('mode.setupTitle')}
           >
-            绑定姿势
+            {t('mode.setup')}
           </button>
           <button
             className={mode === 'animate' ? 'is-active' : ''}
             onClick={() => setMode('animate')}
-            title="编辑关键帧"
+            title={t('mode.animateTitle')}
           >
-            动画
+            {t('mode.animate')}
           </button>
         </div>
 
@@ -172,47 +175,44 @@ export function App() {
           <button
             className={tool === 'rotate' ? 'is-active' : ''}
             onClick={() => setTool('rotate')}
-            title="拖动骨骼旋转 (R)"
+            title={t('tool.rotateTitle')}
           >
-            旋转
+            {t('tool.rotate')}
           </button>
           <button
             className={tool === 'translate' ? 'is-active' : ''}
             onClick={() => setTool('translate')}
-            title="拖动骨骼平移 (T)"
+            title={t('tool.translateTitle')}
           >
-            平移
+            {t('tool.translate')}
           </button>
           <button
             className={tool === 'scale' ? 'is-active' : ''}
             onClick={() => setTool('scale')}
-            title="拖动骨骼缩放 (S)"
+            title={t('tool.scaleTitle')}
           >
-            缩放
+            {t('tool.scale')}
           </button>
         </div>
 
         <button onClick={undo} disabled={!canUndo} title="Ctrl+Z">
-          撤销
+          {t('toolbar.undo')}
         </button>
         <button onClick={redo} disabled={!canRedo} title="Ctrl+Shift+Z">
-          重做
+          {t('toolbar.redo')}
         </button>
         <button
           onClick={() => selectedBone !== null && keyBoneAtTime(selectedBone)}
           disabled={selectedBone === null || mode !== 'animate'}
-          title="K"
+          title={t('toolbar.keyTitle')}
         >
-          打关键帧
+          {t('toolbar.key')}
         </button>
 
-        <span className="history-depth">历史 {historyDepth}</span>
+        <span className="history-depth">{t('toolbar.history', { n: historyDepth })}</span>
         {status !== '' && <span className="project-status">{status}</span>}
-        <span className="hint">
-          {mode === 'animate'
-            ? '空格播放 · 拖动骨骼在当前时刻打帧 · 右键关键帧删除 · R/T/S 换工具'
-            : '拖动骨骼修改绑定姿势 · R/T/S 换工具'}
-        </span>
+        <LanguageSwitch />
+        <span className="hint">{t(mode === 'animate' ? 'hint.animate' : 'hint.setup')}</span>
       </header>
 
       <main className="workspace">

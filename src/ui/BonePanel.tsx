@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react'
 import { samplePose } from '@core/animation.ts'
 import { useEditorStore } from '@store/editorStore.ts'
+import { useT } from '@i18n/index.ts'
 
 /**
  * 选中骨骼的 TRS 数值编辑。
@@ -52,6 +53,7 @@ function NumField({ label, value, step = 1, disabled = false, title, onCommit }:
 }
 
 export function BonePanel() {
+  const t = useT()
   const doc = useEditorStore((s) => s.doc)
   const mode = useEditorStore((s) => s.mode)
   const time = useEditorStore((s) => s.time)
@@ -87,21 +89,21 @@ export function BonePanel() {
   return (
     <div className="panel bone-panel">
       <div className="panel-title">
-        {name} · {mode === 'animate' ? '当前姿势(编辑打关键帧)' : '绑定姿势'}
+        {name} · {t(mode === 'animate' ? 'bonePanel.headerAnimate' : 'bonePanel.headerSetup')}
       </div>
       <div className="prop-grid">
         <NumField label="X" value={v.x} onCommit={(x, tag) => setBoneTranslation(name, x, v.y, `${tag}:x`)} />
         <NumField label="Y" value={v.y} onCommit={(y, tag) => setBoneTranslation(name, v.x, y, `${tag}:y`)} />
-        <NumField label="旋转" value={v.rotation} onCommit={(r, tag) => setBoneRotation(name, r, `${tag}:rot`)} />
-        <NumField label="长度" value={bone.length} disabled={mode === 'animate'}
-          title={mode === 'animate' ? '长度只是编辑器显示用,不可动画' : undefined}
+        <NumField label={t('bonePanel.rotation')} value={v.rotation} onCommit={(r, tag) => setBoneRotation(name, r, `${tag}:rot`)} />
+        <NumField label={t('bonePanel.length')} value={bone.length} disabled={mode === 'animate'}
+          title={mode === 'animate' ? t('bonePanel.lengthNote') : undefined}
           onCommit={(l, tag) => setBoneLength(name, l, `${tag}:len`)} />
-        <NumField label="缩放X" value={v.scaleX} step={0.1}
+        <NumField label={t('bonePanel.scaleX')} value={v.scaleX} step={0.1}
           onCommit={(sx, tag) => setBoneScale(name, sx, v.scaleY, `${tag}:sx`)} />
-        <NumField label="缩放Y" value={v.scaleY} step={0.1}
+        <NumField label={t('bonePanel.scaleY')} value={v.scaleY} step={0.1}
           onCommit={(sy, tag) => setBoneScale(name, v.scaleX, sy, `${tag}:sy`)} />
-        <NumField label="斜切X" value={v.shearX} onCommit={(x, tag) => setBoneShear(name, x, v.shearY, `${tag}:shx`)} />
-        <NumField label="斜切Y" value={v.shearY} onCommit={(y, tag) => setBoneShear(name, v.shearX, y, `${tag}:shy`)} />
+        <NumField label={t('bonePanel.shearX')} value={v.shearX} onCommit={(x, tag) => setBoneShear(name, x, v.shearY, `${tag}:shx`)} />
+        <NumField label={t('bonePanel.shearY')} value={v.shearY} onCommit={(y, tag) => setBoneShear(name, v.shearX, y, `${tag}:shy`)} />
       </div>
     </div>
   )

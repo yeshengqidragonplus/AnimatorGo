@@ -764,3 +764,26 @@ body {
   border-right: 4.5px solid transparent;
   border-top: 7px solid #ff5f56;
 }
+
+/* ── 语言切换 ───────────────────────────────────────────────────────────── */
+
+.language-switch {
+  margin-left: auto;
+  background: #1e2430;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.language-switch:hover {
+  background: #272f3e;
+}
+
+/* 语言下拉接管了右推,提示文字改为普通间距 */
+.toolbar .hint {
+  margin-left: 0;
+}

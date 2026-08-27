@@ -54,6 +54,21 @@ imageId 的冒号会撞上 `.atlas` 文本语法;文件名两边一致,重新打
 **已知限制(刻意抛错而非静默忽略):**
 `BoneData.inheritRotation / inheritScale` 的非默认值会在 `Skeleton` 构造时抛错。
 
+## 多语言
+
+界面支持 en / zh / es / fr / de,实现在 [src/i18n/](src/i18n/)。
+
+**加新界面文案时:先加到 [locales/en.ts](src/i18n/locales/en.ts)** —— 它是 key 的唯一真源,
+其余四个语言声明成 `Record<TranslationKey, string>`,少一个 key **编译不过**。
+
+- 组件里:`const t = useT()`,然后 `t('toolbar.save')`
+- 组件外(工具函数、抛异常):`tt('error.imageSize')`
+- 占位符写 `{name}`;漏传参数时**原样保留**不静默变空串,便于发现
+- **不要把文案写进模块级常量** —— 常量求值早于语言选择,切换语言不会更新。
+  存 key,渲染时再翻译(见 `Timeline.tsx` 的 `CHANNEL_KEY`)
+
+`i18n.test.ts` 会校验五个语言的 key 集合一致、无空串、占位符一致。
+
 ## 先读这些
 
 设计理由都在文档里,不要在本文件重复:

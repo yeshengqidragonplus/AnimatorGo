@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useEditorStore } from '@store/editorStore.ts'
 import { packProjectAtlas, type PackedProjectAtlas } from './atlasCompose.ts'
+import { useT } from '@i18n/index.ts'
 
 /**
  * 正式图集:打包按钮 + 打包结果预览。
@@ -9,6 +10,7 @@ import { packProjectAtlas, type PackedProjectAtlas } from './atlasCompose.ts'
  * 这里的预览是给人检查排布和裁剪对不对的。
  */
 export function AtlasPanel() {
+  const t = useT()
   const doc = useEditorStore((s) => s.doc)
   const projectDir = useEditorStore((s) => s.projectDir)
   const setAtlas = useEditorStore((s) => s.setAtlas)
@@ -52,27 +54,27 @@ export function AtlasPanel() {
   return (
     <section className="atlas-panel">
       <div className="panel-title panel-title-actions">
-        <span>图集</span>
+        <span>{t('atlas.title')}</span>
         <button
           className="atlas-pack-btn"
           disabled={projectDir === null || doc.images.length === 0 || busy}
-          title={projectDir === null ? '先打开项目目录' : doc.images.length === 0 ? '先导入图片' : '按 MaxRects 打包全部图片'}
+          title={projectDir === null ? t('atlas.openProjectFirst') : doc.images.length === 0 ? t('atlas.importImagesFirst') : t('atlas.packTitle')}
           onClick={() => void pack()}
         >
-          {busy ? '打包中…' : '打包'}
+          {busy ? t('atlas.packing') : t('atlas.pack')}
         </button>
       </div>
 
       {error !== '' && <p className="atlas-error">{error}</p>}
 
       {atlas === undefined ? (
-        <p className="asset-empty">尚未打包。打包会裁掉透明边并生成 atlases/ 下的页 PNG 与 .atlas 文本。</p>
+        <p className="asset-empty">{t('atlas.notPacked')}</p>
       ) : (
         <div className="atlas-info">
           <span title={atlas.path}>{atlas.path}</span>
-          <small>{atlas.pages.length} 页</small>
+          <small>{t('atlas.pages', { n: atlas.pages.length })}</small>
           {result !== null && (
-            <button onClick={() => setShowPreview(true)}>预览</button>
+            <button onClick={() => setShowPreview(true)}>{t('atlas.preview')}</button>
           )}
         </div>
       )}
@@ -82,9 +84,9 @@ export function AtlasPanel() {
           <div className="atlas-preview" onClick={(e) => e.stopPropagation()}>
             <div className="atlas-preview-head">
               <span>
-                图集预览 · {result.layout.regions.length} 个区域 · {result.layout.pages.length} 页
+                {t('atlas.previewTitle', { regions: result.layout.regions.length, pages: result.layout.pages.length })}
               </span>
-              <button onClick={() => setShowPreview(false)}>关闭</button>
+              <button onClick={() => setShowPreview(false)}>{t('atlas.close')}</button>
             </div>
             <div className="atlas-preview-pages">
               {result.layout.pages.map((page, pageIndex) => (
@@ -105,7 +107,7 @@ export function AtlasPanel() {
                           <div
                             key={region.name}
                             className="atlas-region-box"
-                            title={`${region.name}${region.rotated ? ' (旋转 90°)' : ''}`}
+                            title={region.rotated ? t('atlas.regionRotated', { name: region.name }) : region.name}
                             style={{
                               left: `${(region.x / page.width) * 100}%`,
                               top: `${(region.y / page.height) * 100}%`,

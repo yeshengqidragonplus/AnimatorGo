@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "node scripts/dev.mjs",
-    "build": "tsc -b --noEmit && node scripts/build.mjs",
+    "build": "tsc -b --noEmit && node --max-old-space-size=4096 scripts/build.mjs",
     "build:win": "pnpm build && electron-builder --win",
     "build:mac": "pnpm build && electron-builder --mac",
     "typecheck": "tsc -b --noEmit",

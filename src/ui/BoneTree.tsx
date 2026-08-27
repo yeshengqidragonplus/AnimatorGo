@@ -2,6 +2,7 @@ import { useMemo } from 'react'
 import { sampleRotation } from '@core/animation.ts'
 import type { BoneData } from '@core/types.ts'
 import { useEditorStore } from '@store/editorStore.ts'
+import { useT } from '@i18n/index.ts'
 
 interface Row {
   bone: BoneData
@@ -22,6 +23,7 @@ function depthsOf(bones: readonly BoneData[]): number[] {
 }
 
 export function BoneTree() {
+  const t = useT()
   const bones = useEditorStore((s) => s.doc.skeleton.bones)
   const animations = useEditorStore((s) => s.doc.animations)
   const currentAnimation = useEditorStore((s) => s.currentAnimation)
@@ -49,9 +51,9 @@ export function BoneTree() {
   return (
     <div className="panel">
       <div className="panel-title panel-title-actions">
-        <span>骨骼{mode === 'animate' ? ' · 当前姿势' : ' · 绑定姿势'}</span>
+        <span>{t(mode === 'animate' ? 'bones.currentPose' : 'bones.setupPose')}</span>
         <button
-          title={selectedBone === null ? '添加根骨骼' : `添加 ${selectedBone} 的子骨骼`}
+          title={selectedBone === null ? t('bones.addRoot') : t('bones.addChild', { name: selectedBone })}
           onClick={() => selectBone(addBone(selectedBone))}
         >
           +

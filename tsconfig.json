@@ -2,36 +2,60 @@
   "compilerOptions": {
     "target": "ES2022",
     "useDefineForClassFields": true,
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
     "module": "ESNext",
     "skipLibCheck": true,
-
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
     "isolatedModules": true,
     "moduleDetection": "force",
     "noEmit": true,
     "jsx": "react-jsx",
-
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
-
-    "types": ["node", "vite/client"],
-
+    "types": [
+      "node",
+      "vite/client"
+    ],
     "baseUrl": ".",
     "paths": {
-      "@core/*": ["src/core/*"],
-      "@render/*": ["src/render/*"],
-      "@store/*": ["src/store/*"],
-      "@ui/*": ["src/ui/*"],
-      "@platform/*": ["src/platform/*"],
-      "@project/*": ["src/project/*"],
-      "@plugins/*": ["src/plugins/*"]
+      "@core/*": [
+        "src/core/*"
+      ],
+      "@render/*": [
+        "src/render/*"
+      ],
+      "@store/*": [
+        "src/store/*"
+      ],
+      "@ui/*": [
+        "src/ui/*"
+      ],
+      "@platform/*": [
+        "src/platform/*"
+      ],
+      "@project/*": [
+        "src/project/*"
+      ],
+      "@plugins/*": [
+        "src/plugins/*"
+      ],
+      "@i18n/*": [
+        "src/i18n/*"
+      ]
     }
   },
-  "include": ["src", "electron", "vite.config.ts"]
+  "include": [
+    "src",
+    "electron",
+    "vite.config.ts"
+  ]
 }
