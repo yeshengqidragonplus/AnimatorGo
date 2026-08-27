@@ -2,6 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⭐ 项目定位(先读这条)
+
+**这是一个 2D 骨骼动画的格式转换器,不是编辑器。**
+
+核心能力:Spine / Unity / Godot / Cocos 之间互转,以及 Spine 3.8 ⇄ 4.1 版本互转。
+
+仓库里已有一个编辑器 MVP(骨骼、时间轴、图集、slot、Electron 壳、多语言)——
+那是转向之前做的。**代码保留,但停止投入**,编辑器降级为可选的查看/临时编辑视图。
+
+**不要按「做编辑器」推进工作。** 完整理由见 [docs/DECISIONS.md](docs/DECISIONS.md) 开头。
+
 ## 命令
 
 包管理器是 **pnpm**。这是 **Electron 桌面应用**,不是网页应用。
@@ -82,6 +93,26 @@ imageId 的冒号会撞上 `.atlas` 文本语法;文件名两边一致,重新打
 
 ## 硬约束
 
+### 中转模型必须是超集,不能用编辑器的格式
+
+跨格式转换走中转模型(2N 个转换器而非 N²),模型形状取自 **Spine** ——
+它在五个格式里最丰富。
+
+**绝对不能用 `src/core/` 编辑器格式当中转** —— 它是 Spine 的子集,
+Spine 资产过一遍会**静默**丢掉约束、皮肤、网格形变。
+
+### 版本迁移不走中转模型
+
+Spine 3.8 ⇄ 4.1 两边数据模型相同,直接在 JSON 树上变换,**不认识的字段原样透传**。
+走一遍中转反而可能丢东西。见 `src/spine-convert/`。
+
+### 有损必须报告,不得静默
+
+Unity / Cocos 没有 slot、skin、path 约束的对应物 —— 这不是"难",是"不存在"。
+每次转换产出 `ConversionIssue`(loss / approximated / info)。
+
+**「Spine → Unity → 改 → 转回 Spine」的往返做不到**,不要朝这个方向投入。
+
 ### `core/` 不得依赖任何渲染 API
 
 ```
@@ -111,22 +142,25 @@ render/   薄适配层。PixiJS / Godot / Unity / Cocos 各一个
 
 以下均已评估否决,理由见 [docs/DECISIONS.md](docs/DECISIONS.md)。不要因为「技术上可行」重提:
 
-- 复制、移植或翻译 Spine Runtime 源码（兼容导入/导出必须自行实现）
+- 复制、移植或翻译 Spine Runtime 源码(解析器与序列化器必须自行实现)
 - Live2D `.moc3` 导出
-- DragonBones 格式作为中间格式
-- 导出引擎原生动画格式(替代运行时路线)
-- PolyRig 等第三方付费插件
+- DragonBones 格式作为中转模型
+- 用编辑器的 `core/` 格式当中转模型(它是子集,会静默丢特性)
+- 跨工具往返编辑(Spine → Unity → 改 → 转回 Spine)
 - Rust + wgpu + egui 技术栈
+
+~~导出引擎原生动画格式~~ 已不在此列 —— **那正是现在要做的事**。
+旧的「自建格式 + 每引擎运行时」路线已随转向作废。
 
 ## 实现顺序
 
-1. 内部项目格式与 importer/exporter 插件 SDK
-2. 项目管理、图片部件、图集、slot/attachment 可视化编辑
-3. 骨骼绑定 + TRS 时间轴 + 实时预览 ← **首个可用闭环**
-4. Spine JSON + atlas 导入插件
-5. Godot / Unity / Cocos 自有格式导出插件与最小运行时
-6. Spine 3.8 / 4.1 JSON + atlas 兼容导出插件
-7. 网格形变、IK、动画融合
+顺序由依赖关系决定:**10 条转换路径没有一条不经过「读写 Spine JSON」。**
+
+1. **Spine JSON 读写 + 3.8 ⇄ 4.1** ← 地基,且是唯一能逐字段对标准答案的
+2. 中转模型定型(用 Spine 的数据模型形状)
+3. Unity 出 + Unity 进(最重的一块 —— `.meta` 里的 SpriteBone/权重、GUID 稳定性)
+4. Godot / Cocos
+5. 编辑器(可选,届时再决定)
 
 ## 动手前必须知道的坑
 
