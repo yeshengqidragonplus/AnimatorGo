@@ -39,11 +39,18 @@ pnpm test:watch
 批量转换 Spine 版本:
 
 ```bash
-pnpm convert <输入路径> --to 4.1 [--out 目录] [--dry-run]
+pnpm convert <输入路径> --to 4.1 [--out 目录] [--format skel|json] [--dry-run]
 ```
+
+`.skel` 与 `.json` **两种格式都能读能写**,`--format` 不给就跟随输入格式。
+把 `.skel` 转成 `.json` 是最快的排查手段 —— 二进制看不出问题,JSON 一眼就能看。
 
 不会覆盖输入文件(默认写到 `<输入目录>_converted`),同名 `.atlas` / `.png` 一并复制。
 每个产物写出前会**自动回读自检**,与其产出坏文件不如当场失败。
+
+⚠️ **JSON 里没有字符串表**(二进制用下标引用,JSON 直接写名字),所以
+`skel → json → skel` **不会逐字节相同**,只保证结构与数值一致。
+逐字节相同只适用于 `skel → skel`。
 
 跑单个测试文件:`pnpm exec vitest run src/core/math.test.ts`
 跑单个用例:`pnpm exec vitest run -t "旋转差值走最短路径"`

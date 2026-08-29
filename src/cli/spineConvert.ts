@@ -3,6 +3,8 @@ import { basename, dirname, extname, join, relative, resolve } from 'node:path'
 import { readSkeletonPart, type SpineMajor } from '../spine-format/binary/readSkeleton.ts'
 import { writeSkeleton } from '../spine-format/binary/writeSkeleton.ts'
 import { convertSkeleton } from '../spine-convert/skel/convert.ts'
+import { toJsonText } from '../spine-format/json/toJson.ts'
+import { fromJsonText } from '../spine-format/json/fromJson.ts'
 import type { ConversionIssue } from '../spine-convert/types.ts'
 
 /**
@@ -17,8 +19,11 @@ import type { ConversionIssue } from '../spine-convert/types.ts'
  */
 
 const SKEL_SUFFIXES = ['.skel', '.skel.bytes']
+const JSON_SUFFIX = '.json'
 /** 图集与贴图不随版本变化,直接复制 */
 const COMPANION_SUFFIXES = ['.atlas', '.atlas.txt', '.png']
+
+type OutputFormat = 'skel' | 'json' | 'same'
 
 interface Options {
   readonly input: string
@@ -26,6 +31,8 @@ interface Options {
   readonly targetVersion: string
   readonly out: string
   readonly dryRun: boolean
+  /** `same` 表示跟随输入格式 */
+  readonly format: OutputFormat
 }
 
 function parseArgs(argv: readonly string[]): Options | string {
@@ -60,9 +67,13 @@ function parseArgs(argv: readonly string[]): Options | string {
   const inputIsDir = statSync(input).isDirectory()
   const baseDir = inputIsDir ? input : dirname(input)
 
+  const format = (flags.get('format') ?? 'same') as OutputFormat
+  if (!['skel', 'json', 'same'].includes(format)) return `--format 只能是 skel / json`
+
   return {
     input: resolve(input),
     to: major,
+    format,
     // 用户给了完整版本号(如 4.1.23)就照写,否则用该大版本的常见补丁号
     targetVersion: /^\d+\.\d+\.\d+$/.test(to) ? to : major === '3.8' ? '3.8.95' : '4.1.23',
     out: resolve(flags.get('out') ?? `${baseDir}_converted`),
@@ -74,15 +85,24 @@ function isSkel(name: string): boolean {
   return SKEL_SUFFIXES.some((s) => name.endsWith(s))
 }
 
+function isJson(name: string): boolean {
+  return name.endsWith(JSON_SUFFIX)
+}
+
+/** 骨骼文件:二进制或 JSON */
+function isSkeletonFile(name: string): boolean {
+  return isSkel(name) || isJson(name)
+}
+
 function collectSkelFiles(root: string): string[] {
-  if (statSync(root).isFile()) return isSkel(root) ? [root] : []
+  if (statSync(root).isFile()) return isSkeletonFile(root) ? [root] : []
 
   const out: string[] = []
   const walk = (dir: string) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const full = join(dir, entry.name)
       if (entry.isDirectory()) walk(full)
-      else if (isSkel(entry.name)) out.push(full)
+      else if (isSkeletonFile(entry.name)) out.push(full)
     }
   }
   walk(root)
@@ -92,7 +112,7 @@ function collectSkelFiles(root: string): string[] {
 /** 去掉 .skel / .skel.bytes 后缀,拿到用于配对 atlas / png 的基名 */
 function skeletonBaseName(file: string): string {
   const name = basename(file)
-  for (const suffix of SKEL_SUFFIXES) {
+  for (const suffix of [...SKEL_SUFFIXES, JSON_SUFFIX]) {
     if (name.endsWith(suffix)) return name.slice(0, -suffix.length)
   }
   return name.slice(0, -extname(name).length)
@@ -109,11 +129,13 @@ interface FileResult {
 
 function convertFile(file: string, options: Options, baseDir: string): FileResult {
   const rel = relative(baseDir, file)
-  const bytes = new Uint8Array(readFileSync(file))
+  const sourceIsJson = isJson(file)
 
   let part
   try {
-    part = readSkeletonPart(bytes)
+    part = sourceIsJson
+      ? fromJsonText(readFileSync(file, 'utf-8'))
+      : readSkeletonPart(new Uint8Array(readFileSync(file)))
   } catch (error) {
     return {
       file: rel, from: '?', to: options.targetVersion, status: 'failed',
@@ -121,7 +143,7 @@ function convertFile(file: string, options: Options, baseDir: string): FileResul
     }
   }
 
-  if (part.failure !== null) {
+  if (!sourceIsJson && part.failure !== null) {
     return {
       file: rel, from: part.header.version, to: options.targetVersion, status: 'failed',
       note: `解析中断于动画「${part.failure.name}」偏移 ${part.failure.offset}:${part.failure.message}`,
@@ -129,32 +151,47 @@ function convertFile(file: string, options: Options, baseDir: string): FileResul
     }
   }
 
-  if (part.header.major === options.to) {
+  const asJson = options.format === 'json' || (options.format === 'same' && sourceIsJson)
+
+  // 版本相同**且**格式也没变才算无事可做 —— 否则「4.1 转 4.1 但导成 JSON」会被误跳过
+  if (part.header.major === options.to && asJson === sourceIsJson) {
     return {
       file: rel, from: part.header.version, to: part.header.version, status: 'skipped',
-      note: '已经是目标版本', issues: [],
+      note: '已经是目标版本与格式', issues: [],
     }
   }
 
   const { part: converted, issues } = convertSkeleton(part, options.to, options.targetVersion)
-  const output = writeSkeleton(converted)
 
   // 立刻回读一遍 —— 与其产出一个坏文件,不如当场失败
-  const verify = readSkeletonPart(output)
-  if (verify.failure !== null || verify.endOffset !== verify.totalBytes) {
+  let output: Uint8Array | string
+  try {
+    if (asJson) {
+      output = toJsonText(converted)
+      fromJsonText(output)
+    } else {
+      output = writeSkeleton(converted)
+      const verify = readSkeletonPart(output)
+      if (verify.failure !== null || verify.endOffset !== verify.totalBytes) {
+        throw new Error(verify.failure?.message ?? '未读到文件末尾')
+      }
+    }
+  } catch (error) {
     return {
       file: rel, from: part.header.version, to: options.targetVersion, status: 'failed',
-      note: `产物自检未通过:${verify.failure?.message ?? '未读到文件末尾'}`, issues,
+      note: `产物自检未通过:${error instanceof Error ? error.message : String(error)}`, issues,
     }
   }
 
   if (!options.dryRun) {
-    const target = join(options.out, rel)
+    // 换了格式就换扩展名,否则沿用原文件名
+    const base = skeletonBaseName(file)
+    const targetName = asJson === sourceIsJson ? basename(file) : base + (asJson ? '.json' : '.skel.bytes')
+    const target = join(options.out, dirname(rel) === '.' ? targetName : join(dirname(rel), targetName))
     mkdirSync(dirname(target), { recursive: true })
     writeFileSync(target, output)
 
     // 图集与贴图不随版本变化,一并复制,让产物可直接使用
-    const base = skeletonBaseName(file)
     for (const suffix of COMPANION_SUFFIXES) {
       const companion = join(dirname(file), base + suffix)
       if (existsSync(companion)) {
@@ -225,15 +262,16 @@ function main(): number {
   const parsed = parseArgs(process.argv.slice(2))
   if (typeof parsed === 'string') {
     console.error(`✗ ${parsed}\n`)
-    console.error('用法:  pnpm convert <输入路径> --to <版本> [--out <目录>] [--dry-run]')
+    console.error('用法:  pnpm convert <输入路径> --to <版本> [--out <目录>] [--format skel|json] [--dry-run]')
     console.error('例:    pnpm convert res/spine/3.8 --to 4.1')
     console.error('       pnpm convert res/spine --to 3.8 --out /tmp/out --dry-run')
+    console.error('       pnpm convert res/spine/4.1 --to 4.1 --format json   # 转成可读的 JSON')
     return 2
   }
 
   const files = collectSkelFiles(parsed.input)
   if (files.length === 0) {
-    console.error(`✗ ${parsed.input} 下没有找到 .skel / .skel.bytes 文件`)
+    console.error(`✗ ${parsed.input} 下没有找到 .skel / .skel.bytes / .json 文件`)
     return 1
   }
 
