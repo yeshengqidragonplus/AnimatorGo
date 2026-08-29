@@ -186,10 +186,58 @@ offsetRotation、offsetX、offsetY、offsetScaleX、offsetScaleY、offsetShearY(
 
 ---
 
-## 7. 待整理
+## 7. 动画 —— 两版差异最多的一段
 
-- Path 约束的字段顺序
-- 皮肤与各类 attachment(region / mesh / linkedmesh / boundingbox / path / point / clipping)
-- 事件
-- **动画时间轴的关键帧与曲线编码** —— changelog 明确说 4.0"改了曲线格式并增加了省略默认值的假设",
-  这是剩余工作里最大的一块
+已用真实文件完整验证:两个版本都能读到文件最后一个字节,且时间轴结构逐项一致。
+
+### 7.1 ⚠️ 帧与曲线的排列顺序不同(最容易踩的一处)
+
+```
+3.8:  t0 v0 曲线0 | t1 v1 曲线1 | t2 v2        每帧读自己的值,后面跟曲线
+4.x:  t0 v0 | t1 v1 曲线0 | t2 v2 曲线1        曲线挪到了「下一帧的值之后」
+```
+
+4.x 要先把第一帧读出来,再错位循环。**用 4.x 的读法去读 3.8 会从头开始读乱码。**
+
+### 7.2 每条动画的开头
+
+4.x 多一个**时间轴总数** varint,3.8 没有。
+
+### 7.3 时间轴头
+
+| | 3.8 | 4.x |
+|---|---|---|
+| 通用 | type, frameCount | type, frameCount, **bezierCount** |
+| attachment / drawOrder / event | 同上 | **不写 bezierCount**(没有曲线) |
+
+### 7.4 多值通道的贝塞尔
+
+3.8 无论几个分量都只存**一条**曲线;4.x **每个分量各一条**。
+
+- translate:3.8 是 4 个 float,4.x 是 8 个
+- RGBA:3.8 是 4 个,4.x 是 16 个
+
+**降级时若各分量曲线不同,只能保留一条 —— 必须报 loss。**
+
+### 7.5 分段顺序
+
+两版相同:slot → 骨骼 → IK → transform → path → deform → drawOrder → event。
+
+4.x 把 deform 段改名为「attachment 时间轴」,并在每条时间轴前加了**子类型字节**
+(0 = deform,1 = sequence)。
+
+### 7.6 deform 帧序
+
+```
+3.8:  时间 → 顶点 → 曲线            (每帧)
+4.x:  先读一个时间,循环里是 顶点 → 下一帧时间 → 曲线
+```
+
+### 7.7 slot 颜色
+
+3.8 打包成 `int`;4.x 分通道逐字节。类型也从 3 种扩到 6 种(见第 6 节)。
+
+## 8. 待整理
+
+- path 约束的字段顺序(测试骨架里没有 path 约束,未经真实数据验证)
+- 事件时间轴中带音频事件的 volume / balance(测试骨架无事件)

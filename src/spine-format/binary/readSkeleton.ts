@@ -1,5 +1,6 @@
 import { SpineInput } from './input.ts'
 import { readSkins, type Skin } from './readSkins.ts'
+import { readAnimations, readEvents, type AnimationData, type EventDef } from './readAnimations.ts'
 
 /**
  * 读 `.skel` 的骨架部分(不含皮肤、事件、动画)。
@@ -122,8 +123,18 @@ export interface SkeletonPart {
   readonly transform: readonly TransformRecord[]
   readonly path: readonly PathRecord[]
   readonly skins: readonly Skin[]
-  /** 读到哪个字节为止 —— 后面是事件、动画,尚未实现 */
-  readonly offsetAfterSkins: number
+  readonly events: readonly EventDef[]
+  readonly animations: readonly AnimationData[]
+  /** 动画解析失败时的定位信息;null 表示全部读通 */
+  readonly failure: {
+    name: string
+    index: number
+    offset: number
+    message: string
+    trace: { section: string; offset: number }[]
+  } | null
+  /** 读完之后停在哪个字节。**应当正好等于 totalBytes** —— 不等就是布局有误 */
+  readonly endOffset: number
   readonly totalBytes: number
 }
 
@@ -367,6 +378,8 @@ export function readSkeletonPart(bytes: Uint8Array, expectedMajor?: SpineMajor):
   const transform = readTransform(input, is38)
   const path = readPath(input, is38)
   const skins = readSkins(input, is38, nonessential)
+  const events = readEvents(input)
+  const animationsResult = readAnimations(input, is38)
 
   return {
     header: { hash, version, major, x, y, width, height, nonessential, fps, imagesPath, audioPath },
@@ -377,7 +390,10 @@ export function readSkeletonPart(bytes: Uint8Array, expectedMajor?: SpineMajor):
     transform,
     path,
     skins,
-    offsetAfterSkins: input.offset,
+    events,
+    animations: animationsResult.animations,
+    failure: animationsResult.failure,
+    endOffset: input.offset,
     totalBytes: bytes.length,
   }
 }

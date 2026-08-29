@@ -156,6 +156,44 @@ describe.skipIf(!bothExist)('真实 .skel 文件', () => {
     expect(withSeq).toEqual([])
   })
 
+  it('✅ 完整读完整个文件 —— 最硬的检验,错一个字节就到不了末尾', () => {
+    for (const s of [v38(), v41()]) {
+      expect(s.failure, s.failure ? `${s.failure.name} @ ${s.failure.offset}` : '').toBeNull()
+      expect(s.endOffset).toBe(s.totalBytes)
+    }
+  })
+
+  it('两版的动画名与数量一致', () => {
+    expect(v41().animations.map((a) => a.name)).toEqual(v38().animations.map((a) => a.name))
+  })
+
+  it('两版的时间轴总数一致', () => {
+    const count = (s: ReturnType<typeof v38>) => s.animations.flatMap((a) => a.timelines).length
+    expect(count(v41())).toBe(count(v38()))
+    expect(count(v38())).toBeGreaterThan(0)
+  })
+
+  it('骨骼时间轴逐类型数量一致(rotate/translate/scale)', () => {
+    const tally = (s: ReturnType<typeof v38>) => {
+      const out: Record<string, number> = {}
+      for (const t of s.animations.flatMap((a) => a.timelines)) {
+        if (['rotate', 'translate', 'scale', 'shear', 'deform', 'drawOrder', 'attachment'].includes(t.kind)) {
+          out[t.kind] = (out[t.kind] ?? 0) + 1
+        }
+      }
+      return out
+    }
+    expect(tally(v41())).toEqual(tally(v38()))
+  })
+
+  it('每条时间轴的帧数都大于 0', () => {
+    for (const s of [v38(), v41()]) {
+      for (const t of s.animations.flatMap((a) => a.timelines)) {
+        expect(t.frames.length, `${t.kind}`).toBeGreaterThan(0)
+      }
+    }
+  })
+
   it('slot 引用的骨骼下标在范围内', () => {
     for (const s of [v38(), v41()]) {
       for (const slot of s.slots) {
