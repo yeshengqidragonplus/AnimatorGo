@@ -36,6 +36,15 @@ pnpm test:watch
 **没有用 `vite-plugin-electron`** —— 它当前版本按 rolldown 接口传参,和 Vite 6 对不上,
 能构建但启动不了 Electron。主进程由 [scripts/electron-bundle.mjs](scripts/electron-bundle.mjs) 用 esbuild 单独打包。
 
+批量转换 Spine 版本:
+
+```bash
+pnpm convert <输入路径> --to 4.1 [--out 目录] [--dry-run]
+```
+
+不会覆盖输入文件(默认写到 `<输入目录>_converted`),同名 `.atlas` / `.png` 一并复制。
+每个产物写出前会**自动回读自检**,与其产出坏文件不如当场失败。
+
 跑单个测试文件:`pnpm exec vitest run src/core/math.test.ts`
 跑单个用例:`pnpm exec vitest run -t "旋转差值走最短路径"`
 
