@@ -110,6 +110,52 @@ describe.skipIf(!bothExist)('真实 .skel 文件', () => {
     }
   })
 
+  /**
+   * ⚠️ 两版导出的 attachment **集合相同但顺序不同**(3.8 从 L_hand 开头,
+   * 4.1 从 body 开头)。所以比对必须排序,转换时也不能假设顺序一致 ——
+   * 必须按 slot 下标和名字重新对应。
+   */
+  it('两版的 attachment 集合相同(顺序不保证)', () => {
+    const flat = (s: ReturnType<typeof v38>) =>
+      s.skins
+        .flatMap((k) => k.slots.flatMap((x) => x.attachments.map((t) => `${t.type}:${t.key}`)))
+        .sort()
+
+    expect(v38().skins.map((k) => k.name)).toEqual(v41().skins.map((k) => k.name))
+    expect(flat(v41())).toEqual(flat(v38()))
+  })
+
+  it('皮肤内的 slot 下标集合相同', () => {
+    const slotsOf = (s: ReturnType<typeof v38>) =>
+      s.skins.flatMap((k) => k.slots.map((x) => x.slot)).sort((p, q) => p - q)
+    expect(slotsOf(v41())).toEqual(slotsOf(v38()))
+  })
+
+  it('mesh 的顶点数与 UV 数量对得上 —— 错一个字节这里就崩', () => {
+    for (const s of [v38(), v41()]) {
+      const meshes = s.skins
+        .flatMap((k) => k.slots.flatMap((x) => x.attachments))
+        .filter((a) => a.type === 'mesh')
+      expect(meshes.length).toBeGreaterThan(0)
+
+      for (const m of meshes) {
+        const vertexCount = m.data['vertexCount'] as number
+        expect((m.data['uvs'] as number[]).length).toBe(vertexCount * 2)
+        // 三角形索引必须是 3 的倍数,且都落在顶点范围内
+        const tri = m.data['triangles'] as number[]
+        expect(tri.length % 3).toBe(0)
+        for (const idx of tri) expect(idx).toBeLessThan(vertexCount)
+      }
+    }
+  })
+
+  it('3.8 的 attachment 一律没有 sequence(4.1 才有该特性)', () => {
+    const withSeq = v38()
+      .skins.flatMap((k) => k.slots.flatMap((x) => x.attachments))
+      .filter((a) => a.sequence !== null)
+    expect(withSeq).toEqual([])
+  })
+
   it('slot 引用的骨骼下标在范围内', () => {
     for (const s of [v38(), v41()]) {
       for (const slot of s.slots) {

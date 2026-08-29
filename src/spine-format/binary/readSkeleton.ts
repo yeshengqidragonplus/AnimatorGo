@@ -1,4 +1,5 @@
 import { SpineInput } from './input.ts'
+import { readSkins, type Skin } from './readSkins.ts'
 
 /**
  * 读 `.skel` 的骨架部分(不含皮肤、事件、动画)。
@@ -90,6 +91,28 @@ export interface TransformRecord {
   readonly mixShearY: number
 }
 
+/**
+ * Path 约束。与 transform 约束同样的拆分:3.8 的 `translateMix`
+ * 在 4.x 拆成了 `mixX` / `mixY`。这里统一存 4.x 形式。
+ */
+export interface PathRecord {
+  readonly name: string
+  readonly order: number
+  readonly skinRequired: boolean
+  readonly bones: readonly number[]
+  /** ⚠️ 指向 **slot** 下标,不是骨骼 */
+  readonly target: number
+  readonly positionMode: number
+  readonly spacingMode: number
+  readonly rotateMode: number
+  readonly offsetRotation: number
+  readonly position: number
+  readonly spacing: number
+  readonly mixRotate: number
+  readonly mixX: number
+  readonly mixY: number
+}
+
 export interface SkeletonPart {
   readonly header: SkeletonHeader
   readonly strings: readonly (string | null)[]
@@ -97,8 +120,10 @@ export interface SkeletonPart {
   readonly slots: readonly SlotRecord[]
   readonly ik: readonly IkRecord[]
   readonly transform: readonly TransformRecord[]
-  /** 读到哪个字节为止 —— 后面是 path 约束、皮肤、事件、动画,尚未实现 */
-  readonly offsetAfterTransform: number
+  readonly path: readonly PathRecord[]
+  readonly skins: readonly Skin[]
+  /** 读到哪个字节为止 —— 后面是事件、动画,尚未实现 */
+  readonly offsetAfterSkins: number
   readonly totalBytes: number
 }
 
@@ -235,8 +260,43 @@ function readTransform(input: SpineInput, is38: boolean): TransformRecord[] {
   return out
 }
 
+function readPath(input: SpineInput, is38: boolean): PathRecord[] {
+  const count = input.readVarInt()
+  const out: PathRecord[] = []
+
+  for (let i = 0; i < count; i++) {
+    const head = {
+      name: input.readString() ?? '',
+      order: input.readVarInt(),
+      skinRequired: input.readBoolean(),
+      bones: readBoneList(input),
+      target: input.readVarInt(), // slot 下标
+      positionMode: input.readVarInt(),
+      spacingMode: input.readVarInt(),
+      rotateMode: input.readVarInt(),
+      offsetRotation: input.readFloat(),
+      position: input.readFloat(),
+      spacing: input.readFloat(),
+    }
+
+    if (is38) {
+      const mixRotate = input.readFloat()
+      const translateMix = input.readFloat()
+      out.push({ ...head, mixRotate, mixX: translateMix, mixY: translateMix })
+    } else {
+      out.push({
+        ...head,
+        mixRotate: input.readFloat(),
+        mixX: input.readFloat(),
+        mixY: input.readFloat(),
+      })
+    }
+  }
+  return out
+}
+
 /**
- * 读到 transform 约束为止。后面(path 约束、皮肤、事件、动画)尚未实现。
+ * 读到约束部分为止。后面(path 约束、皮肤、事件、动画)尚未实现。
  *
  * `expectedMajor` 用于覆盖版本推断 —— 两版格式无法自识别,
  * 万一 version 字符串靠不住可以强制指定。
@@ -305,6 +365,8 @@ export function readSkeletonPart(bytes: Uint8Array, expectedMajor?: SpineMajor):
   const slots = readSlots(input)
   const ik = readIk(input)
   const transform = readTransform(input, is38)
+  const path = readPath(input, is38)
+  const skins = readSkins(input, is38, nonessential)
 
   return {
     header: { hash, version, major, x, y, width, height, nonessential, fps, imagesPath, audioPath },
@@ -313,7 +375,9 @@ export function readSkeletonPart(bytes: Uint8Array, expectedMajor?: SpineMajor):
     slots,
     ik,
     transform,
-    offsetAfterTransform: input.offset,
+    path,
+    skins,
+    offsetAfterSkins: input.offset,
     totalBytes: bytes.length,
   }
 }
