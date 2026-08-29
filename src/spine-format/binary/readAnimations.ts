@@ -24,6 +24,7 @@ export const CURVE_BEZIER = 2
 
 export interface EventDef {
   readonly name: string
+  readonly nameIndex: number
   readonly int: number
   readonly float: number
   readonly string: string | null
@@ -38,6 +39,8 @@ export interface Timeline {
   /** slot / bone / 约束的下标,drawOrder 与 event 时间轴为 -1 */
   readonly owner: number
   readonly frames: readonly Record<string, unknown>[]
+  /** 4.x 时间轴头里的贝塞尔总数。3.8 没有这个字段,记为 -1。写回时要原样还原。 */
+  readonly bezierCount: number
 }
 
 export interface AnimationData {
@@ -163,7 +166,9 @@ function readSlotTimeline(
   if (type === SLOT_ATTACHMENT) {
     const frames: Record<string, unknown>[] = []
     for (let i = 0; i < frameCount; i++) {
-      frames.push({ time: input.readFloat(), name: input.readStringRef() })
+      const time = input.readFloat()
+      const at = input.readStringRefAt()
+      frames.push({ time, name: at.value, nameIndex: at.index })
     }
     return { kind: 'attachment', frames }
   }
@@ -242,11 +247,11 @@ function readTimelineHead(
   input: SpineInput,
   is38: boolean,
   hasCurves = true,
-): { frameCount: number } {
+): { frameCount: number; bezierCount: number } {
   const frameCount = input.readVarInt()
   // bezierCount 只在带曲线的时间轴上出现;attachment / drawOrder / event 没有
-  if (!is38 && hasCurves) input.readVarInt()
-  return { frameCount }
+  const bezierCount = !is38 && hasCurves ? input.readVarInt() : -1
+  return { frameCount, bezierCount }
 }
 
 function readAnimation(
@@ -268,9 +273,9 @@ function readAnimation(
     for (let ii = 0, nn = input.readVarInt(); ii < nn; ii++) {
       const type = input.readByte()
       // ⚠️ attachment 时间轴没有曲线,因此 4.x 也**不写** bezierCount
-      const { frameCount } = readTimelineHead(input, is38, type !== SLOT_ATTACHMENT)
+      const { frameCount, bezierCount } = readTimelineHead(input, is38, type !== SLOT_ATTACHMENT)
       const { kind, frames } = readSlotTimeline(input, is38, type, frameCount)
-      timelines.push({ kind, owner: slot, frames })
+      timelines.push({ kind, owner: slot, frames, bezierCount })
     }
   }
 
@@ -280,12 +285,13 @@ function readAnimation(
     const bone = input.readVarInt()
     for (let ii = 0, nn = input.readVarInt(); ii < nn; ii++) {
       const type = input.readByte()
-      const { frameCount } = readTimelineHead(input, is38)
+      const { frameCount, bezierCount } = readTimelineHead(input, is38)
       const shape = boneTimelineShape(type, is38)
       timelines.push({
         kind: shape.kind,
         owner: bone,
         frames: readValueTimeline(input, is38, frameCount, shape.values.length, shape.values),
+        bezierCount,
       })
     }
   }
@@ -294,7 +300,7 @@ function readAnimation(
   // ── IK 约束 ──
   for (let i = 0, n = input.readVarInt(); i < n; i++) {
     const index = input.readVarInt()
-    const { frameCount } = readTimelineHead(input, is38)
+    const { frameCount, bezierCount } = readTimelineHead(input, is38)
     const frames: Record<string, unknown>[] = []
 
     if (is38) {
@@ -337,14 +343,14 @@ function readAnimation(
         softness = s2
       }
     }
-    timelines.push({ kind: 'ik', owner: index, frames })
+    timelines.push({ kind: 'ik', owner: index, frames, bezierCount })
   }
 
   mark('transform 约束 之前')
   // ── transform 约束 ──
   for (let i = 0, n = input.readVarInt(); i < n; i++) {
     const index = input.readVarInt()
-    const { frameCount } = readTimelineHead(input, is38)
+    const { frameCount, bezierCount } = readTimelineHead(input, is38)
     // 3.8:rotate/translate/scale/shear 四个 mix;4.x:六个
     const names = is38
       ? ['mixRotate', 'mixTranslate', 'mixScale', 'mixShear']
@@ -353,6 +359,7 @@ function readAnimation(
       kind: 'transform',
       owner: index,
       frames: readValueTimeline(input, is38, frameCount, names.length, names),
+      bezierCount,
     })
   }
 
@@ -362,7 +369,7 @@ function readAnimation(
     const index = input.readVarInt()
     for (let ii = 0, nn = input.readVarInt(); ii < nn; ii++) {
       const type = input.readByte()
-      const { frameCount } = readTimelineHead(input, is38)
+      const { frameCount, bezierCount } = readTimelineHead(input, is38)
 
       // 0=position 1=spacing 都是单值;2=mix 在 3.8 是两值,4.x 是三值
       const names =
@@ -376,6 +383,7 @@ function readAnimation(
         kind: `path${type}`,
         owner: index,
         frames: readValueTimeline(input, is38, frameCount, names.length, names),
+        bezierCount,
       })
     }
   }
@@ -387,10 +395,11 @@ function readAnimation(
     for (let ii = 0, nn = input.readVarInt(); ii < nn; ii++) {
       const slot = input.readVarInt()
       for (let iii = 0, nnn = input.readVarInt(); iii < nnn; iii++) {
-        const attachment = input.readStringRef()
+        const attachmentAt = input.readStringRefAt()
+        const attachment = attachmentAt.value
         // 4.x 把这段改名为 attachment 时间轴,并加了子类型(0=deform 1=sequence)
         if (!is38) input.readByte()
-        const { frameCount } = readTimelineHead(input, is38)
+        const { frameCount, bezierCount } = readTimelineHead(input, is38)
         const frames: Record<string, unknown>[] = []
 
         /** 一帧的顶点偏移:count 为 0 表示无形变,否则先读起始下标再读 count 个 float */
@@ -426,7 +435,7 @@ function readAnimation(
           }
         }
 
-        timelines.push({ kind: 'deform', owner: slot, frames: [{ skin, attachment, frames }] })
+        timelines.push({ kind: 'deform', owner: slot, frames: [{ skin, attachment, attachmentIndex: attachmentAt.index, frames }], bezierCount })
       }
     }
   }
@@ -444,7 +453,7 @@ function readAnimation(
       }
       frames.push({ time, offsets })
     }
-    timelines.push({ kind: 'drawOrder', owner: -1, frames })
+    timelines.push({ kind: 'drawOrder', owner: -1, frames, bezierCount: -1 })
   }
 
   mark('事件 之前')
@@ -462,7 +471,7 @@ function readAnimation(
         // volume/balance 只在事件带音频时才有 —— 由调用方按事件定义补读
       })
     }
-    timelines.push({ kind: 'event', owner: -1, frames })
+    timelines.push({ kind: 'event', owner: -1, frames, bezierCount: -1 })
   }
 
   mark('结束')
@@ -474,7 +483,8 @@ export function readEvents(input: SpineInput): EventDef[] {
   const count = input.readVarInt()
   const out: EventDef[] = []
   for (let i = 0; i < count; i++) {
-    const name = input.readStringRef() ?? ''
+    const nameAt = input.readStringRefAt()
+    const name = nameAt.value ?? ''
     const int = input.readVarInt(false)
     const float = input.readFloat()
     const string = input.readString()
@@ -485,7 +495,7 @@ export function readEvents(input: SpineInput): EventDef[] {
       volume = input.readFloat()
       balance = input.readFloat()
     }
-    out.push({ name, int, float, string, audioPath, volume, balance })
+    out.push({ name, nameIndex: nameAt.index, int, float, string, audioPath, volume, balance })
   }
   return out
 }

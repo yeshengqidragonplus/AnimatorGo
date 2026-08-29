@@ -46,6 +46,7 @@ export interface SlotRecord {
   readonly color: number
   readonly darkColor: number // -1 = 无暗色
   readonly attachmentName: string | null
+  readonly attachmentNameIndex: number
   readonly blendMode: number
 }
 
@@ -180,12 +181,18 @@ function readSlots(input: SpineInput): SlotRecord[] {
   const count = input.readVarInt()
   const slots: SlotRecord[] = []
   for (let i = 0; i < count; i++) {
+    const name = input.readString() ?? ''
+    const bone = input.readVarInt()
+    const color = input.readInt()
+    const darkColor = input.readInt()
+    const attachment = input.readStringRefAt()
     slots.push({
-      name: input.readString() ?? '',
-      bone: input.readVarInt(),
-      color: input.readInt(),
-      darkColor: input.readInt(),
-      attachmentName: input.readStringRef(),
+      name,
+      bone,
+      color,
+      darkColor,
+      attachmentName: attachment.value,
+      attachmentNameIndex: attachment.index,
       blendMode: input.readVarInt(),
     })
   }

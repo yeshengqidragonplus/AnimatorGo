@@ -46,6 +46,11 @@ export interface Attachment {
   readonly key: string
   /** attachment 自己的名字,通常与 key 相同 */
   readonly name: string
+  /** 原始的 stringRef —— null 表示文件里没写名字(写回时要还原成 null) */
+  readonly nameRef: string | null
+  /** nameRef 的原始表下标(表里有重复项,不能用字符串反查) */
+  readonly nameIndex: number
+  readonly keyIndex: number
   readonly type: AttachmentType
   readonly sequence: Sequence | null
   /** 各类型的具体字段,保持原样以便原封写回 */
@@ -57,8 +62,11 @@ export interface SkinSlotEntry {
   readonly attachments: readonly Attachment[]
 }
 
+/** 皮肤里每个 attachment 的键名下标,与 attachments 一一对应 */
 export interface Skin {
   readonly name: string
+  /** 皮肤名在字符串表里的下标 */
+  readonly nameIndex: number
   readonly bones: readonly number[]
   readonly ik: readonly number[]
   readonly transform: readonly number[]
@@ -126,10 +134,12 @@ function readSequence(input: SpineInput, is38: boolean): Sequence | null {
 function readAttachment(
   input: SpineInput,
   key: string,
+  keyIndex: number,
   is38: boolean,
   nonessential: boolean,
 ): Attachment | null {
-  const nameRef = input.readStringRef()
+  const nameAt = input.readStringRefAt()
+  const nameRef = nameAt.value
   const name = nameRef ?? key
   const typeIndex = input.readByte()
   const type = ATTACHMENT_TYPES[typeIndex]
@@ -143,7 +153,7 @@ function readAttachment(
 
   switch (type) {
     case 'region': {
-      data['path'] = input.readStringRef()
+      { const r = input.readStringRefAt(); data['path'] = r.value; data['pathIndex'] = r.index }
       data['rotation'] = input.readFloat()
       data['x'] = input.readFloat()
       data['y'] = input.readFloat()
@@ -163,7 +173,7 @@ function readAttachment(
       break
     }
     case 'mesh': {
-      data['path'] = input.readStringRef()
+      { const r = input.readStringRefAt(); data['path'] = r.value; data['pathIndex'] = r.index }
       data['color'] = input.readInt()
       const vertexCount = input.readVarInt()
       data['vertexCount'] = vertexCount
@@ -180,10 +190,10 @@ function readAttachment(
       break
     }
     case 'linkedmesh': {
-      data['path'] = input.readStringRef()
+      { const r = input.readStringRefAt(); data['path'] = r.value; data['pathIndex'] = r.index }
       data['color'] = input.readInt()
-      data['skinName'] = input.readStringRef()
-      data['parent'] = input.readStringRef()
+      { const r = input.readStringRefAt(); data['skinName'] = r.value; data['skinNameIndex'] = r.index }
+      { const r = input.readStringRefAt(); data['parent'] = r.value; data['parentIndex'] = r.index }
       // 3.8 叫 inheritDeform,4.x 叫 inheritTimelines —— 只是改名,字节位置相同
       data['inheritTimelines'] = input.readBoolean()
       sequence = readSequence(input, is38)
@@ -220,7 +230,7 @@ function readAttachment(
     }
   }
 
-  return { key, name, type, sequence, data }
+  return { key, keyIndex, name, nameRef, nameIndex: nameAt.index, type, sequence, data }
 }
 
 function readSkinSlots(input: SpineInput, slotCount: number, is38: boolean, nonessential: boolean) {
@@ -230,8 +240,8 @@ function readSkinSlots(input: SpineInput, slotCount: number, is38: boolean, none
     const attachmentCount = input.readVarInt()
     const attachments: Attachment[] = []
     for (let ii = 0; ii < attachmentCount; ii++) {
-      const key = input.readStringRef() ?? ''
-      const attachment = readAttachment(input, key, is38, nonessential)
+      const keyAt = input.readStringRefAt()
+      const attachment = readAttachment(input, keyAt.value ?? '', keyAt.index, is38, nonessential)
       if (attachment !== null) attachments.push(attachment)
     }
     slots.push({ slot, attachments })
@@ -252,6 +262,7 @@ export function readSkins(input: SpineInput, is38: boolean, nonessential: boolea
   if (defaultSlotCount > 0) {
     skins.push({
       name: 'default',
+      nameIndex: 0,
       bones: [],
       ik: [],
       transform: [],
@@ -262,7 +273,8 @@ export function readSkins(input: SpineInput, is38: boolean, nonessential: boolea
 
   const extra = input.readVarInt()
   for (let i = 0; i < extra; i++) {
-    const name = input.readStringRef() ?? ''
+    const nameAt = input.readStringRefAt()
+    const name = nameAt.value ?? ''
     const bones = readIndexList(input)
     const ik = readIndexList(input)
     const transform = readIndexList(input)
@@ -270,6 +282,7 @@ export function readSkins(input: SpineInput, is38: boolean, nonessential: boolea
     const slotCount = input.readVarInt()
     skins.push({
       name,
+      nameIndex: nameAt.index,
       bones,
       ik,
       transform,

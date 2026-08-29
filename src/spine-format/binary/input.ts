@@ -114,10 +114,21 @@ export class SpineInput {
     return new TextDecoder('utf-8').decode(slice)
   }
 
-  /** 指向文件头字符串表的索引;0 表示 null */
+  /**
+   * 指向文件头字符串表的索引;0 表示 null。
+   *
+   * ⚠️ **字符串表允许有重复项**(实测 MX2_cat 里 "bubble" 出现 3 次),
+   * 所以只保留解析后的字符串是不够的 —— 写回时无法还原是哪一个下标。
+   * 用 readStringRefAt 拿到原始索引。
+   */
   readStringRef(): string | null {
+    return this.readStringRefAt().value
+  }
+
+  /** 同时给出原始索引与解析结果 */
+  readStringRefAt(): { index: number; value: string | null } {
     const index = this.readVarInt()
-    return index === 0 ? null : (this.strings[index - 1] ?? null)
+    return { index, value: index === 0 ? null : (this.strings[index - 1] ?? null) }
   }
 
   /** 4.x 的 hash 是 8 字节。这里只跳过并返回十六进制,内容用不上。 */
