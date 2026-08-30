@@ -4,13 +4,23 @@
  * 两者都是三次曲线,但参数化方式不同:
  *
  * ```
- * Spine:  贝塞尔控制点 [cx1, cy1, cx2, cy2],归一化到两帧之间的 [0,1]×[0,1]
+ * Spine:  贝塞尔控制点 [cx1, cy1, cx2, cy2]
  * Unity:  每帧一个切线斜率 inSlope / outSlope,外加可选的权重 inWeight / outWeight
  * ```
  *
- * **开了 weightedMode 之后可以精确互转** —— Spine 的 `cx1` 恰好就是 Unity 的
- * `outWeight`(占该段时长的比例),`1 - cx2` 就是 `inWeight`。
- * 不开权重则只能近似,必须报 `approximated`。
+ * ⚠️ **Spine 的控制点是绝对的「时间 / 值」,不是归一化到 [0,1] 的。**
+ * 实测数据里出现过 `cx1 = 1.1083`(该段是 1.0→2.0 秒)和 `cy1 = 333.98`
+ * (旋转角度)。按归一化处理会让**所有缓动悄悄变形** —— 不崩溃,只是不对。
+ *
+ * 换算(t0/v0、t1/v1 是两端帧):
+ * ```
+ * outSlope  = (cy1 - v0) / (cx1 - t0)
+ * inSlope   = (v1 - cy2) / (t1 - cx2)
+ * outWeight = (cx1 - t0) / (t1 - t0)     ← 控制点占该段时长的比例
+ * inWeight  = (t1 - cx2) / (t1 - t0)
+ * ```
+ *
+ * **开了 weightedMode 之后可以精确互转**;不开权重则只能近似,须报 `approximated`。
  *
  * 见 [docs/UNITY-2D.md](../../docs/UNITY-2D.md) 第 5 节。
  */
@@ -40,7 +50,7 @@ export interface UnityKeyframe {
 /** 一段区间的曲线定义(来自 Spine 的帧) */
 export interface SpineSegment {
   readonly curve: 'linear' | 'stepped' | 'bezier'
-  /** 仅 bezier:[cx1, cy1, cx2, cy2] */
+  /** 仅 bezier:[cx1, cy1, cx2, cy2],**绝对时间 / 绝对值**,不是归一化的 */
   readonly bezier?: readonly number[]
 }
 
@@ -97,16 +107,20 @@ export function toUnityCurve(
 
     const [cx1, cy1, cx2, cy2] = segment.bezier as [number, number, number, number]
 
+    // 控制点是绝对坐标,先化成相对该段的偏移
+    const dx1 = cx1 - k0.time
+    const dx2 = k1.time - cx2
+
     // 控制点贴在端点上时斜率无定义(0/0),按线性处理
-    const safeOut = cx1 > 1e-6
-    const safeIn = 1 - cx2 > 1e-6
+    const safeOut = dx1 > 1e-9
+    const safeIn = dx2 > 1e-9
 
-    k0.outSlope = safeOut ? (dv * cy1) / (dt * cx1) : dv / dt
-    k1.inSlope = safeIn ? (dv * (1 - cy2)) / (dt * (1 - cx2)) : dv / dt
+    k0.outSlope = safeOut ? (cy1 - k0.value) / dx1 : dv / dt
+    k1.inSlope = safeIn ? (k1.value - cy2) / dx2 : dv / dt
 
-    // 权重就是控制点在时间轴上的占比 —— 有它才能精确还原
-    k0.outWeight = cx1
-    k1.inWeight = 1 - cx2
+    // 权重 = 控制点占该段时长的比例,有它才能精确还原
+    k0.outWeight = Math.min(1, Math.max(0, dx1 / dt))
+    k1.inWeight = Math.min(1, Math.max(0, dx2 / dt))
     k0.weightedMode |= WEIGHTED_OUT
     k1.weightedMode |= WEIGHTED_IN
 

@@ -29,44 +29,60 @@ describe('Spine 曲线 → Unity 切线', () => {
   })
 
   /**
-   * ⭐ 关键:切线必须等于贝塞尔曲线在端点处的真实导数。
-   * 算错的话动画的缓入缓出就会变形,而且**肉眼很难发现**。
+   * ⭐ **Spine 的控制点是绝对的「时间 / 值」**,不是归一化的。
+   * 实测数据里出现过 cx1 = 1.1083(该段是 1.0→2.0 秒)、cy1 = 333.98(角度)。
+   *
+   * 按归一化处理不会崩,只会让所有缓动**悄悄变形** —— 所以这条测试用
+   * 明显超出 [0,1] 的控制点,一旦有人改回归一化就会红。
    */
-  it('贝塞尔端点斜率与曲线的解析导数一致', () => {
-    const bezier = [0.25, 0.1, 0.75, 0.9] as const
-    const [cx1, cy1, cx2, cy2] = bezier
-    const t0 = 0, t1 = 2, v0 = 10, v1 = 30
-
+  it('控制点按绝对坐标解释,cx 可以大于 1', () => {
+    const t0 = 1, t1 = 2, v0 = 100, v1 = 300
+    // 控制点在 1.25 秒 / 值 150,和 1.75 秒 / 值 280
+    const bezier = [1.25, 150, 1.75, 280]
     const { keys } = toUnityCurve([t0, t1], [v0, v1], [{ curve: 'bezier', bezier }, undefined])
 
-    // 归一化空间里的 dy/dx,再换算回真实单位
-    const startSlope = (bezierSlope(0, cy1, cy2) / bezierSlope(0, cx1, cx2)) * ((v1 - v0) / (t1 - t0))
-    const endSlope = (bezierSlope(1, cy1, cy2) / bezierSlope(1, cx1, cx2)) * ((v1 - v0) / (t1 - t0))
-
-    expect(keys[0]!.outSlope).toBeCloseTo(startSlope, 6)
-    expect(keys[1]!.inSlope).toBeCloseTo(endSlope, 6)
+    // 斜率 = 控制点到端点的连线斜率
+    expect(keys[0]!.outSlope).toBeCloseTo((150 - 100) / (1.25 - 1), 6)
+    expect(keys[1]!.inSlope).toBeCloseTo((300 - 280) / (2 - 1.75), 6)
   })
 
-  it('权重直接取自控制点的时间占比 —— 这是精确还原的前提', () => {
+  it('权重是控制点占该段时长的比例', () => {
     const { keys, approximated } = toUnityCurve(
-      [0, 1], [0, 1], [{ curve: 'bezier', bezier: [0.25, 0.1, 0.75, 0.9] }, undefined],
+      [1, 2], [100, 300], [{ curve: 'bezier', bezier: [1.25, 150, 1.75, 280] }, undefined],
     )
-    expect(keys[0]!.outWeight).toBeCloseTo(0.25, 9)
-    expect(keys[1]!.inWeight).toBeCloseTo(0.25, 9) // 1 - 0.75
+    expect(keys[0]!.outWeight).toBeCloseTo(0.25, 9) // (1.25-1)/1
+    expect(keys[1]!.inWeight).toBeCloseTo(0.25, 9) // (2-1.75)/1
     expect(keys[0]!.weightedMode & WEIGHTED_OUT).toBeTruthy()
     expect(keys[1]!.weightedMode & WEIGHTED_IN).toBeTruthy()
     expect(approximated).toBe(false)
   })
 
+  it('等价于对归一化控制点做还原 —— 两种算法结果一致', () => {
+    const t0 = 0, t1 = 2, v0 = 10, v1 = 30
+    const [nx1, ny1, nx2, ny2] = [0.25, 0.1, 0.75, 0.9] // 归一化控制点
+    // 换算成绝对坐标喂进去
+    const abs = [t0 + nx1 * (t1 - t0), v0 + ny1 * (v1 - v0), t0 + nx2 * (t1 - t0), v0 + ny2 * (v1 - v0)]
+    const { keys } = toUnityCurve([t0, t1], [v0, v1], [{ curve: 'bezier', bezier: abs }, undefined])
+
+    // 归一化空间里的解析导数,换算回真实单位后应当一致
+    const start = (bezierSlope(0, ny1, ny2) / bezierSlope(0, nx1, nx2)) * ((v1 - v0) / (t1 - t0))
+    const end = (bezierSlope(1, ny1, ny2) / bezierSlope(1, nx1, nx2)) * ((v1 - v0) / (t1 - t0))
+    expect(keys[0]!.outSlope).toBeCloseTo(start, 6)
+    expect(keys[1]!.inSlope).toBeCloseTo(end, 6)
+  })
+
   it('中间帧同时是前一段的终点和后一段的起点,weightedMode 要合并', () => {
-    const b = { curve: 'bezier' as const, bezier: [0.3, 0.1, 0.7, 0.9] }
-    const { keys } = toUnityCurve([0, 1, 2], [0, 1, 2], [b, b, undefined])
+    const { keys } = toUnityCurve([0, 1, 2], [0, 1, 2], [
+      { curve: 'bezier', bezier: [0.3, 0.3, 0.7, 0.7] },
+      { curve: 'bezier', bezier: [1.3, 1.3, 1.7, 1.7] },
+      undefined,
+    ])
     expect(keys[1]!.weightedMode).toBe(WEIGHTED_IN | WEIGHTED_OUT)
   })
 
   it('控制点贴在端点上时斜率无定义,退化为线性并报近似', () => {
     const { keys, approximated } = toUnityCurve(
-      [0, 1], [0, 2], [{ curve: 'bezier', bezier: [0, 0, 1, 1] }, undefined],
+      [0, 1], [0, 2], [{ curve: 'bezier', bezier: [0, 0, 1, 2] }, undefined],
     )
     expect(Number.isFinite(keys[0]!.outSlope)).toBe(true)
     expect(keys[0]!.outSlope).toBe(2)

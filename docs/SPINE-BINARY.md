@@ -210,7 +210,26 @@ offsetRotation、offsetX、offsetY、offsetScaleX、offsetScaleY、offsetShearY(
 | 通用 | type, frameCount | type, frameCount, **bezierCount** |
 | attachment / drawOrder / event | 同上 | **不写 bezierCount**(没有曲线) |
 
-### 7.4 多值通道的贝塞尔
+### 7.4 ⚠️ 控制点是绝对坐标,不是归一化的
+
+`[cx1, cy1, cx2, cy2]` 里 **cx 是绝对时间(秒),cy 是绝对值**,
+不是归一化到 [0,1] 的比例。
+
+实测数据佐证:某段是 1.0→2.0 秒,其 `cx1 = 1.1083`(大于 1);
+某旋转时间轴的 `cy1 = 333.98`(就是角度本身)。
+
+**按归一化处理不会崩溃,只会让所有缓动悄悄变形** —— 这类错误最难发现。
+导出到别的引擎时要先化成相对偏移:
+
+```
+outSlope = (cy1 - v0) / (cx1 - t0)
+inSlope  = (v1 - cy2) / (t1 - cx2)
+```
+
+> 📌 曾按归一化实现,导致 Spine → Unity 时 54.5% 的曲线段被误判为「无法精确表达」。
+> 改成绝对坐标后,误判归零。
+
+### 7.5 多值通道的贝塞尔
 
 3.8 无论几个分量都只存**一条**曲线;4.x **每个分量各一条**。
 
@@ -219,21 +238,21 @@ offsetRotation、offsetX、offsetY、offsetScaleX、offsetScaleY、offsetShearY(
 
 **降级时若各分量曲线不同,只能保留一条 —— 必须报 loss。**
 
-### 7.5 分段顺序
+### 7.6 分段顺序
 
 两版相同:slot → 骨骼 → IK → transform → path → deform → drawOrder → event。
 
 4.x 把 deform 段改名为「attachment 时间轴」,并在每条时间轴前加了**子类型字节**
 (0 = deform,1 = sequence)。
 
-### 7.6 deform 帧序
+### 7.7 deform 帧序
 
 ```
 3.8:  时间 → 顶点 → 曲线            (每帧)
 4.x:  先读一个时间,循环里是 顶点 → 下一帧时间 → 曲线
 ```
 
-### 7.7 slot 颜色
+### 7.8 slot 颜色
 
 3.8 打包成 `int`;4.x 分通道逐字节。类型也从 3 种扩到 6 种(见第 6 节)。
 
