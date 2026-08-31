@@ -12,7 +12,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "dev:web": "vite",
-    "convert": "node --experimental-strip-types --no-warnings src/cli/spineConvert.ts"
+    "convert": "node --experimental-strip-types --no-warnings src/cli/spineConvert.ts",
+    "unity": "node --experimental-strip-types --no-warnings src/cli/unityExport.ts"
   },
   "dependencies": {
     "maxrects-packer": "^2.7.3",

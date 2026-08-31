@@ -52,6 +52,19 @@ pnpm convert <输入路径> --to 4.1 [--out 目录] [--format skel|json] [--dry-
 `skel → json → skel` **不会逐字节相同**,只保证结构与数值一致。
 逐字节相同只适用于 `skel → skel`。
 
+导出到 Unity 2D Animation:
+
+```bash
+pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--dry-run]
+```
+
+产出**可以直接拖进 Assets 就播**的一整套:烘焙后的图集 PNG + `.meta`
+(含骨骼、网格、权重)、prefab(骨骼层级 + SpriteRenderer + SpriteSkin + Animator)、
+每条动画一个 `.anim`、一个 AnimatorController,各自带 `.meta`。
+
+⚠️ **不是把原图集直接切 sprite**,而是重新烘焙一张正立的 —— Spine 图集里的区域
+可以躺着放,Unity 的 sprite 矩形不能。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 9 节。
+
 跑单个测试文件:`pnpm exec vitest run src/core/math.test.ts`
 跑单个用例:`pnpm exec vitest run -t "旋转差值走最短路径"`
 
@@ -185,3 +198,9 @@ render/   薄适配层。PixiJS / Godot / Unity / Cocos 各一个
 - **动画融合的三个坑** —— 「没有关键帧」≠「值为 0」、离散属性无法插值、旋转走最短路径。详见 [FORMAT.md](docs/FORMAT.md#5-动画融合)
 - **自动权重必须用测地距离**,不能用直线距离,否则两腿贴近时权重互相渗透
 - 真正吃时间的是**时间轴/曲线编辑器的交互**和**权重刷的手感**,不是骨骼数学
+- **Spine 的贝塞尔控制点是绝对时间/值,不是归一化的** —— 弄错了不崩溃,
+  只是所有缓动悄悄变形。见 [UNITY-2D.md](docs/UNITY-2D.md) 第 5 节
+- **加权网格的绑定姿势不是 setup pose** —— 「第二套」网格是在动画中某个姿势下画的,
+  必须从网格自己的逐顶点骨骼坐标反解。见 [UNITY-2D.md](docs/UNITY-2D.md) 第 6 节
+- **Spine 图集可能是按比例导出的**(实测 0.5),`.atlas` 里没记这个数,
+  只能反推,并且要按尺寸加权 —— 小图的整数裁剪框会把估计值带偏

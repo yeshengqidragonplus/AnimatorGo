@@ -23,6 +23,20 @@ export interface Vector3Curve {
   readonly z: readonly UnityKeyframe[]
 }
 
+/**
+ * 单值曲线,走 `m_FloatCurves`。
+ *
+ * 用来表达 Spine 里两样没有 Transform 对应物的东西:
+ * - **attachment 的显隐** → `m_IsActive`(classID 1,GameObject),阶梯曲线
+ * - **slot 颜色** → `m_Color.r/g/b/a`(classID 212,SpriteRenderer)
+ */
+export interface FloatCurve {
+  readonly path: string
+  readonly attribute: string
+  readonly classID: number
+  readonly keys: readonly UnityKeyframe[]
+}
+
 export interface PPtrKey {
   readonly time: number
   /** sprite 在纹理 meta 里的 internalID */
@@ -45,6 +59,7 @@ export interface AnimClip {
   readonly position: readonly Vector3Curve[]
   readonly euler: readonly Vector3Curve[]
   readonly scale: readonly Vector3Curve[]
+  readonly float: readonly FloatCurve[]
   readonly pptr: readonly PPtrCurve[]
 }
 
@@ -100,6 +115,34 @@ function vectorCurve(c: Vector3Curve): string {
   return lines.join('\n')
 }
 
+function floatCurve(c: FloatCurve): string {
+  const lines = ['  - serializedVersion: 2', '    curve:', '      serializedVersion: 2', '      m_Curve:']
+  for (const k of c.keys) {
+    lines.push(
+      '      - serializedVersion: 3',
+      `        time: ${n(k.time)}`,
+      `        value: ${n(k.value)}`,
+      `        inSlope: ${n(k.inSlope)}`,
+      `        outSlope: ${n(k.outSlope)}`,
+      '        tangentMode: 0',
+      `        weightedMode: ${k.weightedMode}`,
+      `        inWeight: ${n(k.inWeight)}`,
+      `        outWeight: ${n(k.outWeight)}`,
+    )
+  }
+  lines.push(
+    '      m_PreInfinity: 2',
+    '      m_PostInfinity: 2',
+    '      m_RotationOrder: 4',
+    `    attribute: ${c.attribute}`,
+    `    path: ${c.path}`,
+    `    classID: ${c.classID}`,
+    '    script: {fileID: 0}',
+    '    flags: 0',
+  )
+  return lines.join('\n')
+}
+
 function pptrCurve(c: PPtrCurve): string {
   const lines = ['  - serializedVersion: 2', '    curve:']
   for (const k of c.keys) {
@@ -127,6 +170,7 @@ export function writeAnim(clip: AnimClip): string {
     ...[...clip.position, ...clip.euler, ...clip.scale].flatMap((c) =>
       c.x.length === 0 ? [0] : [c.x[c.x.length - 1]!.time],
     ),
+    ...clip.float.flatMap((c) => (c.keys.length === 0 ? [0] : [c.keys[c.keys.length - 1]!.time])),
     ...clip.pptr.flatMap((c) => (c.keys.length === 0 ? [0] : [c.keys[c.keys.length - 1]!.time])),
   )
 
@@ -149,7 +193,7 @@ export function writeAnim(clip: AnimClip): string {
     section('m_EulerCurves', clip.euler.map(vectorCurve)),
     section('m_PositionCurves', clip.position.map(vectorCurve)),
     section('m_ScaleCurves', clip.scale.map(vectorCurve)),
-    '  m_FloatCurves: []',
+    section('m_FloatCurves', clip.float.map(floatCurve)),
     section('m_PPtrCurves', clip.pptr.map(pptrCurve)),
     `  m_SampleRate: ${n(clip.sampleRate)}`,
     '  m_WrapMode: 0',

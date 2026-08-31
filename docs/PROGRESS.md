@@ -1,79 +1,106 @@
-# 开发进度与交接（2026-08-21）
+# 开发进度与交接(2026-08-31)
 
 ## 产品定位
 
-AnimatorGo 是一个类似 Spine 的桌面 2D 动画编辑器。用户编辑图片部件、骨骼、slot、时间轴和后续网格；骨骼动画是核心能力，不是产品全部。
+**2D 骨骼动画的格式转换器,不是编辑器。** 详见 [DECISIONS.md](DECISIONS.md) 开头。
 
-内部项目模型是唯一真相来源。外部格式和引擎能力都通过 importer / exporter 插件接入：首批目标是 Spine JSON + atlas 导入、自有 Godot / Unity / Cocos 导出，以及 Spine 3.8 / 4.1 JSON + atlas 兼容导出。
+两个具体需求驱动:
+
+1. **Spine 3.8 ⇄ 4.1 批量互转** —— 团队经常要做,以前靠美术手工重导一天
+2. **Spine → Unity 2D Animation** —— 目标是**彻底不装 spine-unity 运行时**,
+   用 Unity 自带的运行时播;顺带让没有 Spine 授权的人也能改动画、能在 Unity 里做后期
+
+仓库里的编辑器 MVP 是转向之前做的,**代码保留、停止投入**。
 
 ## 已完成
 
-### 基础架构
+### Spine `.skel` 二进制读写(`src/spine-format/binary/`)
 
-- `core/` 保持纯数学：骨骼层级、世界矩阵、动画采样（rotate / translate / scale / shear 四通道）、线性/stepped/Bezier 曲线、时间轴关键帧、`samplePose` 完整姿势采样。
-- `ProjectData` 统一项目快照，包含图片、图集、骨架、皮肤、slot 和动画；`ProjectDocument` 负责可读 JSON 与运行时 `Map` 结构之间的往返转换。
-- 构建期插件 SDK 与 `PluginRegistry` 已建立，含 manifest、API 版本校验、导入/导出结果和兼容性报告类型。详见 [PLUGINS.md](PLUGINS.md)。
-- Electron 平台层经 IPC 提供项目目录、原子保存、图片读写、图片导入和 `atlases/` 打包产物读写；渲染进程没有 Node 文件系统权限。
+- 3.8 与 4.1 都能**读到最后一个字节**(35344/35344、36328/36328)
+- 写回**逐字节相同**
+- 格式规范是自己整理的:[SPINE-BINARY.md](SPINE-BINARY.md)
 
-### 当前可操作的编辑器能力
+⚠️ **字符串表里有重复项**(`"bubble"` 出现 3 次),所以模型里存的是**原始下标**,
+不能用 `indexOf` 反查 —— 会写出另一个下标,文件结构合法但内容错位。
 
-1. 打开或创建项目目录（自动建立 `images/`、`export/`、`atlases/`）。
-2. 导入 PNG / JPG / WebP；原文件会复制进 `images/`，同名文件自动加序号，绝不覆盖。
-3. 新项目可添加根骨骼，选中骨骼后可添加子骨骼。
-4. 选中骨骼后，可在"图片部件"面板将图片绑定为 region attachment；重复绑定同一图片会改绑而非新建重叠 slot，且保留已改的颜色和混合模式。
-5. **完整 TRS 编辑**：视口工具切换（旋转 R / 平移 T / 缩放 S 拖拽），属性面板数值编辑 x / y / rotation / scaleX / scaleY / shearX / shearY / length。setup 模式写绑定姿势，animate 模式在当前时刻打关键帧（偏移语义由 store 统一换算）。
-6. **时间轴按通道分行**：每根骨骼的 rotate / translate / scale / shear 各一行；K 键固化所有已有通道在当前时刻的插值结果；右键按通道删帧。
-7. **Slot 编辑面板**：绘制顺序上下移、双击改名、解除绑定、染色 + 不透明度、混合模式（normal / additive / multiply / screen）。删除和换序时皮肤的 slot 下标自动重排。
-8. **正式图集打包**：一键 MaxRects 打包（`maxrects-packer`，POT 页、允许旋转、裁透明边），写出 `atlases/<项目名>.png` + `.atlas`（Spine 4.x 文本格式，`parseAtlas` 可读回），带区域框预览弹窗。
-9. 编辑期预览支持混合模式近似（additive → CSS plus-lighter）和 slot alpha。
-10. 撤销重做覆盖以上全部文档编辑；数值输入和拖拽手势按 merge key 合并成单条历史。
+### Spine JSON 读写(`src/spine-format/json/`)
 
-### 关键实现细节
+`.skel` 与 `.json` 互为编码,两种都能读能写。把 `.skel` 转成 `.json` 是最快的排查手段。
 
-- `src/core/renderCommands.ts` 从 `Skeleton + Atlas` 生成纯 `RenderCommand`（世界顶点、UV、颜色和混合模式）。
-- **图集区域名 = `image.path`（images/ 内的文件名），不是 imageId**。imageId 带 `image:` 前缀，冒号会撞上 `.atlas` 文本的 `key: value` 语法。`attachment.path` 记的也是文件名，所以 looseAtlas 和正式打包的区域名一致，**重新打包只换布局，attachment / slot 全都不用动**（有测试锁定）。
-- 编辑期画布预览仍走 `src/project/looseAtlas.ts`（每张原图一页）+ `src/ui/ImageOverlay.tsx` 原图叠加；正式打包产物给导出器和引擎用。图集布局纯逻辑在 `src/project/atlasLayout.ts`（可单测），像素合成（裁边扫描、页画布、旋转放置）在 `src/ui/atlasCompose.ts`。
-- region 顶点计算已经处理图集 `offsetX/offsetY` 与原始尺寸，不能删掉；否则裁透明边的图片锚点会漂移。
-- 皮肤按 slot 下标索引；`editorStore` 里所有 slot 删除/换序操作都要经 `remapSkins` 重排下标，直接改 slots 数组必错。
-- 旋转放置约定：打包时逆时针转 90°（`ctx.setTransform(0,-1,1,0,…)`），渲染时 `regionUVs` 转回来。两边互逆,改任何一边必须同步另一边。
+⚠️ **JSON 里没有字符串表**,所以 `skel → json → skel` 只保证结构与数值一致,
+不保证逐字节相同。逐字节只适用于 `skel → skel`。
+
+### 版本转换(`src/spine-convert/skel/`)+ 命令行
+
+```bash
+pnpm convert <输入路径> --to 4.1 [--out 目录] [--format skel|json] [--dry-run]
+```
+
+不覆盖输入,每个产物写出前自动回读自检,同名 `.atlas` / `.png` 一并复制。
+
+### Spine → Unity 2D Animation(`src/spine-convert/unity/`、`src/unity/`)
+
+```bash
+pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--dry-run]
+```
+
+产出一整套可以直接拖进 `Assets/` 就播的资源:
+
+| 产物 | 内容 |
+|---|---|
+| `<名字>.png` + `.meta` | **重新烘焙的正立图集**,`.meta` 里带 sprite 矩形、pivot、网格顶点、三角形、骨骼、权重 |
+| `<名字>.prefab` + `.meta` | 骨骼 Transform 层级 + 每个 attachment 一个挂图节点 + `SpriteSkin` + `Animator` |
+| `<名字>@<动画>.anim` + `.meta` | 每条动画一个,位置/旋转/缩放/显隐/颜色曲线 |
+| `<名字>.controller` + `.meta` | 每条动画一个 state,第一条为默认 |
+
+自带 PNG 编解码(`src/unity/png.ts`,只用 Node 的 zlib,没有引第三方图片库)。
+
+**端到端校验**(`export.test.ts`):把产出的 `.meta` 和 prefab **重新读回来**,
+照 Unity 的 `SpritePostProcess` + `SpriteSkin` 算一遍,和 Spine 自己的骨架求值比对。
+14 个加权网格的顶点最大偏差 **0.75 像素**;不加权网格和 region 四角也各有一条。
+
+MX2_cat(38 骨骼 / 13 slot / 15 网格 / 2 动画)的转换结果:
+**近似 1 处**(`head` 有顶点绑了 5 根骨骼,Unity 上限是 4),
+**有损 3 处**(2 条 deform 顶点动画 + 1 条逐帧绘制顺序)。
 
 ## 未完成
 
-### 当前 MVP 缺口（下一优先级）
+按依赖顺序:
 
-1. 曲线编辑器 UI（贝塞尔在 `core/` 已实现,关键帧上还没有编辑入口）。
-2. 动画**改名/删除**（新建 + 切换已做:时间轴控制条的下拉框和 + 按钮）。
-3. 图集打包参数（页上限、padding、是否旋转）目前是代码常量 `DEFAULT_PACK_OPTIONS`,未做 UI。
+1. **在 Unity 里实际打开验证** —— 产物**还没有在 Unity 里打开过**。
+   数学上验过了,但 prefab / `.meta` 的字段集合是照真实样本抄的,
+   可能有 Unity 版本差异。这是下一步第一件事。
+2. **Unity → Spine**(反方向)
+3. **Godot / Cocos 导出**
+4. `.skel` 里没有样本覆盖的区域:path 约束的字段顺序、音频事件的 `volume` / `balance`
 
-视觉验证已做过一轮（Playwright `_electron` 驱动打包后的应用,截图核对了 R/T/S 拖拽、
-TRS 关键帧、slot 混合模式/染色、图集裁边与旋转,.atlas 数值与手算一致）。
-不同 DPI 与窗口 resize 尚未覆盖。
+### 已知转不过去的东西(都会报出来,不静默)
 
-**⚠️ 方向待定**:用户看过当前编辑器后表示与预期「有挺大出入」,具体调整方向
-待用户想清楚后另行安排 —— 在那之前不要继续堆功能。
+- **deform 顶点关键帧** —— Unity 的 SpriteSkin 只做骨骼蒙皮
+- **逐帧绘制顺序** —— `sortingOrder` 是静态的
+- **path / transform 约束** —— 没有对应物
+- **两色染色(dark color)** —— 没有对应物
+- **IK** —— 骨骼最终位置已经烘进曲线,外观一致但不可再调
+- 每顶点超过 4 根骨骼 —— 取权重最大的四根重新归一化
 
-### 后续大功能
+## 编辑器 MVP(冻结)
 
-- Spine 3.8 / 4.1 JSON + atlas importer，并生成兼容性报告。
-- Godot、Unity、Cocos 自有格式 exporter 与最小运行时。
-- Spine 3.8 / 4.1 JSON + atlas exporter（不承诺 `.skel` 二进制）。
-- 网格、权重、IK、约束、动画混合。
+骨骼、时间轴、图片部件、slot 编辑、图集打包都能用,Electron 壳 + 五国语言。
+`pnpm dev` 可以跑起来。**不要继续往这边堆功能** —— 它现在的定位是可选的查看/临时编辑视图。
 
-## 验证状态
+细节见 git 历史与 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
-- `pnpm typecheck` ✅（曾有 2 处 `PluginRegistry` 联合类型收窄错误，已用 `in` 判别修复）
-- `pnpm test` ✅ 118/118（含新增：TRS 编辑语义、slot 重排/改名/颜色、shear 求值、samplePose、图集布局不重叠/POT/超限报错、`.atlas` 序列化经 `parseAtlas` 往返一致、重打包引用稳定）
-- `pnpm build` ✅
-- **桌面应用未做视觉验证**（用户要求暂缓）。
+## 方法论(这条最值钱)
 
-## 兼容性注意
+**每次只凭文档实现都是错的。** 三次实例:
 
-`attachment.path` 语义从 imageId 改成了图片文件名（见上）。项目格式版本仍是 1 —— 这个阶段没有真实存量项目，未写迁移；若有旧的 project.json，重新绑定图片即可。`AtlasPageAsset` 形状也从 `{name, imageId}` 改为 `{name, path}`。
+| 事情 | 只看文档的结果 | 拿真实数据一比 |
+|---|---|---|
+| 图集 `size` / `bounds` 语义 | 51 个区域里 31 个违例 | 换一种理解后 0 违例 |
+| 贝塞尔控制点是否归一化 | 49 条时间轴报「近似」 | 改成绝对坐标后 0 |
+| 加权网格的绑定姿势 | 15 个网格里 6 个残差 45~206 像素 | 改成逐骨骼反解后全部 < 0.4 像素 |
 
-## 给后续开发者的约束
-
-- 不要让 PixiJS、Electron、Spine 或引擎 API 进入 `src/core/`。
-- 不要复制、翻译或移植 Spine Runtime 源码；兼容解析/序列化必须自行实现。
-- Spine 兼容导出必须返回 `loss` / `approximated` / `info` 报告，禁止静默省略特性。
-- 项目文件要保持文本 JSON 可 diff；所有文件 I/O 通过 `platform/`。
-- 用户当前要求优先完成可用的图片部件骨骼动画编辑器，不要先扩展网格、IK 或跨引擎功能。
+固定套路:**拿到真实样本 → 反推格式 → 实现 → 与标准答案比对**。
+验收要有一条硬指标(读到精确 EOF、逐字节往返、亚像素偏差),
+而不是「看起来对」。**近似/有损的计数异常本身就是最好的报警器** ——
+上面三条里有两条是靠「这个数字不该这么大」发现的。
