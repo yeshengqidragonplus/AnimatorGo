@@ -76,6 +76,32 @@ describe.skipIf(!bothExist)('真实 .skel 文件', () => {
     expect(v41().header).toMatchObject({ version: '4.1.23', major: '4.x' })
   })
 
+  /**
+   * ⚠️ 版本要靠「两种头部布局都试一遍」来认,而**按 3.8 试读必须允许失败**。
+   *
+   * 4.x 的哈希是任意 8 字节,当成字符串长度读出来往往是天文数字。
+   * 实测 `BBQ_grill_4.1.skel.bytes` 头两字节 `eb 47` → 要 9194 字节,
+   * 整个文件才 6568 字节,于是直接抛错 —— 一个完全正常的 4.1 文件读不进来。
+   *
+   * 这里把哈希首字节改成带高位的值来复现:哈希是 8 个不透明字节,改它不影响别的。
+   */
+  it('哈希首字节带高位的 4.x 文件也能认出来', () => {
+    const bytes = new Uint8Array(readFileSync(FILES['4.1']))
+    for (const first of [0xeb, 0xff, 0x80]) {
+      bytes[0] = first
+      const part = readSkeletonPart(bytes)
+      expect(part.header, `首字节 0x${first.toString(16)}`).toMatchObject({
+        version: '4.1.23',
+        major: '4.x',
+      })
+      expect(part.endOffset).toBe(part.totalBytes)
+    }
+  })
+
+  it('完全不是 .skel 时给得出人话,不是「需要 9194 字节」', () => {
+    expect(() => readSkeletonPart(new TextEncoder().encode('这不是骨架文件'))).toThrow(/认不出版本号|不是 Spine/)
+  })
+
   it('两版的骨骼数量与名字完全一致', () => {
     const a = v38().bones
     const b = v41().bones

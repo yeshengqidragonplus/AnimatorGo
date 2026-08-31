@@ -337,20 +337,36 @@ export function readSkeletonPart(bytes: Uint8Array, expectedMajor?: SpineMajor):
     version = input.readString() ?? ''
     major = '4.x'
   } else {
-    // 自动判断:3.8 的第一个字节是字符串长度(哈希约 27 字符 → 0x1c)。
-    // 4.x 第一个字节是哈希的高位字节,可能是任何值。
-    // 可靠做法是两种都试,取能读出合法版本号的那个。
-    const probe = new SpineInput(bytes)
-    const asString = probe.readString()
-    const v38 = probe.readString() ?? ''
+    // 自动判断:3.8 的开头是「长度前缀的哈希字符串」,4.x 是 8 字节定长哈希。
+    // 两种都试,取能读出合法版本号的那个。
+    //
+    // ⚠️ **试读必须允许失败。** 4.x 的哈希是任意 8 字节,当成字符串长度读出来
+    // 往往是个天文数字(实测 BBQ_grill 的头两字节 `eb 47` → 要 9194 字节,
+    // 整个文件才 6568)。早先没有捕获,4.x 文件只要哈希首字节带高位就直接抛错。
+    const probe = (as: SpineMajor): string | null => {
+      try {
+        const p = new SpineInput(bytes)
+        if (as === '3.8') p.readString()
+        else p.readLongHex()
+        const v = p.readString() ?? ''
+        return /^\d+\.\d+/.test(v) ? v : null
+      } catch {
+        return null
+      }
+    }
 
-    if (/^3\.\d/.test(v38)) {
-      hash = asString
-      version = v38
-      major = '3.8'
-      input.readString()
-      input.readString()
+    // 3.8 布局要读出 3.x 的版本号才算数 —— 别的都当 4.x
+    const v38 = probe('3.8')
+    major = v38 !== null && v38.startsWith('3.') ? '3.8' : '4.x'
+
+    if (major === '3.8') {
+      hash = input.readString()
+      version = input.readString() ?? ''
     } else {
+      const v4x = probe('4.x')
+      if (v4x === null) {
+        throw new Error('认不出版本号 —— 两种头部布局都试过了,这大概不是 Spine 的 .skel 文件')
+      }
       hash = input.readLongHex()
       version = input.readString() ?? ''
       major = majorOf(version)

@@ -11,7 +11,7 @@ import type { ConversionIssue } from '../spine-convert/types.ts'
  * Spine → Unity 2D Animation 的命令行入口。
  *
  * ```
- * pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--dry-run]
+ * pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--dry-run]
  * ```
  *
  * 每个骨架产出一套可以**直接拖进 Assets 就能播**的资源:
@@ -28,6 +28,8 @@ interface Options {
   readonly out: string
   readonly pixelsPerUnit: number
   readonly dryRun: boolean
+  /** 显式指定图集;null 表示按文件名去找 */
+  readonly atlas: string | null
 }
 
 function parseArgs(argv: readonly string[]): Options | string {
@@ -57,6 +59,9 @@ function parseArgs(argv: readonly string[]): Options | string {
   const ppu = Number(flags.get('ppu') ?? '100')
   if (!Number.isFinite(ppu) || ppu <= 0) return `--ppu 要是正数,收到 "${flags.get('ppu')}"`
 
+  const atlas = flags.get('atlas') ?? null
+  if (atlas !== null && !existsSync(atlas)) return `图集不存在:${atlas}`
+
   const resolved = resolve(input)
   const base = statSync(resolved).isDirectory() ? resolved : dirname(resolved)
 
@@ -65,6 +70,7 @@ function parseArgs(argv: readonly string[]): Options | string {
     out: resolve(flags.get('out') ?? `${base}_unity`),
     pixelsPerUnit: ppu,
     dryRun: flags.has('dry-run'),
+    atlas: atlas === null ? null : resolve(atlas),
   }
 }
 
@@ -102,19 +108,44 @@ function readSkeleton(file: string): SkeletonPart {
   return readSkeletonPart(new Uint8Array(bytes))
 }
 
+const ATLAS_SUFFIXES = ['.atlas', '.atlas.txt']
+
 /**
  * 找骨架旁边的图集。
  *
- * Spine 导出时图集和骨架同名,但 Unity 工程里常见 `.atlas.txt`(`.atlas` 会被
- * Unity 当成未知类型),两种都认。
+ * Spine 导出时图集和骨架同名,但实际拿到的文件往往不是:
+ * Unity 工程里习惯 `.atlas.txt`(`.atlas` 会被当成未知类型),
+ * 转过版本的骨架又常带个 `_4.1` 后缀,而图集没有(实测 `BBQ_grill_4.1.skel.bytes`
+ * 配的是 `BBQ_grill.atlas.txt`)。
+ *
+ * 所以按「同名 → 去掉版本后缀 → 目录里唯一的那个」依次退让。
+ * 目录里有多个图集时**不猜**,让用户用 `--atlas` 指定。
  */
-function findAtlas(skeleton: string): string | null {
+function findAtlas(skeleton: string): { path: string; guessed: boolean } | null {
   const dir = dirname(skeleton)
   const stem = stemOf(skeleton)
-  for (const suffix of ['.atlas', '.atlas.txt']) {
-    const candidate = join(dir, stem + suffix)
-    if (existsSync(candidate)) return candidate
+
+  const tryStem = (name: string) => {
+    for (const suffix of ATLAS_SUFFIXES) {
+      const candidate = join(dir, name + suffix)
+      if (existsSync(candidate)) return candidate
+    }
+    return null
   }
+
+  const exact = tryStem(stem)
+  if (exact !== null) return { path: exact, guessed: false }
+
+  // 去掉 `_4.1` / `-3.8` 这类版本后缀再试
+  const stripped = stem.replace(/[_-]v?\d+\.\d+(\.\d+)?$/, '')
+  if (stripped !== stem) {
+    const found = tryStem(stripped)
+    if (found !== null) return { path: found, guessed: true }
+  }
+
+  const all = readdirSync(dir).filter((f) => ATLAS_SUFFIXES.some((s) => f.toLowerCase().endsWith(s)))
+  if (all.length === 1) return { path: join(dir, all[0]!), guessed: true }
+
   return null
 }
 
@@ -126,7 +157,7 @@ function describe(issue: ConversionIssue): string {
 function main(): void {
   const parsed = parseArgs(process.argv.slice(2))
   if (typeof parsed === 'string') {
-    console.error(`✗ ${parsed}\n\n用法:pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--dry-run]`)
+    console.error(`✗ ${parsed}\n\n用法:pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--dry-run]`)
     process.exitCode = 1
     return
   }
@@ -154,9 +185,15 @@ function main(): void {
         throw new Error(`动画 "${part.failure.name}" 解析失败:${part.failure.message}`)
       }
 
-      const atlasPath = findAtlas(file)
-      if (atlasPath === null) throw new Error(`找不到同名图集(${stem}.atlas / ${stem}.atlas.txt)`)
+      const found = parsed.atlas === null ? findAtlas(file) : { path: parsed.atlas, guessed: false }
+      if (found === null) {
+        throw new Error(
+          `找不到图集(试过 ${stem}.atlas / .atlas.txt,以及去掉版本后缀)—— 用 --atlas 指定`,
+        )
+      }
+      if (found.guessed) console.log(`    ℹ 图集不同名,用了 ${basename(found.path)}`)
 
+      const atlasPath = found.path
       const atlas = parseAtlas(readFileSync(atlasPath, 'utf8'))
       const sources = new Map<string, Image>()
       for (const page of atlas.pages) {
