@@ -1,6 +1,7 @@
 import type { SkeletonPart, SpineMajor } from '../../spine-format/binary/readSkeleton.ts'
 import type { AnimationData, Timeline } from '../../spine-format/binary/readAnimations.ts'
 import { IssueCollector, type ConversionIssue } from '../types.ts'
+import { curveValuesOf, toAbsoluteBezier, toNormalizedBezier } from '../../spine-format/bezier.ts'
 
 /**
  * `.skel` 的版本转换。
@@ -12,10 +13,14 @@ import { IssueCollector, type ConversionIssue } from '../types.ts'
  * |---|---|---|
  * | 文件头 hash | 字符串 → 8 字节(重算) | 反之 |
  * | slot 颜色时间轴 | 打包 int → 分通道字节 | 反之 |
- * | 贝塞尔曲线 | 一条 → 每分量各一条(复制) | **N 条取第一条,有损** |
+ * | 贝塞尔曲线 | 一条**归一化** → 每分量一条**绝对** | 反之,N 条取一条,可能有损 |
  * | bezierCount | 需要算出来 | 丢弃 |
  * | 单轴时间轴 | —— | **3.8 没有,需合成或丢弃** |
  * | sequence | 无 → null | **有则丢失** |
+ *
+ * ⚠️ 贝塞尔那一行不是「复制」那么简单 —— **两版的控制点坐标系不同**,
+ * 3.8 是归一化的百分比,4.x 是绝对的时间与取值。照抄过去动画照播,
+ * 但所有缓动都会变形。见 [bezier.ts](../../spine-format/bezier.ts)。
  *
  * 见 [docs/SPINE-BINARY.md](../../../docs/SPINE-BINARY.md)。
  */
@@ -73,29 +78,93 @@ function packRgb(bytes: readonly number[]): number {
 
 // ─── 曲线 ────────────────────────────────────────────────────────────────────
 
-/** 升级:3.8 的单条曲线复制到每个分量上。无损。 */
-function expandCurve(frame: Record<string, unknown>, components: number): Record<string, unknown> {
-  if (frame['curve'] !== 'bezier') return frame
-  const single = (frame['beziers'] as number[][])[0]!
-  return { ...frame, beziers: Array.from({ length: components }, () => [...single]) }
+/**
+ * 升级:3.8 的单条**归一化**曲线 → 4.x 每分量一条**绝对**曲线。
+ *
+ * ⚠️ 不只是复制。3.8 的控制点是「占该段时间/取值的百分比」,4.x 是绝对的时间和取值 ——
+ * 直接抄过去动画照播,但**所有缓动都会变形**。见 [bezier.ts](../../spine-format/bezier.ts)。
+ *
+ * 各分量的取值范围不同,所以换算出来的 N 条曲线一般**互不相同**。
+ */
+function expandCurves(
+  kind: string,
+  frames: readonly Record<string, unknown>[],
+  components: number,
+): Record<string, unknown>[] {
+  return frames.map((frame, i) => {
+    if (frame['curve'] !== 'bezier') return frame
+    const single = (frame['beziers'] as number[][])[0]!
+    const next = frames[i + 1]
+
+    // 取值空间一致(deform)或没有数值可插值时不换算,原样复制
+    const from = next === undefined ? null : curveValuesOf(kind, frame, true)
+    const to = next === undefined ? null : curveValuesOf(kind, next, true)
+    if (from === null || to === null) {
+      return { ...frame, beziers: Array.from({ length: components }, () => [...single]) }
+    }
+
+    const t0 = frame['time'] as number
+    const t1 = next!['time'] as number
+    return {
+      ...frame,
+      beziers: Array.from({ length: components }, (_, c) =>
+        toAbsoluteBezier(single, t0, from[c] ?? 0, t1, to[c] ?? 0),
+      ),
+    }
+  })
 }
 
 /**
- * 降级:N 条曲线只能留一条。各分量曲线不同时会丢信息。
+ * 降级:4.x 每分量一条**绝对**曲线 → 3.8 单条**归一化**曲线。
+ *
+ * 先各自归一化再比较 —— 各分量取值范围不同,绝对值几乎必然不等,
+ * 直接比会把「形状其实一样」的情况也报成有损。
+ *
+ * 代表分量取**取值变化最大**的那个:首尾取值相同的分量归一化没有意义,
+ * 拿它当代表会把曲线丢成一条直线。
  *
  * `report` 每条时间轴只调一次 —— 逐帧报会刷屏,而用户关心的是
  * 「哪条时间轴受影响」,不是「第几帧」。
  */
-function collapseCurve(
-  frame: Record<string, unknown>,
+function collapseCurves(
+  kind: string,
+  frames: readonly Record<string, unknown>[],
   report: () => void,
-): Record<string, unknown> {
-  if (frame['curve'] !== 'bezier') return frame
-  const beziers = frame['beziers'] as number[][]
-  const first = beziers[0]!
+): Record<string, unknown>[] {
+  return frames.map((frame, i) => {
+    if (frame['curve'] !== 'bezier') return frame
+    const beziers = frame['beziers'] as number[][]
+    const next = frames[i + 1]
 
-  if (beziers.some((b) => b.some((n, i) => n !== first[i]))) report()
-  return { ...frame, beziers: [[...first]] }
+    const from = next === undefined ? null : curveValuesOf(kind, frame, false)
+    const to = next === undefined ? null : curveValuesOf(kind, next, false)
+    if (from === null || to === null) {
+      if (beziers.some((b) => b.some((n, at) => n !== beziers[0]![at]))) report()
+      return { ...frame, beziers: [[...beziers[0]!]] }
+    }
+
+    const t0 = frame['time'] as number
+    const t1 = next!['time'] as number
+    const normalized = beziers.map((b, c) => toNormalizedBezier(b, t0, from[c] ?? 0, t1, to[c] ?? 0))
+
+    let best = 0
+    let bestSpan = -1
+    beziers.forEach((_, c) => {
+      const span = Math.abs((to[c] ?? 0) - (from[c] ?? 0))
+      if (span > bestSpan) {
+        bestSpan = span
+        best = c
+      }
+    })
+
+    const chosen = normalized[best]!
+    // 取值不变的分量归一化后是全 0,不算「形状不同」
+    const differs = normalized.some(
+      (n, c) => Math.abs((to[c] ?? 0) - (from[c] ?? 0)) > 1e-9 && n.some((v, at) => Math.abs(v - chosen[at]!) > 1e-6),
+    )
+    if (differs) report()
+    return { ...frame, beziers: [[...chosen]] }
+  })
 }
 
 /** 造一个「同一条时间轴只报一次」的回调 */
@@ -109,7 +178,7 @@ function onceReporter(issues: IssueCollector, where: string, message: string): (
 }
 
 const CURVE_COLLAPSE_MESSAGE =
-  '各分量的贝塞尔曲线不同,3.8 每条时间轴只能存一条,已取第一个分量的曲线'
+  '各分量的贝塞尔曲线形状不同,3.8 每条时间轴只能存一条,已取取值变化最大的那个分量'
 
 // ─── 时间轴 ──────────────────────────────────────────────────────────────────
 
@@ -118,14 +187,15 @@ function upgradeTimeline(t: Timeline): Timeline {
   if (t.kind === 'color' || t.kind === 'twoColor') {
     const kind = t.kind === 'color' ? 'slotColor1' : 'slotColor3'
     const components = componentsOf(kind)
-    const frames = t.frames.map((f) => {
+    // 先按 3.8 的形状换算曲线,再改帧的形状 —— 换算要读原来的 colors
+    const frames = expandCurves(t.kind, t.frames, components).map((f) => {
       const colors = f['colors'] as number[]
       const bytes =
         t.kind === 'color'
           ? unpackRgba(colors[0]!)
           : [...unpackRgba(colors[0]!), ...unpackRgb(colors[1]!)]
       const { colors: _drop, ...rest } = f
-      return expandCurve({ ...rest, color: bytes }, components)
+      return { ...rest, color: bytes }
     })
     return { kind, owner: t.owner, frames, bezierCount: countBeziers(frames, components) }
   }
@@ -137,7 +207,7 @@ function upgradeTimeline(t: Timeline): Timeline {
   // deform 的帧套了一层(skin/attachment 包装)
   if (t.kind === 'deform') {
     const wrapper = t.frames[0] as Record<string, unknown>
-    const inner = (wrapper['frames'] as Record<string, unknown>[]).map((f) => expandCurve(f, 1))
+    const inner = expandCurves(t.kind, wrapper['frames'] as Record<string, unknown>[], 1)
     return {
       kind: t.kind,
       owner: t.owner,
@@ -147,7 +217,7 @@ function upgradeTimeline(t: Timeline): Timeline {
   }
 
   const components = componentsOf(t.kind)
-  const frames = t.frames.map((f) => expandCurve(f, components))
+  const frames = expandCurves(t.kind, t.frames, components)
   return { kind: t.kind, owner: t.owner, frames, bezierCount: countBeziers(frames, components) }
 }
 
@@ -172,10 +242,10 @@ function downgradeTimeline(t: Timeline, issues: IssueCollector): Timeline | null
       where,
       `3.8 没有单轴时间轴,已转成双轴并把另一轴填为中性值 ${single.neutral}`,
     )
-    const frames = t.frames.map((f) => {
+    const other = single.axis === 'x' ? 'y' : 'x'
+    const frames = collapseCurves(t.kind, t.frames, collapsed).map((f) => {
       const { value, ...rest } = f
-      const other = single.axis === 'x' ? 'y' : 'x'
-      return collapseCurve({ ...rest, [single.axis]: value, [other]: single.neutral }, collapsed)
+      return { ...rest, [single.axis]: value, [other]: single.neutral }
     })
     return { kind: single.kind, owner: t.owner, frames, bezierCount: -1 }
   }
@@ -191,13 +261,13 @@ function downgradeTimeline(t: Timeline, issues: IssueCollector): Timeline | null
       )
     }
     const twoColor = type === 3 || type === 4
-    const frames = t.frames.map((f) => {
+    const frames = collapseCurves(t.kind, t.frames, collapsed).map((f) => {
       const c = f['color'] as number[]
       // 缺的通道补 255(不透明白),这是 3.8 里的中性值
       const rgba = [c[0] ?? 255, c[1] ?? 255, c[2] ?? 255, type === 5 ? c[0]! : (c[3] ?? 255)]
       const colors = twoColor ? [packRgba(rgba), packRgb(c.slice(4))] : [packRgba(rgba)]
       const { color: _drop, ...rest } = f
-      return collapseCurve({ ...rest, colors }, collapsed)
+      return { ...rest, colors }
     })
     return { kind: twoColor ? 'twoColor' : 'color', owner: t.owner, frames, bezierCount: -1 }
   }
@@ -208,13 +278,11 @@ function downgradeTimeline(t: Timeline, issues: IssueCollector): Timeline | null
 
   if (t.kind === 'deform') {
     const wrapper = t.frames[0] as Record<string, unknown>
-    const inner = (wrapper['frames'] as Record<string, unknown>[]).map((f) =>
-      collapseCurve(f, collapsed),
-    )
+    const inner = collapseCurves(t.kind, wrapper['frames'] as Record<string, unknown>[], collapsed)
     return { kind: t.kind, owner: t.owner, frames: [{ ...wrapper, frames: inner }], bezierCount: -1 }
   }
 
-  const frames = t.frames.map((f) => collapseCurve(f, collapsed))
+  const frames = collapseCurves(t.kind, t.frames, collapsed)
   return { kind: t.kind, owner: t.owner, frames, bezierCount: -1 }
 }
 

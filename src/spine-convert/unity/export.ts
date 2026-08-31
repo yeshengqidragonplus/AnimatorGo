@@ -16,6 +16,7 @@ import { writeController, CLIP_FILE_ID } from '../../unity/writeController.ts'
 import { writeNativeMeta, writePrefabMeta, writeTextureMeta, type MetaBone, type MetaSprite, type MetaWeight } from '../../unity/writeMeta.ts'
 import { unityGuid, internalId, uniqueIds } from '../../unity/ids.ts'
 import { encodePng, type Image } from '../../unity/png.ts'
+import { toAbsoluteBezier } from '../../spine-format/bezier.ts'
 import { bakeAtlas } from './bakeAtlas.ts'
 import { bindMesh, estimateAtlasScale } from './mesh.ts'
 
@@ -89,7 +90,11 @@ function constantKeys(times: readonly number[], value: number): UnityKeyframe[] 
 }
 
 /**
- * 取出各段的曲线定义。
+ * 取出各段的曲线定义,统一成**绝对时间/取值**的控制点。
+ *
+ * ⚠️ **3.8 的控制点是归一化的百分比,4.x 是绝对值** —— 见
+ * [bezier.ts](../../spine-format/bezier.ts)。当成同一种处理,动画照播,
+ * 但所有缓动都会变形。
  *
  * ⚠️ **控制点的 y 分量在 Spine 的原始值空间里**(平移是像素、缩放是倍率),
  * 而我们的 values 已经加过绑定姿势、换算过单位。两者必须用**同一个变换**,
@@ -99,7 +104,10 @@ function constantKeys(times: readonly number[], value: number): UnityKeyframe[] 
  */
 function segmentsOf(
   frames: readonly Record<string, unknown>[],
+  /** 该分量每帧的**原始**取值,3.8 的归一化控制点要靠它还原成绝对值 */
+  rawValues: readonly number[],
   transformValue: (raw: number) => number,
+  is38: boolean,
   component = 0,
 ): (SpineSegment | undefined)[] {
   return frames.map((f, i) => {
@@ -108,7 +116,16 @@ function segmentsOf(
     if (curve === 'stepped') return { curve: 'stepped' as const }
     if (curve === 'bezier') {
       const all = f['beziers'] as number[][]
-      const b = all[Math.min(component, all.length - 1)]!
+      const raw = all[Math.min(component, all.length - 1)]!
+      const b = is38
+        ? toAbsoluteBezier(
+            raw,
+            f['time'] as number,
+            rawValues[i] ?? 0,
+            frames[i + 1]!['time'] as number,
+            rawValues[i + 1] ?? 0,
+          )
+        : raw
       // 时间分量原样保留,值分量走同一个变换
       return {
         curve: 'bezier' as const,
@@ -219,6 +236,8 @@ export function exportToUnity(
   const issues = new IssueCollector()
   const scale = 1 / options.pixelsPerUnit
   const name = sanitize(options.name)
+  // 3.8 的贝塞尔控制点是归一化的,4.x 是绝对的 —— segmentsOf 要靠这个区分
+  const is38 = part.header.major === '3.8'
 
   for (const bone of part.bones) {
     if (bone.transformMode !== 0) {
@@ -594,10 +613,11 @@ export function exportToUnity(
 
         if (t.kind === 'rotate' && bone !== undefined && path !== undefined) {
           const toAngle = (raw: number) => bone.rotation + raw
+          const raw = t.frames.map((f) => f['value'] as number)
           const s = withSetup(
             t.frames.map((f) => f['time'] as number),
-            t.frames.map((f) => toAngle(f['value'] as number)),
-            segmentsOf(t.frames, toAngle),
+            raw.map(toAngle),
+            segmentsOf(t.frames, raw, toAngle, is38),
             bone.rotation,
           )
           const z = toUnityCurve(s.times, s.values, s.segments)
@@ -610,16 +630,18 @@ export function exportToUnity(
         if (t.kind === 'translate' && bone !== undefined && path !== undefined) {
           const toX = (raw: number) => (bone.x + raw) * scale
           const toY = (raw: number) => (bone.y + raw) * scale
+          const rawX = t.frames.map((f) => f['x'] as number)
+          const rawY = t.frames.map((f) => f['y'] as number)
           const sx = withSetup(
             t.frames.map((f) => f['time'] as number),
-            t.frames.map((f) => toX(f['x'] as number)),
-            segmentsOf(t.frames, toX, 0),
+            rawX.map(toX),
+            segmentsOf(t.frames, rawX, toX, is38, 0),
             bone.x * scale,
           )
           const sy = withSetup(
             t.frames.map((f) => f['time'] as number),
-            t.frames.map((f) => toY(f['y'] as number)),
-            segmentsOf(t.frames, toY, 1),
+            rawY.map(toY),
+            segmentsOf(t.frames, rawY, toY, is38, 1),
             bone.y * scale,
           )
           const x = toUnityCurve(sx.times, sx.values, sx.segments)
@@ -634,16 +656,18 @@ export function exportToUnity(
         if (t.kind === 'scale' && bone !== undefined && path !== undefined) {
           const toSX = (raw: number) => bone.scaleX * raw
           const toSY = (raw: number) => bone.scaleY * raw
+          const rawX = t.frames.map((f) => f['x'] as number)
+          const rawY = t.frames.map((f) => f['y'] as number)
           const sx = withSetup(
             t.frames.map((f) => f['time'] as number),
-            t.frames.map((f) => toSX(f['x'] as number)),
-            segmentsOf(t.frames, toSX, 0),
+            rawX.map(toSX),
+            segmentsOf(t.frames, rawX, toSX, is38, 0),
             bone.scaleX,
           )
           const sy = withSetup(
             t.frames.map((f) => f['time'] as number),
-            t.frames.map((f) => toSY(f['y'] as number)),
-            segmentsOf(t.frames, toSY, 1),
+            rawY.map(toSY),
+            segmentsOf(t.frames, rawY, toSY, is38, 1),
             bone.scaleY,
           )
           const x = toUnityCurve(sx.times, sx.values, sx.segments)
@@ -691,7 +715,8 @@ export function exportToUnity(
 
           for (const [attribute, values, component, setupValue] of channels) {
             const times = t.frames.map((f) => f['time'] as number)
-            const s = withSetup(times, values, segmentsOf(t.frames, (v) => v, component), setupValue)
+            // 颜色的取值已经是 0..1,与贝塞尔 cy 同一空间,不用再变换
+            const s = withSetup(times, values, segmentsOf(t.frames, values, (v) => v, is38, component), setupValue)
             const curve = toUnityCurve(s.times, s.values, s.segments)
             approximated ||= curve.approximated
             for (const item of list) {

@@ -504,6 +504,31 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
     expect(result.issues.filter((i) => i.level === 'approximated').length).toBeLessThan(3)
   })
 
+  /**
+   * 同一份动画的 3.8 与 4.1 导出,转出来的缓动应当一样。
+   *
+   * ⚠️ 3.8 的贝塞尔控制点是归一化的百分比,4.x 是绝对时间/取值。当成同一种处理时,
+   * 3.8 的 `cx` 永远在 [0,1],减去段起始时间往往是负数,于是被当成
+   * 「控制点贴在端点上」退化成线性 —— 46 条时间轴,而 4.1 是 0 条。
+   * **这个数字的反常是唯一的报警信号**,曲线本身错了是看不出来的。
+   */
+  it('⭐ 3.8 输入不会退化成线性(两版控制点的坐标系不同)', () => {
+    const skel38 = 'res/spine/3.8/MX2_cat.skel.bytes'
+    const atlas38 = 'res/spine/3.8/MX2_cat.atlas.txt'
+    const page38 = 'res/spine/3.8/MX2_cat.png'
+    if (![skel38, atlas38, page38].every(existsSync)) return
+
+    const part38 = readSkeletonPart(new Uint8Array(readFileSync(skel38)))
+    const out = exportToUnity(
+      part38,
+      parseAtlas(readFileSync(atlas38, 'utf8')),
+      new Map([['MX2_cat.png', decodePng(new Uint8Array(readFileSync(page38)))]]),
+      { name: 'MX2_cat', pixelsPerUnit: 100 },
+    )
+    const degraded = out.issues.filter((i) => i.message.includes('退化为线性'))
+    expect(degraded).toEqual([])
+  })
+
   it('两次导出逐字节相同 —— 否则 Unity 里的引用会断', () => {
     const again = exportToUnity(part, atlas, sources, { name: 'MX2_cat', pixelsPerUnit: 100 })
     expect(again.files.length).toBe(result.files.length)

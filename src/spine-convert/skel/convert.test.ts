@@ -108,6 +108,33 @@ describe.skipIf(!bothExist)('.skel 版本转换', () => {
       expect(compared).toBeGreaterThan(1000)
     })
 
+    /**
+     * ⭐ **两版的贝塞尔控制点不是一个坐标系** —— 3.8 是归一化的百分比,
+     * 4.x 是绝对的时间与取值。照抄过去动画照播,但所有缓动都会变形,
+     * 自己是看不出来的。幸好这里有标准答案。
+     */
+    it('⭐ 升级后的贝塞尔控制点与真实 4.1 导出一致', () => {
+      const real = indexed(load('4.1'))
+      let compared = 0
+      for (const [key, t] of indexed(converted())) {
+        const r = real.get(key)!
+        t.frames.forEach((f, i) => {
+          if (f['curve'] !== 'bezier') return
+          expect(r.frames[i]!['curve'], `${key} 帧${i} 曲线类型`).toBe('bezier')
+          const mine = f['beziers'] as number[][]
+          const theirs = r.frames[i]!['beziers'] as number[][]
+          expect(mine.length, `${key} 帧${i} 分量数`).toBe(theirs.length)
+          mine.forEach((b, c) => {
+            b.forEach((v, at) => {
+              expectClose(v, theirs[c]![at]!, `${key} 帧${i} 分量${c} 控制点${at}`)
+              compared++
+            })
+          })
+        })
+      }
+      expect(compared).toBeGreaterThan(500)
+    })
+
     it('升级方向不报 loss', () => {
       const { issues } = convertSkeleton(load('3.8'), '4.x')
       expect(issues.filter((i) => i.level === 'loss')).toEqual([])
@@ -142,9 +169,41 @@ describe.skipIf(!bothExist)('.skel 版本转换', () => {
       }
     })
 
-    it('⭐ 各分量曲线不同时必须报 loss,不能静默丢弃', () => {
+    /**
+     * 各分量的**绝对**控制点几乎必然互不相等(取值范围不同),但归一化之后
+     * 形状往往是同一条。按绝对值比会把这种情况误报成有损 —— 这份真实素材就是。
+     */
+    it('分量曲线形状相同时不报 loss(别按绝对值比)', () => {
       const { issues } = convertSkeleton(load('4.1'), '3.8')
-      const losses = issues.filter((i) => i.level === 'loss')
+      const curveLosses = issues.filter((i) => i.level === 'loss' && i.message.includes('贝塞尔'))
+      expect(curveLosses).toEqual([])
+    })
+
+    it('⭐ 各分量曲线形状真的不同时必须报 loss,不能静默丢弃', () => {
+      // 找一帧:两个分量的取值都在变(只有一个在变的话,另一个归一化后是全 0,
+      // 本来就不该算「形状不同」),然后把 y 分量的曲线掰弯
+      const part = structuredClone(load('4.1')) as SkeletonPart
+      let touched = ''
+      outer: for (const anim of part.animations) {
+        for (const t of anim.timelines) {
+          if (t.kind !== 'translate') continue
+          for (let i = 0; i + 1 < t.frames.length; i++) {
+            const f = t.frames[i]!
+            const next = t.frames[i + 1]!
+            if (f['curve'] !== 'bezier') continue
+            if (f['x'] === next['x'] || f['y'] === next['y']) continue
+            const beziers = f['beziers'] as number[][]
+            // 把 y 分量的控制点挪一大截,归一化之后形状必然与 x 不同
+            beziers[1] = [beziers[1]![0]!, beziers[1]![1]! + 1234, beziers[1]![2]!, beziers[1]![3]! - 987]
+            touched = `${t.kind}[${t.owner}]`
+            break outer
+          }
+        }
+      }
+      expect(touched, '素材里没有可用来构造的双分量贝塞尔帧').not.toBe('')
+
+      const { issues } = convertSkeleton(part, '3.8')
+      const losses = issues.filter((i) => i.level === 'loss' && i.message.includes('贝塞尔'))
       expect(losses.length).toBeGreaterThan(0)
       // 报告要精确到具体时间轴,不是笼统一句
       expect(losses[0]!.path).toMatch(/\w+\.\w+\[\d+\]/)
