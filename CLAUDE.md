@@ -87,10 +87,11 @@ pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--dry-run]
 **图集区域名和 `attachment.path` 用图片文件名(`image.path`),不是 imageId** ——
 imageId 的冒号会撞上 `.atlas` 文本语法;文件名两边一致,重新打包不用动任何绑定。
 
-**尚未做:** 三套引擎的原生运行时与实际播放验证、Spine 导入/导出、曲线编辑器 UI(贝塞尔在 `core/` 里已实现,但没有编辑界面)、IK、网格形变。
+**编辑器后续设计,当前不做:** 三套引擎的原生运行时与实际播放验证、编辑器内的 Spine 导入/导出、曲线编辑器 UI、IK、网格形变。
 
-Godot / Unity / Cocos 已能导出统一 Runtime Package，模板在 `runtime-templates/`。运行时分别用
-GDScript / C# / TypeScript 实现，**不要引入 C++ 共用库**；理由与未来重新评估条件见 `docs/DECISIONS.md`。
+Godot / Unity / Cocos 的统一 Runtime Package 与模板在 `runtime-templates/`。这是**冻结的编辑器后续设计**，
+不是当前转换器主线；不要继续投入。若未来恢复，运行时分别用 GDScript / C# / TypeScript 实现，
+**不要引入 C++ 共用库**。
 
 当前交接状态和下一步请先读 [docs/PROGRESS.md](docs/PROGRESS.md)。
 
