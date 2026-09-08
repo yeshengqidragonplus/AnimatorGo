@@ -9,27 +9,28 @@
 //      表现是网格摊成一团或干脆不显示。
 //
 // 所以这里把两样都点一遍,数字摆出来。菜单:Tools ▸ AnimatorGo ▸ 检查转换产物
+//
+// 源码放在仓库的 tools/unity/,用之前拷进 Assets/Editor/ ——
+// UnityAnimationGo/Assets/ 整个是 gitignore 掉的。
 
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using UnityEditor;
+using UnityEditor.SceneManagement;
 using UnityEngine;
 using UnityEngine.U2D.Animation;
 
 public static class AnimatorGoVerify
 {
     const string AssetRoot = "Assets/AnimatorGo";
+    const string ScenePath = "Assets/AnimatorGoVerify.unity";
 
     [MenuItem("Tools/AnimatorGo/检查转换产物")]
     public static void Verify()
     {
-        string[] prefabGuids = AssetDatabase.FindAssets("t:Prefab", new[] { AssetRoot });
-        if (prefabGuids.Length == 0)
-        {
-            Debug.LogWarning($"{AssetRoot} 下没有 prefab —— 先跑 pnpm unity 生成");
-            return;
-        }
+        string[] prefabGuids = FindPrefabs();
+        if (prefabGuids == null) return;
 
         var report = new StringBuilder();
         int problems = 0;
@@ -37,15 +38,21 @@ public static class AnimatorGoVerify
         foreach (string guid in prefabGuids)
         {
             string path = AssetDatabase.GUIDToAssetPath(guid);
-            var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(path);
-            var instance = (GameObject)PrefabUtility.InstantiatePrefab(prefab);
 
-            report.AppendLine($"── {System.IO.Path.GetFileName(path)} ──");
-            problems += CheckSkins(instance, report);
-            problems += CheckClips(instance, path, report);
-            report.AppendLine();
-
-            Object.DestroyImmediate(instance);
+            // 用 LoadPrefabContents 而不是往当前场景里 Instantiate ——
+            // 后者会把用户正在编辑的场景弄脏
+            GameObject root = PrefabUtility.LoadPrefabContents(path);
+            try
+            {
+                report.AppendLine($"── {System.IO.Path.GetFileName(path)} ──");
+                problems += CheckSkins(root, report);
+                problems += CheckClips(root, path, report);
+                report.AppendLine();
+            }
+            finally
+            {
+                PrefabUtility.UnloadPrefabContents(root);
+            }
         }
 
         problems += CheckSprites(report);
@@ -53,6 +60,23 @@ public static class AnimatorGoVerify
         Debug.Log(report.ToString());
         if (problems == 0) Debug.Log("AnimatorGo 自检:全部通过 ✅");
         else Debug.LogError($"AnimatorGo 自检:{problems} 处有问题,详见上面的报告");
+    }
+
+    static string[] FindPrefabs()
+    {
+        if (!AssetDatabase.IsValidFolder(AssetRoot))
+        {
+            Debug.LogWarning($"没有 {AssetRoot} —— 先跑:pnpm unity res/spine/4.1 --out {AssetRoot}");
+            return null;
+        }
+
+        string[] guids = AssetDatabase.FindAssets("t:Prefab", new[] { AssetRoot });
+        if (guids.Length == 0)
+        {
+            Debug.LogWarning($"{AssetRoot} 下没有 prefab —— 先跑 pnpm unity 生成");
+            return null;
+        }
+        return guids;
     }
 
     /// SpriteSkin 的校验状态。SetBoneTransforms 传回它自己现有的数组,
@@ -76,7 +100,10 @@ public static class AnimatorGoVerify
     /// 曲线的 path 能不能指到真实物体。指不到的曲线 Unity 会**静默忽略**。
     static int CheckClips(GameObject root, string prefabPath, StringBuilder report)
     {
-        string folder = System.IO.Path.GetDirectoryName(prefabPath).Replace('\', '/');
+        // ⚠️ 不要用 Path.GetDirectoryName —— 它在 Windows 上给反斜杠,而 AssetDatabase
+        // 只认正斜杠。资源路径本来就一律是正斜杠,自己切一刀最省事。
+        int cut = prefabPath.LastIndexOf('/');
+        string folder = cut < 0 ? AssetRoot : prefabPath.Substring(0, cut);
         string[] clipGuids = AssetDatabase.FindAssets("t:AnimationClip", new[] { folder });
         int unresolved = 0;
 
@@ -117,6 +144,7 @@ public static class AnimatorGoVerify
         {
             string path = AssetDatabase.GUIDToAssetPath(guid);
             Sprite[] sprites = AssetDatabase.LoadAllAssetsAtPath(path).OfType<Sprite>().ToArray();
+            // 默认矩形是 2 个三角形 = 6 个下标,多于 6 说明自定义网格生效了
             int meshed = sprites.Count(s => s.triangles.Length > 6);
             var empty = sprites.Where(s => s.vertices.Length == 0).Select(s => s.name).ToList();
 
@@ -133,15 +161,13 @@ public static class AnimatorGoVerify
     [MenuItem("Tools/AnimatorGo/摆一个对比场景")]
     public static void BuildScene()
     {
-        string[] prefabGuids = AssetDatabase.FindAssets("t:Prefab", new[] { AssetRoot });
-        if (prefabGuids.Length == 0)
-        {
-            Debug.LogWarning($"{AssetRoot} 下没有 prefab");
-            return;
-        }
+        string[] prefabGuids = FindPrefabs();
+        if (prefabGuids == null) return;
 
-        var scene = UnityEditor.SceneManagement.EditorSceneManager.NewScene(
-            UnityEditor.SceneManagement.NewSceneSetup.DefaultGameObjects);
+        // 会新建场景,先给用户机会保存手头的
+        if (!EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo()) return;
+
+        var scene = EditorSceneManager.NewScene(NewSceneSetup.DefaultGameObjects, NewSceneMode.Single);
 
         // 每个角色横向排开,免得叠在一起看不出谁是谁
         float x = 0f;
@@ -159,10 +185,11 @@ public static class AnimatorGoVerify
             camera.orthographic = true;
             camera.orthographicSize = 8f;
             camera.transform.position = new Vector3((x - 12f) / 2f, 0f, -10f);
+            camera.clearFlags = CameraClearFlags.SolidColor;
             camera.backgroundColor = new Color(0.22f, 0.24f, 0.27f);
         }
 
-        UnityEditor.SceneManagement.EditorSceneManager.SaveScene(scene, $"{AssetRoot}/Verify.unity");
-        Debug.Log($"场景已存到 {AssetRoot}/Verify.unity —— 直接播就能看");
+        EditorSceneManager.SaveScene(scene, ScenePath);
+        Debug.Log($"场景已存到 {ScenePath} —— 直接播就能看");
     }
 }

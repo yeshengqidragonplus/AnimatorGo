@@ -23,9 +23,15 @@ pnpm build        # 类型检查 + 构建 dist/ 和 dist-electron/
 pnpm build:win    # 打包 Windows 安装程序 → release/
 pnpm build:mac    # 打包 macOS dmg → release/
 pnpm typecheck
+pnpm check:unity  # 编译 tools/unity/ 下的 Editor 脚本(见下)
 pnpm test         # vitest 单跑一次
 pnpm test:watch
 ```
+
+⚠️ **`tools/unity/*.cs` 改完一定要跑 `pnpm check:unity`。** TypeScript 那边有 tsc 兜着,
+C# 这边什么都没有 —— 曾经把 `Replace('\', '/')`(反斜杠没转义)交出去,
+用户打开 Unity 才发现。这个脚本用 Unity 自带的 Roslyn + Unity 自己的引用程序集编,
+判断和 Unity 里一致;找不到 Unity 或 dotnet 就跳过,不会因为换机器而失败。
 
 `pnpm dev:web` 只起 Vite(浏览器里打开会因为没有 `platform/` 而报错,仅用于调试渲染层)。
 
@@ -55,7 +61,7 @@ pnpm convert <输入路径> --to 4.1 [--out 目录] [--format skel|json] [--dry-
 导出到 Unity 2D Animation:
 
 ```bash
-pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--dry-run]
+pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--dry-run]
 ```
 
 产出**可以直接拖进 Assets 就播**的一整套:烘焙后的图集 PNG + `.meta`

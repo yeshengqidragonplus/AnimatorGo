@@ -9,6 +9,7 @@
     "build:win": "pnpm build && electron-builder --win",
     "build:mac": "pnpm build && electron-builder --mac",
     "typecheck": "tsc -b --noEmit",
+    "check:unity": "bash tools/unity/check-scripts.sh",
     "test": "vitest run",
     "test:watch": "vitest",
     "dev:web": "vite",
