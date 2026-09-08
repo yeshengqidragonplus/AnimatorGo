@@ -91,9 +91,20 @@ for src in "${files[@]}"; do
     # 包里用宏隔开的分支也要编到
     echo "-define:UNITY_2D_ANIMATION"
     echo "-out:\"$out_win/check.dll\""
-    for f in "$mono/mscorlib.dll" "$mono/System.dll" "$mono/System.Core.dll" "$mono/Facades/netstandard.dll"; do
-      [ -f "$f" ] && echo "-r:\"$f\""
-    done
+    # Unity 6 的引擎程序集是对着 netstandard 2.1 编的。优先用 Unity 自带的 2.1 引用程序集
+    # (Unity 自己编 Editor 脚本就是用它),没有再退回 mono 4.7.1 + netstandard 2.0 facade ——
+    # 后者碰到 ValueTuple 之类 2.1 才有的东西会报 CS1705 版本不匹配
+    ns21="$data/NetStandard/ref/2.1.0/netstandard.dll"
+    if [ -f "$ns21" ]; then
+      echo "-r:\"$ns21\""
+      for f in "$data"/NetStandard/compat/2.1.0/shims/netfx/*.dll "$data"/NetStandard/Extensions/2.0.0/*.dll; do
+        [ -f "$f" ] && echo "-r:\"$f\""
+      done
+    else
+      for f in "$mono/mscorlib.dll" "$mono/System.dll" "$mono/System.Core.dll" "$mono/Facades/netstandard.dll"; do
+        [ -f "$f" ] && echo "-r:\"$f\""
+      done
+    fi
     for f in "$managed"/*.dll "$script_assemblies"/*.dll; do
       [ -f "$f" ] && echo "-r:\"$f\""
     done

@@ -110,10 +110,10 @@ Unity.exe -batchmode -quit -nographics -projectPath <工程>           -executeM
 
 | 骨架数 | 问题 | 性质 |
 |---|---|---|
-| 170 (32%) | **deform 顶点动画** | SpriteSkin 无对应物。候选解法 `SkinnedMeshRenderer` + Blend Shape,**排查中、未定**,见 [DECISIONS.md](DECISIONS.md) |
+| ~~170 (32%)~~ | ~~**deform 顶点动画**~~ | ✅ **已解**(2026-09-09):走 `SkinnedMeshRenderer` + Blend Shape,见下文与 [UNITY-2D.md](UNITY-2D.md) 第 11 节 |
 | 95 | 每顶点 >4 根骨骼 | Unity 的 `BoneWeight` 硬限制 |
-| 38 | 网格在绑定姿势下就非刚性 | 顶点位置与 UV 绑死,表达不了(多半是刻意做的透视) |
-| 29 | 加权网格之间缩放不一致 | 一张纹理只有一个 `pixelsPerUnit` |
+| ~~38~~ | ~~网格在绑定姿势下就非刚性~~ | ✅ **已解**:这类网格也走 SkinnedMeshRenderer,Mesh 的绑定矩阵是任意 4×4 |
+| ~~29~~ | ~~加权网格之间缩放不一致~~ | ✅ **已解**:同上,Mesh 的顶点与 UV 各自独立 |
 | 22 | clipping 遮罩 | 无对应物 |
 | 20 | 贝塞尔控制点贴端点 | 退化为线性 |
 | 16 | 逐帧绘制顺序 | ~~`sortingOrder` 是静态的~~ 排查证实 `m_SortingOrder` **可以打关键帧,能做、未做** |
@@ -190,15 +190,41 @@ MC2 数据侧(458 条加权网格上的 deform,脚本在会话 scratchpad):
 顺带发现两处**此前的说法不对**,已改:IK 的提示说「位置已烘进曲线」,但代码里没有 IK 求解;
 逐帧绘制顺序判为「做不到」,实测能做。
 
+### ✅ deform → SkinnedMeshRenderer + Blend Shape 已实现(2026-09-09)
+
+排查完用户把子决策交给我定(见 [DECISIONS.md](DECISIONS.md)),当天做完。四块:
+
+| 模块 | 文件 | 验证 |
+|---|---|---|
+| 姿势求值器 | `src/spine-eval/pose.ts` | 单测:父子链、继承模式、3.8/4.x 两种贝塞尔、第一帧之前用 setup |
+| Mesh `.asset` 写入器 | `src/unity/writeMesh.ts`(+ `crc32.ts`) | 与 Unity 样本同构的网格写出再回读,顶点流 / 可变根数权重 / 形变目标 / 绑定矩阵逐个对上;6 顶点 256 字节与样本一致 |
+| 材质、prefab 里的 SkinnedMeshRenderer | `src/unity/writeMaterial.ts`、`writePrefab.ts` | Unity batchmode 加载 |
+| 分流 + 反解增量 + 权重曲线 | `src/spine-convert/unity/export.ts` | ⭐ 两条端到端用例:把写出的 Mesh / prefab / `.anim` 读回来,按 Unity 的规则(前 4 根归一、加完再蒙皮)算顶点,与 Spine 的 deform 求值比,关键帧时刻 <0.5px —— MX2_cat 的不加权 eyelid,和 MC2 `customer_1` 的加权网格(本地样本,存在才跑) |
+
+Unity 6000.3 batchmode 自检(临时工程,`AnimatorGoVerify.cs` 新增 `CheckSkinnedMeshes`,
+并对 `blendShape.<名>` 曲线查 Mesh 里真有这个目标):
+
+```
+MX2_cat / customer_1 / blackrichwoman / wave / 17701 / 13901
+SpriteSkin 41 个全部 Ready;SkinnedMeshRenderer 59 个、形变目标 373 个,有问题 0;
+所有曲线都指到物体;AnimatorGo 自检:全部通过 ✅
+```
+
+这六个也已转进 `UnityAnimationGo/Assets/AnimatorGo/`,**肉眼确认待用户**。
+
+顺带解掉的:绑定姿势非刚性(38 个骨架)、加权网格缩放不一致(29 个)—— 同样的网格路径。
+顺带发现的:`wave` 的 deform 打在 `path` attachment 上(路径约束用),不参与渲染,报 info 跳过。
+
+代价(都报出来):这些网格上的 slot 颜色动画丢弃(SkinnedMeshRenderer 没有 `m_Color`);
+每顶点 >4 根仍截到 4(渲染器写死 Bone4);关键帧之间与 Spine 的分歧 >0.5px 时报 approximated
+(`wave` 最大 1.3px)。
+
 ## 未完成
 
 路线已定(2026-09-09,见 [DECISIONS.md](DECISIONS.md)):**Spine → Unity 先做正常动画,
 VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
-1. **deform 解法排查**(候选:`SkinnedMeshRenderer` + Blend Shape)—— 32% 的骨架受影响,优先级最高。
-   **先查再定**,排查脚本 `tools/unity/AnimatorGoProbe.cs`:用 Unity 自己的 API 造带蒙皮 + 形变目标的
-   Mesh 存成 `.asset` 拿 YAML 当标准答案,并数值验证:增量是否「加完再蒙皮」、每顶点能否 >4 根骨骼、
-   绑定矩阵的缩放是否保留、`sortingOrder` 能否打关键帧、SkinnedMesh 与 Sprite 的排序是否互通
+1. **deform 的 Unity 肉眼确认** —— 六个样本已在 `UnityAnimationGo/Assets/AnimatorGo/`,等用户看
 2. **linkedmesh** —— 7 个骨架 / 138 处
 3. **逐帧绘制顺序 → `m_SortingOrder` 阶梯曲线** —— 16 个骨架,排查证实能做
 4. **Unity → Spine**(反方向)
@@ -212,7 +238,8 @@ VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
 ### 已知转不过去的东西(都会报出来,不静默)
 
-- **deform 顶点关键帧** —— Unity 的 SpriteSkin 只做骨骼蒙皮(**待解**:候选 Blend Shape 路线,排查中)
+- ~~deform 顶点关键帧~~ —— 已转成 SkinnedMeshRenderer 的 Blend Shape;打在 `path` 上的 deform 不参与渲染,跳过
+- **走 SkinnedMeshRenderer 的网格上的 slot 颜色动画** —— 没有 `m_Color`,静态颜色烘进顶点色,动画部分丢弃
 - **逐帧绘制顺序** —— 尚未转换(排查证实 `m_SortingOrder` 可以打关键帧,待实现)
 - **path / transform 约束** —— 没有对应物
 - **两色染色(dark color)** —— 没有对应物

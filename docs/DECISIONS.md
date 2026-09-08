@@ -93,15 +93,26 @@ VAT 动画,这是我们最终目标。眼下先做正常动画,以后再考虑 V
 - **触发 VAT 的条件是极限性能**(大量同屏实例、一个 draw call),不是保真度。
   正常动画路线上碰到的表达力缺口,先在正常动画里解决,不拿 VAT 当逃生口
 
-### 正常动画路线上 deform 的候选解法:Blend Shape · 排查中 · 2026-09-09
+### 正常动画路线上 deform 的解法:Blend Shape · 已定 · 2026-09-09
 
 Spine 的 deform 顶点动画在 MergeCooking2 里占 **32% 的骨架**,且数据证明不是微小起伏
 (128 / 170 个骨架最大偏移 ≥ 20 px,详见 [PROGRESS.md](PROGRESS.md))。**不能不管。**
 
-**尚未定案。** 用户要求先排查再定(*"没有调查就没有发言权"*),排查脚本在
-`tools/unity/AnimatorGoProbe.cs`,结论记在 [PROGRESS.md](PROGRESS.md)。下面是候选方案和对比。
+先排查后定案(用户:*"没有调查就没有发言权"*)。排查脚本 `tools/unity/AnimatorGoProbe.cs`,
+8 项全部通过,结论全文在 [PROGRESS.md](PROGRESS.md)「Blend Shape 路线的排查结论」。
+排查完用户把三个子决策交给我定,定如下:
 
-候选:**有 deform 的网格走 `SkinnedMeshRenderer` + Blend Shape**。每个 deform 关键帧
+1. **只有需要的网格走 `SkinnedMeshRenderer`**:有 deform、绑定姿势非刚性、或与别的加权网格缩放
+   不一致的。其余一律保持 SpriteSkin —— **现有已验证的效果一个字节不变**(用户:「现在效果挺好的」)
+2. **渲染器写死 `m_Quality = 4`(Bone4)**。理由学 Spine:外观不随 Quality 档位变。真实工程的
+   Low/Medium/High 档是 2 根,Auto 会比 SpriteSkin 还差。>4 根截到 4 并报 approximated(与 SpriteSkin
+   一致)。转换时读 `ProjectSettings/QualitySettings.asset` 报一条提醒;`--skin-quality auto` 给
+   已把所有档位设成 Unlimited 的工程用,能吃满 >4 根
+3. **加权网格的增量按关键帧时刻的姿势反解**(M(Pₖ)·δ = Δₖ),不直接抄 Spine 的逐影响偏移 ——
+   数据证明那些偏移在世界空间里并不一致。关键帧之间的分歧在导出时算出来,>0.5 px 报 approximated
+4. 姿势求值器放 `src/spine-eval/`(纯数学、不依赖渲染),VAT 以后共用
+
+**有 deform 的网格走 `SkinnedMeshRenderer` + Blend Shape**。每个 deform 关键帧
 是一个形变目标,两帧之间的插值等价于两个目标的权重交叉,权重由 `Animator` 驱动。
 增量「加完再蒙皮」的顺序与 Spine 一致。这是 Unity 自带的原生组件,零运行时代码,
 权重曲线在 Animation 窗口里可以直接改 —— 初心保住。
@@ -116,9 +127,6 @@ Spine 的 deform 顶点动画在 MergeCooking2 里占 **32% 的骨架**,且数�
   真做就得换 `MeshRenderer` 自己填顶点,等于重写一个薄版 spine-unity。重新引入运行时,违背路线
 - **「只处理整块变换的 deform」这条捷径** —— 数据否了:全部 deform 都是整块平移/旋转/缩放的
   骨架只有 10 个,真·自由形变有 137 个。覆盖面不够,不做
-
-**待定的子决策:** 哪些网格走 `SkinnedMeshRenderer`。倾向「只有需要的走」(有 deform /
-非刚性 / 缩放不一致的),现有已验证的 SpriteSkin 输出不动;等做出来验过再看要不要收成一套。
 
 **已知仍然做不到的:** clipping 遮罩。逐帧绘制顺序此前判定为做不到 —— 排查证实
 `m_SortingOrder` 可以打关键帧(SpriteRenderer 与 SkinnedMeshRenderer 都行),能做、未做。

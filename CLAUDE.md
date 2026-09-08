@@ -11,7 +11,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Spine → Unity 有两种出口,顺序已定(2026-09-09):**
 
 1. **正常动画**(现在做):Unity 原生骨骼 + `Animator` + `.anim`,**在 Unity 里可编辑** —— 这是初心,
-   「没有 Spine license 的人也能改」。deform 顶点动画的解法**还在排查**(候选 `SkinnedMeshRenderer` + Blend Shape),查完再定
+   「没有 Spine license 的人也能改」。deform 顶点动画用 `SkinnedMeshRenderer` + Blend Shape 解,
+   **只有需要的网格走它**(deform / 非刚性 / 缩放不一致),其余保持 SpriteSkin,已验证的效果不动
 2. **VAT**(终局,以后做):顶点位置烘进贴图、shader 取,只播放不可编辑,极限性能时用。
    来源既可以是 Spine,也可以是 Unity 正常动画 —— 它是正常动画的下游烘焙,不是平行管线
 
@@ -70,7 +71,7 @@ pnpm convert <输入路径> --to 4.1 [--out 目录] [--format skel|json] [--dry-
 导出到 Unity 2D Animation:
 
 ```bash
-pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--dry-run]
+pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--skin-quality bone4|auto] [--dry-run]
 ```
 
 产出**可以直接拖进 Assets 就播**的一整套:烘焙后的图集 PNG + `.meta`
@@ -82,6 +83,11 @@ pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [
 
 `--rp` 不给的话会**从输出目录往上找 Unity 工程的 `Packages/manifest.json`**
 自己判断内置管线还是 URP —— 两套的默认 sprite 材质不是同一个,给错了整个角色是粉红的。
+
+**网格有两条路径。** 默认 SpriteRenderer + SpriteSkin;**只有** SpriteSkin 表达不了的网格
+(有 deform 顶点动画 / 绑定姿势非刚性 / 图集缩放不一致)改走 SkinnedMeshRenderer + Mesh `.asset`,
+deform 变成 Blend Shape。`--skin-quality` 默认 `bone4`(渲染器写死 4 根,外观不随工程 Quality 档位变);
+`auto` 只给所有档位都是 Unlimited 的工程用。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 11 节。
 
 跑单个测试文件:`pnpm exec vitest run src/core/math.test.ts`
 跑单个用例:`pnpm exec vitest run -t "旋转差值走最短路径"`
@@ -256,6 +262,11 @@ render/   薄适配层。PixiJS / Godot / Unity / Cocos 各一个
   没地方放自己的缩放(绑定姿势只有 TR),所以只能由它约束纹理的 `pixelsPerUnit`;
   region 和不加权网格各自用节点 `localScale` 扛。当成一个全局常数会让个别部件
   差出几百像素。见 [UNITY-2D.md](docs/UNITY-2D.md) 第 8 节
+- ⚠️ **Blend Shape 的增量不能抄 Spine 的逐影响偏移** —— 那些偏移换到世界空间并不一致
+  (MC2 里 12~22% 的顶点分歧 >0.5px)。要按关键帧时刻的姿势反解 `M(Pₖ)·δ = Δₖ`。
+  增量是「加完再蒙皮」(实测),与 Spine 同序。见 [UNITY-2D.md](docs/UNITY-2D.md) 11.4
+- ⚠️ **SkinnedMeshRenderer 不会自动带 sprite 的纹理**,挂默认材质是纯白;每张图集页要写
+  一个引用了它的 `.mat`。渲染器 `m_Quality` 写死 4 —— 真实工程 Low/Medium 档只有 2 根,Auto 会更差
 - ⚠️ **`.meta` 里有顶点就必须有等量的 `weights`,哪怕这个 sprite 没有骨骼** ——
   Unity 的加载器会无条件读 `m_Weights[0]`,空数组直接 NRE,而这个异常会中断
   整个 sprite 循环,**让排在后面的 sprite 全部拿不到网格**(连带一片

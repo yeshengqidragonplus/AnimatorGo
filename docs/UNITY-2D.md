@@ -17,13 +17,19 @@
 | 网格 + 顶点权重 | `vertices` / `indices` / `weights` | ⚠️ **每顶点最多 4 根骨骼** |
 | slot 换图 / 皮肤 | 一个 attachment 一个物体 + `m_IsActive` 曲线 | ✅ 可映射(不必用 SpriteLibrary) |
 | 骨骼 TRS 动画 | `.anim` 的 Position / Euler / Scale 曲线 | ✅ 可映射 |
-| IK | 包内 `IK/` 模块 | ✅ 有 |
-| **deform 顶点关键帧** | —— | ❌ **没有对应物** |
+| IK | 包内 `IK/` 模块 | ⚠️ 有,但**未转换也未烘进曲线**,受 IK 驱动的骨骼停在自己的关键帧上 |
+| **deform 顶点关键帧** | 2D 包里没有;用 **`SkinnedMeshRenderer` 的 Blend Shape** | ✅ **走另一条网格路径**,见第 11 节 |
+| 逐帧绘制顺序 | `m_SortingOrder` 可以打关键帧(实测) | ⚠️ 能做,未做 |
 | **path / transform 约束** | —— | ❌ 没有 |
 | **两色染色(dark)** | —— | ❌ 没有 |
+| **clipping 遮罩** | —— | ❌ 没有 |
 
 > 📌 **纠正一处早期判断**:曾认为「Unity 没有 slot / skin 的对应物」。
 > 实际有 —— `SpriteLibrary` + `SpriteResolver` 就是换装与换图机制。
+>
+> 📌 **再纠正一处**:曾认为「deform 没有对应物」。2D Animation 包里确实没有,
+> 但 Unity 的 3D 那半边有 —— `SkinnedMeshRenderer` 的 Blend Shape 做的正是
+> 「每个顶点一组增量、按权重叠加、加完再蒙皮」,和 Spine 的 deform 是同一种数学。
 > 真正缺的只有上表最后三行。
 >
 > 不过**实现上没用 SpriteLibrary**:改成一个 attachment 一个 GameObject、
@@ -364,7 +370,112 @@ Spine 图集里的区域可以躺着放(`rotate: true`,省空间),
 URP 工程里可能要换成 `Sprite-Unlit-Default`。这属于一眼能看出来(粉红)、
 一键能改掉的问题,不像几何错误那样会悄悄错。
 
-## 11. 待确认
+⚠️ **`SkinnedMeshRenderer` 不会像 `SpriteRenderer` 那样自动把 sprite 的纹理塞给材质** ——
+挂默认材质渲染出来是纯白(实测)。所以走第 11 节那条路的网格,每张图集页要写一个自己的
+`.mat`(classID 21,`_MainTex` 指向图集页的 Texture2D,fileID 2800000)。URP 的 shader
+guid `13c02b14c4d048fa9653293d54f6e0e1` 取自包内样本;内置管线用 `Sprites/Default`
+(内置 shader fileID 10753)—— **这条没实测**,验证工程是 URP 的。
+
+## 11. SkinnedMeshRenderer 路径:deform / 非刚性 / 缩放不一致的网格
+
+`SpriteRenderer + SpriteSkin` 是默认路径,已验证的效果不动。**只有三类 SpriteSkin
+结构上表达不了的网格**改走 `SkinnedMeshRenderer` + Mesh 资产(决策见 DECISIONS.md,
+排查数据见 PROGRESS.md):
+
+| 为什么 SpriteSkin 不行 | Mesh 资产为什么行 |
+|---|---|
+| 有 deform 顶点动画 —— SpriteSkin 只做骨骼蒙皮 | Blend Shape:每个 deform 关键帧一个形变目标,权重由 `Animator` 驱动 |
+| 绑定姿势非刚性 —— SpriteSkin 的绑定只有旋转平移(第 6 节) | `m_BindPose` 是任意 4×4 |
+| 与其他加权网格缩放不一致 —— sprite 的顶点和 UV 绑死(第 7、8 节) | Mesh 的位置和 UV 各自独立,不再需要全局 k |
+
+判据与 `export.ts` 一致:有 deform 时间轴指向它;或绑定残差 > max(1px, 跨度 2%);
+或(真正混合的加权网格)自己反推的图集缩放与全局中位数差 > 2% 且跨度 ≥ 64px。
+
+### 11.1 Mesh `.asset` 的 YAML(classID 43,fileID 4300000)
+
+结构取自 Unity 6000.3 自己 `CreateAsset` 出来的网格(`tools/unity/AnimatorGoProbe.cs`,
+用 `SetBoneWeights(NativeArray)` + `AddBlendShapeFrame` 造的),`serializedVersion: 12`:
+
+- **`m_VertexData`**(serializedVersion 3):14 个通道槽位固定顺序 Position / Normal / Tangent /
+  Color / TexCoord0..7 / BlendWeight / BlendIndices,每个 `{stream, offset, format, dimension}`,
+  没用到的全 0。三个 stream,每个起点对齐 16 字节:
+
+  | stream | 内容 | 格式(format 码) | 每顶点 |
+  |---|---|---|---|
+  | 0 | Position | Float32 × 3(0) | 12 B |
+  | 1 | Color, TexCoord0 | UNorm8 × 4(2),Float32 × 2(0) | 12 B |
+  | 2 | BlendWeight, BlendIndices | UNorm16 × 4(4),UInt16 × 4(8) | 16 B |
+
+  6 顶点 → 72→80,72→80,96,共 256 字节,与样本逐字节对得上。
+- **顶点流里只放权重最大的 4 根**,重新归一到总和正好 65535(舍入差记到最大那根上)。
+  **超过 4 根的完整权重另存 `m_VariableBoneCountWeights.m_Data`**:先是每顶点一个 uint32
+  「起始字偏移」,再一个 uint32 总字数,然后是 (骨骼 u16, 权重 UNorm16) 列表。
+  Unity 只在 Quality 为 Unlimited 且渲染器 `m_Quality` 为 Auto 时用它
+- **`m_Shapes`** 稀疏存:`vertices` 只列有增量的顶点(`vertex` + `index`,normal/tangent 全 0),
+  `shapes` 记每个目标的 `firstVertex/vertexCount`,`channels` 记 `name`、`nameHash`、
+  `frameIndex`、`frameCount: 1`,`fullWeights` 每个 100。**`nameHash` 是 CRC32**
+  (`shape0` → 2081338680),与 `.anim` 里 `m_ClipBindingConstant` 的哈希是同一个函数
+- **`m_BindPose`**:每根骨骼一个 4×4(e00..e33 行主序),= 骨骼在绑定时刻**世界矩阵的逆**。
+  这里的世界矩阵按 Unity 的 TRS 层级算(忽略 Spine 的 shear 与非默认继承),因为 prefab
+  里的骨骼节点就是那么摆的;顶点位置本身按 Spine 的真实 setup 算。两者在 shear = 0 时相同
+- `m_BoneNameHashes` 可以为空,`m_RootBoneNameHash: 0`。`m_BonesAABB` 每根骨骼一个,
+  取它影响的顶点(含所有形变目标增量)在骨骼空间的包围盒;`m_LocalAABB` 也含增量
+- `.asset.meta` 是 `NativeFormatImporter`,`mainObjectFileID: 4300000`
+
+### 11.2 prefab 里的 SkinnedMeshRenderer(classID 137)
+
+- 节点放在骨架根下,**变换为单位** —— 网格空间就是骨架空间,绑定矩阵按此算
+- `m_Bones` 的顺序必须与 Mesh 的 `m_BindPose` 一致;`m_RootBone` 取第一根
+- **`m_Quality: 4`(Bone4)写死**。理由学 Spine:外观不随工程 Quality 档位变。实测真实工程的
+  Low/Medium/High 档 `skinWeights` 是 2 根,Auto 会比 SpriteSkin 还差。`--skin-quality auto`
+  给所有档位都设成 Unlimited 的工程用(能吃满 >4 根)
+- `m_Materials` 指向第 10 节说的带纹理材质;`m_BlendShapeWeights` 全 0;`m_DirtyAABB: 1` 让 Unity 自己算包围盒
+- `m_SortingOrder` 与 SpriteRenderer 同一套(slot 下标),两种渲染器之间按它互通(实测,
+  渲染到 RenderTexture 读像素);**同 order 时 Sprite 在上**,别打平
+
+### 11.3 `.anim` 里的权重曲线
+
+`m_FloatCurves` 条目,`attribute: blendShape.<名>`,`classID: 137`。每个形变目标一条:
+相邻两帧处 0、本帧处 100,Spine 那一段的曲线搬到权重上(段 k→k+1 的进度 y 映射成
+目标 k 的 100(1−y) 和目标 k+1 的 100y;3.8 的归一化控制点先按第 5 节换成绝对值)。
+第一帧之前 Spine 没有形变,所以 0 处补 0 并阶梯过去(与骨骼曲线的 `withSetup` 同理)。
+没有偏移的「零帧」不成为目标,只贡献相邻目标权重归零的时刻。
+
+### 11.4 ⚠️ 增量怎么算:按关键帧时刻的姿势反解,不要抄 Spine 的逐影响偏移
+
+Spine 加权网格的 deform 偏移是**每个影响一份、在各自骨骼的局部空间**里(实测 338/458 条
+时间轴的下标范围超过顶点数×2,只能这么解释)。直觉是「把 dᵢ 换到网格空间取平均」——
+**不行**:同一顶点各影响的偏移换到世界空间后并不一致,setup 姿势下 21.8% 的(顶点×帧)
+分歧 > 0.5px,关键帧时刻的姿势下仍有 12%。多半是美术在某个姿势下拖了顶点、之后又改了骨骼。
+
+正确做法:Unity 在姿势 P 下作用在增量 δ 上的矩阵是 `M(P) = Σ w'ᵢ Bᵢ(P) Bᵢ(S)⁻¹`
+(w' 是 Unity 实际用的前 4 根归一权重,B 是骨骼世界矩阵的线性部分),Spine 在同一时刻的
+世界偏移是 `Δ = Σ wᵢ Bᵢ(P) dᵢ`。令 **`M(Pₖ)·δ = Δₖ`**,关键帧时刻就严格一致(实测 2 个
+骨架、上万个顶点×帧 < 0.5px)。关键帧之间两边各自 lerp,分歧导出时算出来,> 0.5px 报
+approximated —— MC2 的 458 条里 431 条 < 0.5px,最大 20px。
+
+不加权网格简单得多:`δ = B(S)·d`(线性部分),任何姿势下都精确。
+
+### 11.5 ⚠️ 增量是「加完再蒙皮」
+
+实测(`AnimatorGoProbe.cs` Q3):骨骼转 90° 后增量跟着转,「加完再蒙皮」假设误差 0,
+「蒙皮后再加」假设误差 1.41。与 Spine 同序,所以上面的公式成立。权重线性,50 = 半个增量。
+
+### 11.6 已知代价
+
+- **slot 颜色动画**在这些网格上没有对应属性(SkinnedMeshRenderer 没有 `m_Color`),
+  静态颜色烘进顶点色,动画部分报 loss
+- 这些网格在 Sprite Editor 里不能再刷权重;骨骼和形变权重曲线在 Animation 窗口里照常能改
+- deform 打在 `path` 上(路径约束用)不参与渲染,报 info 跳过 —— MC2 的 `wave` 有这种
+
+### 11.7 自检
+
+`AnimatorGoVerify.cs` 的 `CheckSkinnedMeshes`:Mesh 在不在、骨骼数 = 绑定矩阵数、材质带纹理、
+形变目标数;`CheckClips` 对 `blendShape.<名>` 曲线额外查 Mesh 里真有这个目标 ——
+没有的话 Unity 同样一声不响。6 个样本(MX2_cat、customer_1、blackrichwoman、wave、17701、13901)
+共 59 个 SkinnedMeshRenderer、373 个形变目标,batchmode 全部通过。
+
+## 12. 待确认
 
 - `.anim` 里驱动 `SpriteResolver` 的曲线具体形态(尚无样本)。
   目前换 attachment 走的是**一个 attachment 一个物体 + `m_IsActive` 阶梯曲线**,

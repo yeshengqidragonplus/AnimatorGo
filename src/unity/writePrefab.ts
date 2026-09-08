@@ -18,6 +18,7 @@ export const CLASS_TRANSFORM = 4
 export const CLASS_ANIMATOR = 95
 export const CLASS_MONO_BEHAVIOUR = 114
 export const CLASS_SPRITE_RENDERER = 212
+export const CLASS_SKINNED_MESH_RENDERER = 137
 
 /**
  * `SpriteSkin` 脚本的 GUID。
@@ -59,6 +60,30 @@ export interface SkinSpec {
   readonly bones: readonly number[]
 }
 
+/**
+ * 走 `SkinnedMeshRenderer` 的网格(有 deform / 绑定非刚性 / 缩放不一致的那些)。
+ *
+ * 它吃一个 Mesh 资产而不是 sprite,所以材质要自己带纹理(见 writeMaterial.ts)。
+ * 节点应当放在骨架根下、变换为单位 —— 网格空间就是骨架空间,绑定矩阵按此算。
+ */
+export interface SkinnedMeshSpec {
+  /** Mesh 资产,fileID 取 MESH_FILE_ID */
+  readonly mesh: AssetRef
+  /** 带纹理的材质,fileID 取 MATERIAL_FILE_ID */
+  readonly material: AssetRef
+  /** 骨骼下标指向 nodes 数组,顺序必须与 Mesh 的 bindposes 一致 */
+  readonly bones: readonly number[]
+  readonly rootBone: number
+  readonly blendShapeCount: number
+  readonly sortingOrder: number
+  /**
+   * 每顶点用几根骨骼蒙皮。**4 = Bone4,写死,外观不随工程 Quality 档位变**(学 Spine);
+   * 0 = Auto 跟随 Quality —— 真实工程的 Low/Medium/High 档往往只有 2 根,会比 SpriteSkin 还差。
+   * 只有工程所有档位都设成 Unlimited 时 Auto 才划算(能吃满 >4 根)。
+   */
+  readonly quality: 0 | 4
+}
+
 export interface PrefabNode {
   readonly name: string
   /** 父节点在数组中的下标;根为 -1。**必须父在子之前** */
@@ -69,6 +94,7 @@ export interface PrefabNode {
   readonly scale: { x: number; y: number; z: number }
   readonly renderer: RendererSpec | null
   readonly skin: SkinSpec | null
+  readonly skinnedMesh?: SkinnedMeshSpec | null
 }
 
 export interface PrefabOptions {
@@ -94,6 +120,7 @@ interface Ids {
   readonly transform: number
   readonly renderer: number
   readonly skin: number
+  readonly skinnedMesh: number
   readonly animator: number
 }
 
@@ -121,6 +148,7 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
       transform: fileId(`${key}/tr`),
       renderer: fileId(`${key}/sr`),
       skin: fileId(`${key}/sk`),
+      skinnedMesh: fileId(`${key}/smr`),
       animator: fileId(`${key}/an`),
     }
   })
@@ -137,6 +165,7 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
     const components = [`  - component: {fileID: ${id.transform}}`]
     if (node.renderer !== null) components.push(`  - component: {fileID: ${id.renderer}}`)
     if (node.skin !== null) components.push(`  - component: {fileID: ${id.skin}}`)
+    if (node.skinnedMesh) components.push(`  - component: {fileID: ${id.skinnedMesh}}`)
     if (i === 0 && options.controller !== null) components.push(`  - component: {fileID: ${id.animator}}`)
 
     docs.push(
@@ -257,6 +286,77 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
           '    m_Extent: {x: 0, y: 0, z: 0}',
           '  m_AlwaysUpdate: 1',
           '  m_AutoRebind: 0',
+        ].join('\n'),
+      )
+    }
+
+    if (node.skinnedMesh) {
+      const m = node.skinnedMesh
+      // 字段取自真实样本(Unity 6000.3 存出来的 SkinnedMeshRenderer),
+      // 阴影关掉与 SpriteRenderer 一致;m_DirtyAABB 让 Unity 自己重算包围盒
+      docs.push(
+        [
+          `--- !u!${CLASS_SKINNED_MESH_RENDERER} &${id.skinnedMesh}`,
+          'SkinnedMeshRenderer:',
+          ...COMMON_HEADER,
+          `  m_GameObject: {fileID: ${id.go}}`,
+          '  m_Enabled: 1',
+          '  m_CastShadows: 0',
+          '  m_ReceiveShadows: 0',
+          '  m_DynamicOccludee: 1',
+          '  m_StaticShadowCaster: 0',
+          '  m_MotionVectors: 1',
+          '  m_LightProbeUsage: 1',
+          '  m_ReflectionProbeUsage: 1',
+          '  m_RayTracingMode: 3',
+          '  m_RayTraceProcedural: 0',
+          '  m_RayTracingAccelStructBuildFlagsOverride: 0',
+          '  m_RayTracingAccelStructBuildFlags: 1',
+          '  m_SmallMeshCulling: 1',
+          '  m_ForceMeshLod: -1',
+          '  m_MeshLodSelectionBias: 0',
+          '  m_RenderingLayerMask: 1',
+          '  m_RendererPriority: 0',
+          '  m_Materials:',
+          `  - ${ref(m.material, 2)}`,
+          '  m_StaticBatchInfo:',
+          '    firstSubMesh: 0',
+          '    subMeshCount: 0',
+          '  m_StaticBatchRoot: {fileID: 0}',
+          '  m_ProbeAnchor: {fileID: 0}',
+          '  m_LightProbeVolumeOverride: {fileID: 0}',
+          '  m_ScaleInLightmap: 1',
+          '  m_ReceiveGI: 1',
+          '  m_PreserveUVs: 0',
+          '  m_IgnoreNormalsForChartDetection: 0',
+          '  m_ImportantGI: 0',
+          '  m_StitchLightmapSeams: 1',
+          '  m_SelectedEditorRenderState: 3',
+          '  m_MinimumChartSize: 4',
+          '  m_AutoUVMaxDistance: 0.5',
+          '  m_AutoUVMaxAngle: 89',
+          '  m_LightmapParameters: {fileID: 0}',
+          '  m_GlobalIlluminationMeshLod: 0',
+          '  m_SortingLayerID: 0',
+          '  m_SortingLayer: 0',
+          `  m_SortingOrder: ${m.sortingOrder}`,
+          '  m_MaskInteraction: 0',
+          '  serializedVersion: 2',
+          `  m_Quality: ${m.quality}`,
+          '  m_UpdateWhenOffscreen: 0',
+          '  m_SkinnedMotionVectors: 1',
+          `  m_Mesh: ${ref(m.mesh, 2)}`,
+          m.bones.length === 0
+            ? '  m_Bones: []'
+            : `  m_Bones:\n${m.bones.map((b) => `  - {fileID: ${ids[b]!.transform}}`).join('\n')}`,
+          m.blendShapeCount === 0
+            ? '  m_BlendShapeWeights: []'
+            : `  m_BlendShapeWeights:\n${Array.from({ length: m.blendShapeCount }, () => '  - 0').join('\n')}`,
+          `  m_RootBone: {fileID: ${ids[m.rootBone]!.transform}}`,
+          '  m_AABB:',
+          '    m_Center: {x: 0, y: 0, z: 0}',
+          '    m_Extent: {x: 0, y: 0, z: 0}',
+          '  m_DirtyAABB: 1',
         ].join('\n'),
       )
     }

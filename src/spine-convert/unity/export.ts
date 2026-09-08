@@ -1,6 +1,6 @@
 import type { SkeletonPart } from '../../spine-format/binary/readSkeleton.ts'
 import type { Attachment } from '../../spine-format/binary/readSkins.ts'
-import type { Timeline } from '../../spine-format/binary/readAnimations.ts'
+import type { AnimationData, Timeline } from '../../spine-format/binary/readAnimations.ts'
 import type { Atlas } from '../../core/atlas.ts'
 import { IssueCollector, type ConversionIssue } from '../types.ts'
 import {
@@ -16,9 +16,22 @@ import { writeController, CLIP_FILE_ID } from '../../unity/writeController.ts'
 import { writeNativeMeta, writePrefabMeta, writeTextureMeta, type MetaBone, type MetaSprite, type MetaWeight } from '../../unity/writeMeta.ts'
 import { unityGuid, internalId, uniqueIds } from '../../unity/ids.ts'
 import { encodePng, type Image } from '../../unity/png.ts'
+import { writeMesh, MESH_FILE_ID, type BlendShape, type BoneInfluence, type MeshVertex } from '../../unity/writeMesh.ts'
+import { writeSpriteMaterial, MATERIAL_FILE_ID, TEXTURE_FILE_ID } from '../../unity/writeMaterial.ts'
 import { toAbsoluteBezier } from '../../spine-format/bezier.ts'
-import { bakeAtlas } from './bakeAtlas.ts'
-import { bindMesh, estimateAtlasScale } from './mesh.ts'
+import {
+  applyPoint,
+  applyVector,
+  invert,
+  multiply,
+  poseAt,
+  setupPose,
+  valueBetween,
+  IDENTITY,
+  type Affine,
+} from '../../spine-eval/pose.ts'
+import { bakeAtlas, type BakedRect } from './bakeAtlas.ts'
+import { attachmentScale, bindMesh, estimateAtlasScale, uvToRect, type SpineVertices } from './mesh.ts'
 
 /**
  * Spine → Unity 2D Animation。
@@ -36,12 +49,23 @@ import { bindMesh, estimateAtlasScale } from './mesh.ts'
  *    它在图上取哪块像素。所以顶点只能由 Spine 的 UV 反算,再用 pivot 把整体挪到位。
  *    绑定姿势下网格若被改过形(顶点和图对不上),这个平移就不是常数,只能取均值并报近似。
  *
+ * ## 两条网格路径
+ *
+ * 默认走 SpriteRenderer + SpriteSkin(Unity 2D Animation 的原生路径,可在 Sprite Editor 里编辑)。
+ * **只有 SpriteSkin 表达不了的网格**改走 SkinnedMeshRenderer + Mesh 资产:
+ *
+ * - 有 deform 顶点动画 → Blend Shape(每个关键帧一个形变目标,权重由 Animator 驱动)
+ * - 绑定姿势下就不是刚性的(SpriteSkin 的绑定只有旋转平移;Mesh 的绑定矩阵是任意仿射)
+ * - 与其他加权网格的图集缩放不一致(sprite 的顶点和 UV 绑死;Mesh 的各自独立)
+ *
+ * 决策与排查见 docs/DECISIONS.md、docs/PROGRESS.md。
+ *
  * ## 转不过去的东西(见 docs/UNITY-2D.md)
  *
- * - deform 顶点关键帧 —— Unity 的 SpriteSkin 只做骨骼蒙皮
- * - path / transform 约束、IK
+ * - path / transform 约束、IK(也没有烘进曲线)
  * - 两色染色(dark color)
- * - 逐帧改变绘制顺序(drawOrder)—— sortingOrder 是静态的
+ * - 逐帧改变绘制顺序(drawOrder)—— 能做,未做
+ * - clipping 遮罩
  */
 
 export interface UnityExportOptions {
@@ -51,6 +75,12 @@ export interface UnityExportOptions {
   readonly pixelsPerUnit: number
   /** 决定 SpriteRenderer 用哪个默认材质 —— 给错了整个角色是粉红的 */
   readonly renderPipeline: RenderPipeline
+  /**
+   * SkinnedMeshRenderer 每顶点用几根骨骼蒙皮。默认 `bone4`:写死 4 根,外观不随工程
+   * Quality 档位变(学 Spine)。`auto` 跟随 Quality —— 只有所有档位都设成 Unlimited 时
+   * 才划算(能吃满 >4 根);真实工程的 Low/Medium 档往往只有 2 根,会比 SpriteSkin 还差。
+   */
+  readonly skinQuality?: 'bone4' | 'auto'
   /**
    * 跳过图集 PNG 的编码。
    *
@@ -184,6 +214,34 @@ interface SlotAttachment {
   node: number
 }
 
+/** deform 时间轴的外层记录(读取器把一条 deform 包成 frames[0]) */
+interface DeformRecord {
+  readonly skin: number | string
+  readonly attachment: string
+  readonly frames: readonly Record<string, unknown>[]
+}
+
+/** 走 SkinnedMeshRenderer 的网格:几何在骨架根空间(Unity 单位),形变目标随动画转换逐步累积 */
+interface SkinnedGeometry {
+  readonly item: SlotAttachment
+  readonly page: number
+  /** 参与蒙皮的骨骼(骨架下标),顺序即 bindposes 顺序 */
+  readonly subset: readonly number[]
+  readonly vertices: readonly MeshVertex[]
+  readonly triangles: readonly number[]
+  /** Spine 的完整权重,骨骼用 subset 下标 —— 写进 Mesh */
+  readonly weights: readonly (readonly BoneInfluence[])[]
+  /** Unity 实际用来蒙皮的权重(Bone4 时是前 4 根归一),骨骼用**骨架**下标 —— 反解增量用 */
+  readonly effective: readonly (readonly { bone: number; weight: number }[])[]
+  /** 原始的逐影响局部坐标,算 Spine 那边的世界偏移用 */
+  readonly localVerts: SpineVertices
+  readonly slotBone: number
+  readonly bindposes: readonly Affine[]
+  readonly shapes: BlendShape[]
+  readonly shapeNames: Set<string>
+  nodeIndex: number
+}
+
 function regionNameOf(attachment: Attachment): string {
   const path = attachment.data['path']
   return typeof path === 'string' && path.length > 0 ? path : attachment.name
@@ -270,6 +328,39 @@ export function exportToUnity(
   // 3.8 的贝塞尔控制点是归一化的,4.x 是绝对的 —— segmentsOf 要靠这个区分
   const is38 = part.header.major === '3.8'
 
+  // ── 姿势:SkinnedMeshRenderer 的绑定矩阵、deform 反解都要 ──
+  // Spine 的真实 setup(含 shear、继承模式)决定顶点摆在哪;Unity 那份(纯 TRS 层级)决定
+  // 绑定矩阵,因为 prefab 里的骨骼节点就是那么摆的。两者在 shear = 0 时相同。
+  const setupSpine = setupPose(part)
+  const setupUnity = setupPose(part, { unityCompatible: true })
+  const toUnits = (m: Affine): Affine => ({ a: m.a, b: m.b, c: m.c, d: m.d, x: m.x * scale, y: m.y * scale })
+  const linear = (m: Affine): Affine => ({ a: m.a, b: m.b, c: m.c, d: m.d, x: 0, y: 0 })
+  const setupUnityInv = setupUnity.map((m) => invert(linear(m)))
+  const skinQuality: 0 | 4 = options.skinQuality === 'auto' ? 0 : 4
+
+  const skinNameOf = (skin: number | string): string =>
+    typeof skin === 'number' ? (part.skins[skin]?.name ?? String(skin)) : skin
+  /** deform 指向的 attachment 是什么类型 —— path / clipping 也能有 deform,但它们不参与渲染 */
+  const attachmentTypeOf = (skinName: string, slot: number, key: string): string | null => {
+    const skin = part.skins.find((s) => s.name === skinName)
+    const entry = skin?.slots.find((s) => s.slot === slot)
+    return entry?.attachments.find((a) => a.key === key || a.name === key)?.type ?? null
+  }
+  /** 有 deform 时间轴的 attachment:`皮肤/slot/键名` */
+  const deformTargets = new Set<string>()
+  for (const anim of part.animations) {
+    for (const t of anim.timelines) {
+      if (t.kind !== 'deform') continue
+      const d = t.frames[0] as unknown as DeformRecord
+      deformTargets.add(`${skinNameOf(d.skin)}/${t.owner}/${d.attachment}`)
+    }
+  }
+
+  const skinned: SkinnedGeometry[] = []
+  const skinnedByItem = new Map<SlotAttachment, SkinnedGeometry>()
+  const skinnedByKey = new Map<string, SkinnedGeometry>()
+  const meshGuidOf = (spriteName: string) => unityGuid(`${name}/mesh/${spriteName}`)
+
   for (const bone of part.bones) {
     if (bone.transformMode !== 0) {
       issues.add(
@@ -333,6 +424,7 @@ export function exportToUnity(
   }
 
   const textureGuids = baked.pages.map((_, i) => unityGuid(`${name}/texture/${i}`))
+  const materialGuids = baked.pages.map((_, i) => unityGuid(`${name}/material/${i}`))
 
   // ── 图集缩放 ──
   // Spine 导出图集时可以带缩放,`.atlas` 里没记,只能从数据反推。
@@ -381,8 +473,106 @@ export function exportToUnity(
     readonly rigid: { rotation: number; scale: number } | null
     /** 刚性网格挂到哪根骨骼上(骨架下标) */
     readonly rigidBone: number | null
+    /** 走 SkinnedMeshRenderer —— 没有 sprite 条目,几何在 skinnedByItem 里 */
+    readonly skinned: boolean
   }
   const sprites = new Map<string, SpriteInfo>()
+
+  /** 把一个网格整理成 SkinnedMeshRenderer 要的几何(骨架根空间,Unity 单位) */
+  const buildSkinnedGeometry = (item: SlotAttachment, rect: BakedRect, slotBone: number, reasons: string[]): SkinnedGeometry => {
+    const data = item.attachment.data
+    const verts = data['vertices'] as SpineVertices
+    const vertexCount = data['vertexCount'] as number
+    const uvs = data['uvs'] as number[]
+    const triangles = data['triangles'] as number[]
+    const page = baked.pages[rect.page]!
+    const color = unpackColor(part.slots[item.slot]!.color)
+    const subset = verts.weighted ? boneSubset(verts.weights) : [slotBone]
+    const subsetIndex = new Map<number, number>()
+    subset.forEach((b, i) => subsetIndex.set(b, i))
+
+    const vertices: MeshVertex[] = []
+    const weights: BoneInfluence[][] = []
+    const effective: { bone: number; weight: number }[][] = []
+    let over4 = false
+    for (let j = 0; j < vertexCount; j++) {
+      let px = 0
+      let py = 0
+      if (verts.weighted) {
+        const list: BoneInfluence[] = []
+        for (const w of verts.weights[j]!) {
+          const p = applyPoint(setupSpine[w.bone]!, w.x, w.y)
+          px += w.weight * p.x
+          py += w.weight * p.y
+          list.push({ bone: subsetIndex.get(w.bone)!, weight: w.weight })
+        }
+        weights.push(list)
+        const sorted = verts.weights[j]!.filter((w) => w.weight > 0).sort((p, q) => q.weight - p.weight)
+        over4 ||= sorted.length > 4
+        const kept = skinQuality === 4 ? sorted.slice(0, 4) : sorted
+        const total = kept.reduce((n, w) => n + w.weight, 0) || 1
+        effective.push(kept.map((w) => ({ bone: w.bone, weight: w.weight / total })))
+      } else {
+        const p = applyPoint(setupSpine[slotBone]!, verts.positions[j * 2]!, verts.positions[j * 2 + 1]!)
+        px = p.x
+        py = p.y
+        weights.push([{ bone: 0, weight: 1 }])
+        effective.push([{ bone: slotBone, weight: 1 }])
+      }
+      // UV:Spine 的 uv 相对未裁剪原图 → 裁剪矩形内像素 → 烘焙页上的像素 → 归一化
+      const r = uvToRect(uvs[j * 2]!, uvs[j * 2 + 1]!, rect.region)
+      vertices.push({
+        x: px * scale,
+        y: py * scale,
+        u: (rect.x + r.x) / page.width,
+        v: (rect.y + r.y) / page.height,
+        color,
+      })
+    }
+
+    if (over4) {
+      if (skinQuality === 4) {
+        issues.add(
+          'approximated',
+          `mesh.${item.spriteName}`,
+          '每顶点超过 4 根骨骼,SkinnedMeshRenderer 写死 Bone4,取权重最大的四根并重新归一化' +
+            '(完整权重已写入 Mesh;工程 Quality 全部档位设 Unlimited 并加 --skin-quality auto 可用满)',
+        )
+      } else {
+        issues.add(
+          'info',
+          `mesh.${item.spriteName}`,
+          '每顶点超过 4 根骨骼,完整权重已写入 Mesh;只有工程 Quality **所有**档位都是 Unlimited 时才会全部生效',
+        )
+      }
+    }
+
+    const bindposes = subset.map((b) => {
+      const inv = invert(toUnits(setupUnity[b]!))
+      if (inv === null) {
+        issues.loss(`mesh.${item.spriteName}`, `骨骼 "${part.bones[b]!.name}" 在绑定姿势下缩放为 0,绑定矩阵不可逆,该骨骼按单位矩阵处理`)
+        return IDENTITY
+      }
+      return inv
+    })
+    issues.add('info', `mesh.${item.spriteName}`, `走 SkinnedMeshRenderer:${reasons.join('、')}`)
+
+    return {
+      item,
+      page: rect.page,
+      subset,
+      vertices,
+      triangles: [...triangles],
+      weights,
+      effective,
+      localVerts: verts,
+      slotBone,
+      bindposes,
+      shapes: [],
+      shapeNames: new Set(),
+      nodeIndex: -1,
+    }
+  }
   const metaSprites: MetaSprite[][] = baked.pages.map(() => [])
   const seenSprite = new Set<string>()
 
@@ -404,6 +594,7 @@ export function exportToUnity(
         skinBones: null,
         rigid: null,
         rigidBone: null,
+        skinned: false,
       })
       metaSprites[rect.page]!.push({
         name: item.spriteName,
@@ -428,18 +619,41 @@ export function exportToUnity(
     // ── 网格 ──
     const slotBone = part.slots[item.slot]!.bone
     const mesh = bindMesh(item.attachment, region, slotBone, k)
+    const extent = Math.max(rect.width, rect.height, 1)
 
+    // 走 SkinnedMeshRenderer 的三个理由 —— 都是 SpriteSkin 结构上表达不了的,
+    // 其余网格一律留在 SpriteSkin 路径,已验证的效果不动
+    const reasons: string[] = []
+    if (
+      deformTargets.has(`${item.skin}/${item.slot}/${item.key}`) ||
+      deformTargets.has(`${item.skin}/${item.slot}/${item.attachment.name}`)
+    ) {
+      reasons.push('有 deform 顶点动画')
+    }
     // 残差按 sprite 跨度的相对值判 —— 500 像素的大图差 2 像素看不出来,
     // 40 像素的小图差 2 像素就很明显
-    const extent = Math.max(rect.width, rect.height, 1)
     if (mesh.residual > Math.max(1, extent * 0.02)) {
-      issues.add(
-        'approximated',
-        `mesh.${item.spriteName}`,
-        `绑定姿势拟合残差 ${mesh.residual.toFixed(1)} 像素(占跨度 ` +
-          `${((mesh.residual / extent) * 100).toFixed(1)}%)—— 该网格在绑定姿势下` +
-          '就不是刚性的(多半是刻意做的透视/形变),Unity 的 SpriteSkin 只能刚性蒙皮',
-      )
+      reasons.push(`绑定姿势非刚性(残差 ${mesh.residual.toFixed(1)} 像素,占跨度 ${((mesh.residual / extent) * 100).toFixed(1)}%)`)
+    }
+    const own = attachmentScale(item.attachment, region)
+    if (own !== null && own.extent >= 64 && Math.abs(own.scale / k - 1) > 0.02) {
+      reasons.push(`图集缩放 ${own.scale.toFixed(3)} 与全局 ${k.toFixed(3)} 不一致`)
+    }
+    if (reasons.length > 0) {
+      const geo = buildSkinnedGeometry(item, rect, slotBone, reasons)
+      skinned.push(geo)
+      skinnedByItem.set(item, geo)
+      skinnedByKey.set(`${item.skin}/${item.slot}/${item.key}`, geo)
+      skinnedByKey.set(`${item.skin}/${item.slot}/${item.attachment.name}`, geo)
+      sprites.set(item.spriteName, {
+        page: rect.page,
+        internalID: internal,
+        skinBones: null,
+        rigid: null,
+        rigidBone: null,
+        skinned: true,
+      })
+      continue
     }
     if (mesh.undetermined.length > 0) {
       issues.add(
@@ -497,6 +711,7 @@ export function exportToUnity(
       skinBones: mesh.bindPose === null ? null : subset,
       rigid: mesh.rigid,
       rigidBone: mesh.rigidBone,
+      skinned: false,
     })
     metaSprites[rect.page]!.push({
       name: item.spriteName,
@@ -561,6 +776,32 @@ export function exportToUnity(
     const info = sprites.get(item.spriteName)
     const rect = baked.rects.get(item.regionName)
     if (info === undefined || rect === undefined) continue
+
+    if (info.skinned) {
+      // SkinnedMeshRenderer:几何已经在骨架根空间算好,节点待在根下不动,由骨骼驱动
+      const geo = skinnedByItem.get(item)!
+      item.node = nodes.length
+      geo.nodeIndex = item.node
+      nodes.push({
+        name: claimName(0, sanitize(item.key === slot.name ? slot.name : `${slot.name}__${item.key}`)),
+        parent: 0,
+        position: { x: 0, y: 0, z: 0 },
+        rotation: { x: 0, y: 0, z: 0, w: 1 },
+        scale: { x: 1, y: 1, z: 1 },
+        renderer: null,
+        skin: null,
+        skinnedMesh: {
+          mesh: { fileID: MESH_FILE_ID, guid: meshGuidOf(item.spriteName) },
+          material: { fileID: MATERIAL_FILE_ID, guid: materialGuids[info.page]! },
+          bones: geo.subset.map((b) => boneNode[b]!),
+          rootBone: boneNode[geo.subset[0]!]!,
+          blendShapeCount: 0, // 动画转完再补
+          sortingOrder: item.slot,
+          quality: skinQuality,
+        },
+      })
+      continue
+    }
 
     const color = unpackColor(slot.color)
     const renderer: RendererSpec = {
@@ -645,6 +886,209 @@ export function exportToUnity(
     if (list === undefined) slotNodes.set(item.slot, [item])
     else list.push(item)
   }
+
+  // ── deform → Blend Shape ──
+  //
+  // 每个有偏移的 deform 关键帧变成一个形变目标;两帧之间 Spine 对偏移数组做 lerp,
+  // 等价于两个目标的权重交叉 (1−y, y),Spine 的曲线搬到权重曲线上。
+  //
+  // 增量不能直接抄 Spine 的逐影响偏移 —— 那些偏移在世界空间里并不一致(MC2 里 12~22% 的
+  // 顶点分歧 >0.5px,见 PROGRESS.md)。改为**按关键帧时刻的姿势反解**:
+  //     Unity 在姿势 P 下作用在增量 δ 上的是 M(P) = Σ w'ᵢ Bᵢ(P) Bᵢ(S)⁻¹
+  //     Spine 在同一时刻的世界偏移是 Δ = Σ wᵢ Bᵢ(P) dᵢ
+  //     令 M(Pₖ)·δ = Δₖ,关键帧时刻就严格一致;关键帧之间的分歧算出来报 approximated。
+  const offsetsOf = (frame: Record<string, unknown>, length: number): number[] => {
+    const flat = new Array<number>(length).fill(0)
+    const vs = (frame['vertices'] as number[] | undefined) ?? []
+    const start = Number(frame['start'] ?? 0)
+    for (let i = 0; i < vs.length && start + i < length; i++) flat[start + i] = vs[i]!
+    return flat
+  }
+
+  /** Unity 在姿势 P 下作用在增量上的矩阵:Σ w'ᵢ · Bᵢ(P) · Bᵢ(S)⁻¹(只取线性部分) */
+  const unityDeformMatrix = (effective: readonly { bone: number; weight: number }[], poseU: readonly Affine[]): Affine => {
+    let a = 0
+    let b = 0
+    let c = 0
+    let d = 0
+    for (const w of effective) {
+      const inv = setupUnityInv[w.bone]
+      if (inv === null || inv === undefined) continue
+      const m = multiply(linear(poseU[w.bone]!), inv)
+      a += w.weight * m.a
+      b += w.weight * m.b
+      c += w.weight * m.c
+      d += w.weight * m.d
+    }
+    return { a, b, c, d, x: 0, y: 0 }
+  }
+
+  /** 一帧 deform 的偏移 → 每个顶点的 Blend Shape 增量(网格空间,Unity 单位) */
+  const shapeDeltas = (geo: SkinnedGeometry, anim: AnimationData, time: number, flat: number[]): { x: number; y: number }[] => {
+    const verts = geo.localVerts
+    const out: { x: number; y: number }[] = []
+    if (!verts.weighted) {
+      // 不加权:Spine 在骨骼局部加偏移再乘骨骼矩阵,Unity 在网格空间加增量再乘 B(P)B(S)⁻¹,
+      // 令两者在 setup 下一致 → δ = B(S)·d(线性部分)
+      const B = setupSpine[geo.slotBone]!
+      for (let j = 0; j < geo.vertices.length; j++) {
+        const d = applyVector(B, flat[j * 2]!, flat[j * 2 + 1]!)
+        out.push({ x: d.x * scale, y: d.y * scale })
+      }
+      return out
+    }
+    const poseS = poseAt(part, anim, time)
+    const poseU = poseAt(part, anim, time, { unityCompatible: true })
+    let idx = 0
+    for (let j = 0; j < geo.vertices.length; j++) {
+      const start = idx
+      let dx = 0
+      let dy = 0
+      for (const w of verts.weights[j]!) {
+        const d = applyVector(poseS[w.bone]!, flat[idx]!, flat[idx + 1]!)
+        dx += w.weight * d.x
+        dy += w.weight * d.y
+        idx += 2
+      }
+      const inv = invert(unityDeformMatrix(geo.effective[j]!, poseU))
+      if (inv !== null) {
+        const d = applyVector(inv, dx, dy)
+        out.push({ x: d.x * scale, y: d.y * scale })
+        continue
+      }
+      // 退化(骨骼缩放为 0 之类):退回 setup 姿势下的加权平均
+      let sx = 0
+      let sy = 0
+      let kk = start
+      for (const w of verts.weights[j]!) {
+        const d = applyVector(setupSpine[w.bone]!, flat[kk]!, flat[kk + 1]!)
+        sx += w.weight * d.x
+        sy += w.weight * d.y
+        kk += 2
+      }
+      out.push({ x: sx * scale, y: sy * scale })
+    }
+    return out
+  }
+
+  /** 关键帧之间 Blend Shape 与 Spine 的最大分歧(Spine 像素) */
+  const deformDivergence = (
+    geo: SkinnedGeometry,
+    anim: AnimationData,
+    frames: readonly Record<string, unknown>[],
+    flats: readonly number[][],
+    deltas: readonly ({ x: number; y: number }[] | null)[],
+  ): number => {
+    const verts = geo.localVerts
+    let worst = 0
+    for (let k = 0; k < frames.length - 1; k++) {
+      const t0 = frames[k]!['time'] as number
+      const t1 = frames[k + 1]!['time'] as number
+      if (t1 <= t0) continue
+      // 借 valueBetween 算这一段的进度 y(t),连同它的曲线
+      const probe = [{ ...frames[k]!, p: 0 }, { time: t1, p: 1 }]
+      for (let s = 1; s < 8; s++) {
+        const time = t0 + ((t1 - t0) * s) / 8
+        const y = valueBetween(probe, 0, 'p', time, is38, 0)
+        const poseS = poseAt(part, anim, time)
+        const poseU = poseAt(part, anim, time, { unityCompatible: true })
+        let idx = 0
+        for (let j = 0; j < geo.vertices.length; j++) {
+          // Spine:偏移数组先 lerp 再蒙皮
+          let sx = 0
+          let sy = 0
+          for (const w of verts.weights[j]!) {
+            const ox = flats[k]![idx]! + (flats[k + 1]![idx]! - flats[k]![idx]!) * y
+            const oy = flats[k]![idx + 1]! + (flats[k + 1]![idx + 1]! - flats[k]![idx + 1]!) * y
+            const d = applyVector(poseS[w.bone]!, ox, oy)
+            sx += w.weight * d.x
+            sy += w.weight * d.y
+            idx += 2
+          }
+          // Unity:两个目标权重 (1−y, y),增量在网格空间 lerp 再过 M(P)
+          const a = deltas[k]?.[j] ?? { x: 0, y: 0 }
+          const b = deltas[k + 1]?.[j] ?? { x: 0, y: 0 }
+          const mx = (a.x + (b.x - a.x) * y) / scale
+          const my = (a.y + (b.y - a.y) * y) / scale
+          const u = applyVector(unityDeformMatrix(geo.effective[j]!, poseU), mx, my)
+          worst = Math.max(worst, Math.hypot(sx - u.x, sy - u.y))
+        }
+      }
+    }
+    return worst
+  }
+
+  /** 把一条 deform 时间轴转成形变目标 + 权重曲线;返回是否有曲线被近似 */
+  const convertDeform = (geo: SkinnedGeometry, anim: AnimationData, d: DeformRecord, floats: FloatCurve[]): boolean => {
+    const frames = d.frames
+    const n = frames.length
+    if (n === 0) return false
+    const verts = geo.localVerts
+    const flatLength = verts.weighted ? verts.weights.reduce((s, w) => s + w.length * 2, 0) : verts.positions.length
+    const flats = frames.map((f) => offsetsOf(f, flatLength))
+    const times = frames.map((f) => f['time'] as number)
+    const deltas = flats.map((flat, k) => (flat.some((v) => Math.abs(v) > 1e-9) ? shapeDeltas(geo, anim, times[k]!, flat) : null))
+
+    // 有增量的帧才成为形变目标;零帧(回到原样)只贡献相邻目标权重归零的时刻
+    const shapeOf: (number | null)[] = deltas.map((dl, k) => {
+      if (dl === null) return null
+      const sparse = dl.map((v, j) => ({ index: j, x: v.x, y: v.y })).filter((v) => Math.hypot(v.x, v.y) > 1e-7)
+      if (sparse.length === 0) return null
+      const base = `${sanitize(anim.name)}_${k}`
+      let shapeName = base
+      let salt = 1
+      while (geo.shapeNames.has(shapeName)) shapeName = `${base}_${++salt}`
+      geo.shapeNames.add(shapeName)
+      geo.shapes.push({ name: shapeName, deltas: sparse })
+      return geo.shapes.length - 1
+    })
+
+    // 帧 i → i+1 的曲线描述进度 y ∈ [0,1];toWeight 把进度映射成该目标的权重
+    const progressSegment = (i: number, toWeight: (y: number) => number) =>
+      segmentsOf([frames[i]!, frames[i + 1]!], [0, 1], toWeight, is38)[0]
+
+    let approximated = false
+    const path = paths[geo.nodeIndex]!
+    shapeOf.forEach((si, k) => {
+      if (si === null) return
+      const ts: number[] = []
+      const vs: number[] = []
+      const segs: (SpineSegment | undefined)[] = []
+      if (k > 0) {
+        ts.push(times[k - 1]!)
+        vs.push(0)
+        segs.push(progressSegment(k - 1, (y) => 100 * y))
+      }
+      ts.push(times[k]!)
+      vs.push(100)
+      if (k < n - 1) {
+        segs.push(progressSegment(k, (y) => 100 * (1 - y)))
+        ts.push(times[k + 1]!)
+        vs.push(0)
+      }
+      segs.push(undefined)
+      // 第一帧之前 Spine 没有形变 → 0 处补 0 并阶梯过去(与骨骼曲线的 withSetup 同理)
+      const s = withSetup(ts, vs, segs, 0)
+      const curve = toUnityCurve(s.times, s.values, s.segments)
+      approximated ||= curve.approximated
+      floats.push({ path, attribute: `blendShape.${geo.shapes[si]!.name}`, classID: 137, keys: curve.keys })
+    })
+
+    if (verts.weighted && n > 1) {
+      const worst = deformDivergence(geo, anim, frames, flats, deltas)
+      if (worst > 0.5) {
+        issues.add(
+          'approximated',
+          `deform[${geo.item.spriteName}]`,
+          `Blend Shape 在关键帧之间与 Spine 最大差 ${worst.toFixed(1)} 像素(关键帧时刻精确)`,
+        )
+      }
+    }
+    return approximated
+  }
+
+  /** slot 颜色动画落在 SkinnedMeshRenderer 上的 sprite —— 没有对应属性,汇总后报一次 */
+  const skinnedColorLoss = new Set<string>()
 
   // ── 5. 动画 ──
   const clipGuids = new Map<string, string>()
@@ -781,6 +1225,10 @@ export function exportToUnity(
             const curve = toUnityCurve(s.times, s.values, s.segments)
             approximated ||= curve.approximated
             for (const item of list) {
+              if (skinnedByItem.has(item)) {
+                skinnedColorLoss.add(item.spriteName)
+                continue
+              }
               floats.push({ path: paths[item.node]!, attribute, classID: 212, keys: curve.keys })
             }
           }
@@ -789,8 +1237,32 @@ export function exportToUnity(
         }
 
         if (t.kind === 'deform') {
-          issues.loss(`deform[${t.owner}]`, 'Unity 的 SpriteSkin 只做骨骼蒙皮,没有逐顶点关键帧,该时间轴已丢弃')
-        } else if (t.kind === 'drawOrder') {
+          const d = t.frames[0] as unknown as DeformRecord
+          const geo = skinnedByKey.get(`${skinNameOf(d.skin)}/${t.owner}/${d.attachment}`)
+          if (geo === undefined || geo.nodeIndex < 0) {
+            const type = attachmentTypeOf(skinNameOf(d.skin), t.owner, d.attachment)
+            if (type !== null && type !== 'mesh' && type !== 'linkedmesh') {
+              // 实测 MergeCooking2 的 wave:deform 打在 path 上(路径约束用),没有可渲染的东西
+              issues.add('info', `deform[${t.owner}]`, `deform 指向的 "${d.attachment}" 是 ${type},不参与渲染,已跳过`)
+            } else {
+              issues.loss(
+                `deform[${t.owner}]`,
+                `找不到 deform 指向的网格 "${d.attachment}"(${type === 'linkedmesh' ? 'linkedmesh 尚未支持' : '多半是图集里没有这张图'}),该时间轴已丢弃`,
+              )
+            }
+            continue
+          }
+          approximated ||= convertDeform(geo, anim, d, floats)
+          noteApprox(t)
+          continue
+        }
+
+        if (t.kind === 'shear' || t.kind === 'shearX' || t.kind === 'shearY') {
+          issues.loss(`${t.kind}[${bone?.name ?? t.owner}]`, 'Unity 的 Transform 没有斜切(shear),该时间轴已丢弃')
+          continue
+        }
+
+        if (t.kind === 'drawOrder') {
           issues.loss('drawOrder', '逐帧绘制顺序尚未转换,该时间轴已丢弃(排查证实 m_SortingOrder 可以打关键帧,能做、未做)')
         } else if (t.kind === 'transform' || t.kind.startsWith('path')) {
           issues.loss(t.kind, 'Unity 没有 transform / path 约束的对应物,该时间轴已丢弃')
@@ -835,6 +1307,50 @@ export function exportToUnity(
       }),
     })
   })
+
+  // ── SkinnedMeshRenderer 的 Mesh 资产与材质 ──
+  for (const geo of skinned) {
+    if (geo.nodeIndex < 0) continue
+    const node = nodes[geo.nodeIndex]!
+    nodes[geo.nodeIndex] = { ...node, skinnedMesh: { ...node.skinnedMesh!, blendShapeCount: geo.shapes.length } }
+    const assetName = `${name}@${geo.item.spriteName}`
+    files.push({
+      path: `${assetName}.asset`,
+      content: writeMesh({
+        name: assetName,
+        vertices: geo.vertices,
+        triangles: geo.triangles,
+        bindposes: geo.bindposes,
+        weights: geo.weights,
+        blendShapes: geo.shapes,
+      }),
+    })
+    files.push({ path: `${assetName}.asset.meta`, content: writeNativeMeta(meshGuidOf(geo.item.spriteName), MESH_FILE_ID) })
+  }
+  // SkinnedMeshRenderer 不会像 SpriteRenderer 那样自动带上 sprite 的纹理,材质要显式引用图集页
+  for (const page of new Set(skinned.map((g) => g.page))) {
+    const pageName = baked.pages.length === 1 ? name : `${name}_${page}`
+    files.push({
+      path: `${pageName}.mat`,
+      content: writeSpriteMaterial({
+        name: pageName,
+        renderPipeline: options.renderPipeline,
+        texture: { fileID: TEXTURE_FILE_ID, guid: textureGuids[page]! },
+      }),
+    })
+    files.push({ path: `${pageName}.mat.meta`, content: writeNativeMeta(materialGuids[page]!, MATERIAL_FILE_ID) })
+  }
+  if (skinned.length > 0) {
+    const shapes = skinned.reduce((n, g) => n + g.shapes.length, 0)
+    issues.add(
+      'info',
+      'skinnedMesh',
+      `${skinned.length} 个网格走 SkinnedMeshRenderer,deform 已转成 ${shapes} 个 Blend Shape 形变目标`,
+    )
+  }
+  for (const spriteName of skinnedColorLoss) {
+    issues.loss(`color.${spriteName}`, 'slot 颜色动画在 SkinnedMeshRenderer 上没有对应属性(静态颜色已烘进顶点色),已丢弃')
+  }
 
   const controllerGuid = unityGuid(`${name}/controller`)
   const prefabGuid = unityGuid(`${name}/prefab`)

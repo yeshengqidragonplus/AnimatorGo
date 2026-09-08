@@ -49,6 +49,7 @@ public static class AnimatorGoVerify
             {
                 report.AppendLine($"── {System.IO.Path.GetFileName(path)} ──");
                 problems += CheckSkins(root, report);
+                problems += CheckSkinnedMeshes(root, report);
                 problems += CheckClips(root, path, report);
                 report.AppendLine();
             }
@@ -100,6 +101,43 @@ public static class AnimatorGoVerify
         return bad.Count;
     }
 
+    /// 走 SkinnedMeshRenderer 的网格(有 deform / 绑定非刚性 / 缩放不一致的那些)。
+    /// Mesh 在不在、骨骼数是否等于绑定矩阵数、材质是否带纹理(不带就是纯白)、形变目标数。
+    static int CheckSkinnedMeshes(GameObject root, StringBuilder report)
+    {
+        SkinnedMeshRenderer[] renderers = root.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+        if (renderers.Length == 0) return 0;
+
+        var bad = new List<string>();
+        int shapes = 0;
+        foreach (SkinnedMeshRenderer r in renderers)
+        {
+            Mesh mesh = r.sharedMesh;
+            if (mesh == null)
+            {
+                bad.Add($"{r.name}:没有 Mesh");
+                continue;
+            }
+            int boneCount = r.bones == null ? 0 : r.bones.Length;
+            if (boneCount != mesh.bindposes.Length) bad.Add($"{r.name}:骨骼 {boneCount} 根 ≠ 绑定矩阵 {mesh.bindposes.Length} 个");
+            else if (r.bones.Any(b => b == null)) bad.Add($"{r.name}:有骨骼引用为空");
+            if (r.sharedMaterial == null || r.sharedMaterial.mainTexture == null) bad.Add($"{r.name}:材质没有纹理,渲染出来是纯白");
+
+            shapes += mesh.blendShapeCount;
+            var per = mesh.GetBonesPerVertex();
+            int maxBones = 0;
+            for (int i = 0; i < per.Length; i++) maxBones = Mathf.Max(maxBones, per[i]);
+            report.AppendLine(
+                $"    {r.name}:顶点 {mesh.vertexCount},三角形 {mesh.triangles.Length / 3},骨骼 {mesh.bindposes.Length},"
+                + $"每顶点最多 {maxBones} 根,形变目标 {mesh.blendShapeCount},m_Quality {r.quality}"
+                + (r.quality == SkinQuality.Auto ? "(跟随工程 Quality 档位)" : ""));
+        }
+
+        report.AppendLine($"  SkinnedMeshRenderer {renderers.Length} 个,形变目标共 {shapes} 个,有问题 {bad.Count} 个");
+        foreach (string line in bad) report.AppendLine($"    ✗ {line}");
+        return bad.Count;
+    }
+
     /// 曲线的 path 能不能指到真实物体。指不到的曲线 Unity 会**静默忽略**。
     static int CheckClips(GameObject root, string prefabPath, StringBuilder report)
     {
@@ -119,9 +157,19 @@ public static class AnimatorGoVerify
             var missing = new List<string>();
             foreach (EditorCurveBinding b in bindings.Concat(pptr))
             {
-                if (AnimationUtility.GetAnimatedObject(root, b) == null)
+                UnityEngine.Object target = AnimationUtility.GetAnimatedObject(root, b);
+                if (target == null)
                 {
                     missing.Add($"{b.path} :: {b.propertyName} ({b.type.Name})");
+                    continue;
+                }
+                // blendShape.<名> 指到了物体还不够,Mesh 里得真有这个形变目标 —— 没有的话 Unity 同样一声不响
+                const string prefix = "blendShape.";
+                if (b.propertyName.StartsWith(prefix) && target is SkinnedMeshRenderer smr)
+                {
+                    string shape = b.propertyName.Substring(prefix.Length);
+                    if (smr.sharedMesh == null || smr.sharedMesh.GetBlendShapeIndex(shape) < 0)
+                        missing.Add($"{b.path} :: {b.propertyName} —— Mesh 里没有这个形变目标");
                 }
             }
 

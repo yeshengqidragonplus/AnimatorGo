@@ -108,7 +108,7 @@ export function uvToRect(u: number, v: number, region: AtlasRegion): { x: number
   }
 }
 
-interface SpineVertices {
+export interface SpineVertices {
   readonly weighted: boolean
   readonly positions: readonly number[]
   readonly weights: readonly (readonly { bone: number; x: number; y: number; weight: number }[])[]
@@ -200,17 +200,7 @@ export function estimateAtlasScale(
 
   if (values.length === 0) return { scale: 1, spread: 0, count: 0 }
 
-  values.sort((a, b) => a.value - b.value)
-  const total = values.reduce((n, v) => n + v.weight, 0)
-  let seen = 0
-  let scale = values[values.length >> 1]!.value
-  for (const v of values) {
-    seen += v.weight
-    if (seen >= total / 2) {
-      scale = v.value
-      break
-    }
-  }
+  const scale = weightedMedian(values)
 
   // 只拿足够大的样本判断一致性 —— 小图的量化误差不算「不一致」
   let spread = 0
@@ -218,6 +208,44 @@ export function estimateAtlasScale(
     if (v.weight >= 64) spread = Math.max(spread, Math.abs(v.value / scale - 1))
   }
   return { scale, spread, count: values.length }
+}
+
+/** 加权中位数:按 value 排序,累计权重过半的那个 */
+function weightedMedian(values: { value: number; weight: number }[]): number {
+  values.sort((a, b) => a.value - b.value)
+  const total = values.reduce((n, v) => n + v.weight, 0)
+  let seen = 0
+  for (const v of values) {
+    seen += v.weight
+    if (seen >= total / 2) return v.value
+  }
+  return values[values.length >> 1]!.value
+}
+
+/**
+ * **一个**真正混合的加权网格自己反推出的图集缩放,以及它的像素跨度。
+ *
+ * 与全局的 `estimateAtlasScale` 比,偏差大的网格没法用一个共同的 `pixelsPerUnit`
+ * 表达 —— 这种网格改走 SkinnedMeshRenderer(顶点和 UV 各自独立,不再需要 k)。
+ * 不是混合网格(region / 不加权 / 其实刚性)返回 null。
+ */
+export function attachmentScale(
+  attachment: Attachment,
+  region: AtlasRegion,
+): { scale: number; extent: number } | null {
+  if (attachment.type !== 'mesh') return null
+  const verts = attachment.data['vertices'] as SpineVertices | undefined
+  if (verts === undefined || !verts.weighted || rigidBoneOf(verts) !== null) return null
+
+  const target = meshVertices(attachment, region)
+  const values: { value: number; weight: number }[] = []
+  for (const [, pairs] of groupByBone(verts, target)) {
+    if (pairs.src.length < 2) continue
+    const { fit, determined } = fitSimilarity(pairs.src, pairs.dst)
+    if (determined && fit.scale > 1e-6) values.push({ value: 1 / fit.scale, weight: extentOf(pairs.dst) })
+  }
+  if (values.length === 0) return null
+  return { scale: weightedMedian(values), extent: extentOf(target) }
 }
 
 /** 一组点的对角跨度,用作可信度权重 */

@@ -33,6 +33,8 @@ interface Options {
   readonly atlas: string | null
   /** null 表示从输出目录所在的 Unity 工程自动认 */
   readonly renderPipeline: RenderPipeline | null
+  /** SkinnedMeshRenderer 的蒙皮根数:bone4 写死 4 根(默认),auto 跟随工程 Quality */
+  readonly skinQuality: 'bone4' | 'auto'
 }
 
 function parseArgs(argv: readonly string[]): Options | string {
@@ -68,6 +70,9 @@ function parseArgs(argv: readonly string[]): Options | string {
   const rp = flags.get('rp') ?? null
   if (rp !== null && rp !== 'urp' && rp !== 'builtin') return `--rp 只能是 urp 或 builtin,收到 "${rp}"`
 
+  const skinQuality = flags.get('skin-quality') ?? 'bone4'
+  if (skinQuality !== 'bone4' && skinQuality !== 'auto') return `--skin-quality 只能是 bone4 或 auto,收到 "${skinQuality}"`
+
   const resolved = resolve(input)
   const base = statSync(resolved).isDirectory() ? resolved : dirname(resolved)
 
@@ -78,6 +83,7 @@ function parseArgs(argv: readonly string[]): Options | string {
     dryRun: flags.has('dry-run'),
     atlas: atlas === null ? null : resolve(atlas),
     renderPipeline: rp as RenderPipeline | null,
+    skinQuality,
   }
 }
 
@@ -197,6 +203,36 @@ function detectRenderPipeline(outDir: string): { pipeline: RenderPipeline; from:
   return { pipeline: 'builtin', from: null }
 }
 
+/**
+ * 工程 Quality 各档位的 `skinWeights`(1/2/4 根,255 = Unlimited)。
+ *
+ * SkinnedMeshRenderer 按 Auto 走时跟随这个设置 —— 实测 UnityAnimationGo 的 Low/Medium/High
+ * 档是 2 根,MergeCooking2 是 2/4/2。所以默认把渲染器写死 Bone4,这里只是把事实报出来,
+ * 让人知道 `--skin-quality auto` 在这个工程里会发生什么。
+ */
+function detectSkinWeights(outDir: string): { levels: { name: string; skinWeights: number }[]; from: string } | null {
+  let dir = resolve(outDir)
+  for (let up = 0; up < 12; up++) {
+    const file = join(dir, 'ProjectSettings', 'QualitySettings.asset')
+    if (existsSync(file)) {
+      const text = readFileSync(file, 'utf8')
+      const levels: { name: string; skinWeights: number }[] = []
+      let current: string | null = null
+      for (const line of text.split('\n')) {
+        const name = /^\s{4}name: (.*)$/.exec(line)
+        if (name !== null) current = name[1]!.trim()
+        const sw = /^\s{4}skinWeights: (\d+)/.exec(line)
+        if (sw !== null && current !== null) levels.push({ name: current, skinWeights: Number(sw[1]) })
+      }
+      return { levels, from: file }
+    }
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return null
+}
+
 const MARKS: Record<string, string> = { loss: '✗', approximated: '≈', info: 'ℹ' }
 
 function describe(issue: ConversionIssue): string {
@@ -252,6 +288,23 @@ function main(): void {
   if (parsed.renderPipeline !== null) console.log(`渲染管线:${pipeline}(命令行指定)`)
   else if (detected.from !== null) console.log(`渲染管线:${pipeline}(认自 ${detected.from})`)
   else console.log(`渲染管线:${pipeline}(输出目录不在 Unity 工程里,按默认;不对就加 --rp)`)
+
+  // SkinnedMeshRenderer 的蒙皮根数:写死 Bone4 时不受 Quality 影响,但把工程的实际档位报出来,
+  // 免得有人开 --skin-quality auto 之后在 Low 档看到只剩 2 根骨骼
+  const quality = detectSkinWeights(parsed.out)
+  if (quality !== null && quality.levels.length > 0) {
+    const levels = quality.levels.map((l) => `${l.name}=${l.skinWeights === 255 ? 'Unlimited' : `${l.skinWeights}根`}`).join(' ')
+    const allUnlimited = quality.levels.every((l) => l.skinWeights === 255)
+    if (parsed.skinQuality === 'bone4') {
+      console.log(`蒙皮根数:SkinnedMeshRenderer 写死 4 根(工程 Quality 各档 ${levels}${allUnlimited ? ';全是 Unlimited,可用 --skin-quality auto 吃满 >4 根' : ''})`)
+    } else if (allUnlimited) {
+      console.log(`蒙皮根数:跟随工程 Quality(各档 ${levels}),>4 根全部生效`)
+    } else {
+      console.log(`⚠️ 蒙皮根数:跟随工程 Quality,但有档位不是 Unlimited(${levels})—— 那些档位下 SkinnedMeshRenderer 会被截到相应根数,比 SpriteSkin 还少`)
+    }
+  } else if (parsed.skinQuality === 'auto') {
+    console.log('⚠️ 蒙皮根数:--skin-quality auto,但找不到工程的 QualitySettings.asset,无法判断各档位会截到几根')
+  }
   console.log()
 
   let failed = 0
@@ -302,6 +355,7 @@ function main(): void {
         name: stem,
         pixelsPerUnit: parsed.pixelsPerUnit,
         renderPipeline: pipeline,
+        skinQuality: parsed.skinQuality,
         // 试运行不写文件,那就别费时间编码 PNG
         skipImages: parsed.dryRun,
       })

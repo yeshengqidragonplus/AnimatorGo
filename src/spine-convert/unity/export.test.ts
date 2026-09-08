@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest'
 import { readSkeletonPart, type BoneRecord } from '../../spine-format/binary/readSkeleton.ts'
 import { parseAtlas } from '../../core/atlas.ts'
 import { decodePng, type Image } from '../../unity/png.ts'
+import { parseMesh } from '../../unity/writeMesh.ts'
+import { applyPoint, poseAt, type Affine as EvalAffine } from '../../spine-eval/pose.ts'
 import { exportToUnity, type UnityFile } from './export.ts'
 
 /**
@@ -44,6 +46,9 @@ const apply = (m: Affine, x: number, y: number) => ({
   x: m.a * x + m.b * y + m.x,
   y: m.c * x + m.d * y + m.y,
 })
+
+/** Spine 像素 → Unity 单位(ppu 100) */
+const toUnits = (m: EvalAffine): EvalAffine => ({ a: m.a, b: m.b, c: m.c, d: m.d, x: m.x / 100, y: m.y / 100 })
 
 /** Spine 的 `Bone.UpdateWorldTransform`,绑定姿势版本 */
 function setupPose(bones: readonly BoneRecord[]): Affine[] {
@@ -240,6 +245,43 @@ function worldOf(prefab: PrefabBack, id: string, cache: Map<string, Affine>): Af
   return out
 }
 
+/** `.anim` 里的单值曲线:属性、路径、关键帧(时间 → 值)。只取 blendShape 那些 */
+function readBlendShapeCurves(text: string): { shape: string; path: string; keys: { time: number; value: number }[] }[] {
+  const out: { shape: string; path: string; keys: { time: number; value: number }[] }[] = []
+  for (const block of text.split('  - serializedVersion: 2\n    curve:').slice(1)) {
+    const attribute = /^\s{4}attribute: (\S+)/m.exec(block)?.[1]
+    const path = /^\s{4}path: (\S*)/m.exec(block)?.[1] ?? ''
+    if (attribute === undefined || !attribute.startsWith('blendShape.')) continue
+    const keys = [...block.matchAll(/time: (\S+)\n\s+value: (\S+)/g)].map((m) => ({ time: Number(m[1]), value: Number(m[2]) }))
+    out.push({ shape: attribute.slice('blendShape.'.length), path, keys })
+  }
+  return out
+}
+
+/** prefab 里的 SkinnedMeshRenderer:挂在哪个物体、引用哪个 Mesh、骨骼 Transform 的 fileID 顺序 */
+function readSkinnedRenderers(text: string): { name: string; meshGuid: string; materialGuid: string; bones: string[] }[] {
+  const goName = new Map<string, string>()
+  const docs = text.split(/^--- /m).slice(1)
+  for (const doc of docs) {
+    const head = /^!u!(\d+) &(\d+)/.exec(doc)
+    if (head?.[1] === '1') goName.set(head[2]!, /m_Name: (.*)/.exec(doc)![1]!.trim())
+  }
+  const out: { name: string; meshGuid: string; materialGuid: string; bones: string[] }[] = []
+  for (const doc of docs) {
+    const head = /^!u!(\d+) &(\d+)/.exec(doc)
+    if (head?.[1] !== '137') continue
+    const go = /m_GameObject: \{fileID: (\d+)}/.exec(doc)![1]!
+    const bonesBlock = /m_Bones:\n((?:  - \{fileID: \d+}\n)*)/.exec(doc)?.[1] ?? ''
+    out.push({
+      name: goName.get(go)!,
+      meshGuid: /m_Mesh: \{fileID: 4300000, guid: ([0-9a-f]+)/.exec(doc)![1]!,
+      materialGuid: /m_Materials:\n  - \{fileID: 2100000, guid: ([0-9a-f]+)/.exec(doc)![1]!,
+      bones: [...bonesBlock.matchAll(/fileID: (\d+)/g)].map((m) => m[1]!),
+    })
+  }
+  return out
+}
+
 // ─── 用例 ────────────────────────────────────────────────────────────────────
 
 describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
@@ -265,10 +307,13 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
     }
   })
 
-  it('每个 attachment 都有 sprite,没有漏图', () => {
+  it('每个 attachment 都有 sprite 或 Mesh 资产,没有漏图', () => {
     const meta = readMeta(textOf('.png.meta'))
-    // 3 个 region(bubble 共用)+ 15 个 mesh,region 去重后一共 16 个
-    expect(meta.sprites.length).toBe(16)
+    // 3 个 region(bubble 共用)+ 15 个 mesh,region 去重后一共 16 个;
+    // 其中 eyelid 有 deform,走 SkinnedMeshRenderer,是一个 .asset 而不是 sprite
+    const meshAssets = result.files.filter((f) => f.path.endsWith('.asset')).map((f) => f.path)
+    expect(meshAssets).toEqual(['MX2_cat@eyelid.asset'])
+    expect(meta.sprites.length + meshAssets.length).toBe(16)
     for (const sprite of meta.sprites) {
       expect(sprite.rect.width).toBeGreaterThan(0)
       expect(sprite.rect.height).toBeGreaterThan(0)
@@ -427,6 +472,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
     const pose = setupPose(part.bones)
     const cache = new Map<string, Affine>()
     let checked = 0
+    let skinnedUnweighted = 0
 
     for (const skin of part.skins) {
       for (const entry of skin.slots) {
@@ -434,6 +480,11 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
           if (attachment.type !== 'mesh') continue
           const verts = attachment.data['vertices'] as { weighted: boolean; positions: number[] }
           if (verts.weighted) continue
+          // 走 SkinnedMeshRenderer 的没有 sprite,另有专门的用例
+          if (result.files.some((f) => f.path === `MX2_cat@${attachment.name}.asset`)) {
+            skinnedUnweighted++
+            continue
+          }
 
           const sprite = meta.sprites.find((s) => s.name === attachment.name)!
           const slot = part.slots[entry.slot]!
@@ -460,7 +511,8 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
         }
       }
     }
-    expect(checked).toBeGreaterThan(0)
+    // MX2_cat 唯一的不加权网格 eyelid 有 deform,走了 SkinnedMeshRenderer —— 这里就没得查,由专门的用例覆盖
+    expect(checked + skinnedUnweighted).toBeGreaterThan(0)
   })
 
   /**
@@ -533,10 +585,117 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
     expect(checked).toBeGreaterThan(0)
   })
 
+  /**
+   * 走 SkinnedMeshRenderer 的网格(MX2_cat 里是有 deform 的 eyelid)。
+   *
+   * 把写出来的 Mesh 资产、prefab、`.anim` 全部读回来,照 Unity 自己的规则算:
+   * ```
+   * 顶点 = 网格顶点 + Σ 权重ₖ/100 × 形变目标ₖ 的增量        ← 加完再蒙皮(实测)
+   * 世界 = Σ wᵢ × 骨骼ᵢ世界矩阵 · 绑定矩阵ᵢ · 顶点
+   * ```
+   * 权重取 `.anim` 里 blendShape 曲线在关键帧时刻的键值,再与 Spine 的 deform 求值比对。
+   */
+  it('⭐ SkinnedMeshRenderer:按 Unity 的规则蒙皮 + Blend Shape 后,顶点与 Spine 的 deform 一致(关键帧时刻)', () => {
+    const renderers = readSkinnedRenderers(textOf('.prefab'))
+    expect(renderers.map((r) => r.name)).toEqual(['eyelid'])
+    const smr = renderers[0]!
+    // 引用得对:Mesh 资产的 .meta 带这个 guid,材质引用图集页
+    expect(textOf('@eyelid.asset.meta')).toContain(`guid: ${smr.meshGuid}`)
+    expect(textOf('.mat.meta')).toContain(`guid: ${smr.materialGuid}`)
+    expect(textOf('.mat')).toContain(`_MainTex:\n        m_Texture: {fileID: 2800000, guid: ${/guid: ([0-9a-f]+)/.exec(textOf('.png.meta'))![1]}`)
+
+    const mesh = parseMesh(textOf('@eyelid.asset'))
+    const prefab = readPrefab(textOf('.prefab'))
+    const boneNames = smr.bones.map((id) => prefab.nameOf.get(id)!)
+    const boneIndices = boneNames.map((n) => part.bones.findIndex((b) => b.name === n))
+    expect(boneIndices.length).toBe(mesh.bindposes.length)
+    expect(boneIndices.every((i) => i >= 0)).toBe(true)
+
+    let found: { slot: number; positions: number[] } | null = null
+    for (const skin of part.skins) {
+      for (const entry of skin.slots) {
+        for (const attachment of entry.attachments) {
+          if (attachment.name !== 'eyelid') continue
+          const verts = attachment.data['vertices'] as { weighted: boolean; positions: number[] }
+          expect(verts.weighted).toBe(false)
+          found = { slot: entry.slot, positions: verts.positions }
+        }
+      }
+    }
+    expect(found).not.toBeNull()
+    const { slot, positions } = found!
+    expect(mesh.vertexCount).toBe(positions.length / 2)
+    const slotBone = part.slots[slot]!.bone
+    expect(boneIndices).toEqual([slotBone])
+    // 绑定矩阵 · 骨骼绑定时刻的世界矩阵 = 单位:顶点在 setup 下原样落回
+    const setupUnits = toUnits(poseAt(part, part.animations[0]!, -1)[slotBone]!)
+    for (let j = 0; j < mesh.vertexCount; j++) {
+      const p = mesh.positions[j]!
+      const local = applyPoint(mesh.bindposes[0]!, p.x, p.y)
+      const back = applyPoint(setupUnits, local.x, local.y)
+      const spine = applyPoint(poseAt(part, part.animations[0]!, -1)[slotBone]!, positions[j * 2]!, positions[j * 2 + 1]!)
+      expect(Math.hypot(back.x * 100 - spine.x, back.y * 100 - spine.y)).toBeLessThan(0.05)
+    }
+
+    let checked = 0
+    let keysWithShape = 0
+    for (const anim of part.animations) {
+      const curves = readBlendShapeCurves(textOf(`@${anim.name}.anim`)).filter((c) => c.path === 'eyelid')
+      for (const t of anim.timelines) {
+        if (t.kind !== 'deform' || t.owner !== slot) continue
+        const d = t.frames[0] as unknown as { attachment: string; frames: Record<string, unknown>[] }
+        if (d.attachment !== 'eyelid') continue
+        for (const frame of d.frames) {
+          const time = frame['time'] as number
+          const offsets = new Array<number>(positions.length).fill(0)
+          const vs = (frame['vertices'] as number[] | undefined) ?? []
+          const start = Number(frame['start'] ?? 0)
+          vs.forEach((v, i) => (offsets[start + i] = v))
+
+          // 关键帧时刻,曲线正好落在键上:该帧的目标 100,相邻目标 0,其余没有键
+          const weights = new Map<string, number>()
+          for (const c of curves) {
+            const k = c.keys.find((kk) => Math.abs(kk.time - time) < 1e-6)
+            if (k !== undefined) weights.set(c.shape, k.value)
+          }
+          const active = [...weights.values()].filter((v) => v > 1e-6)
+          const deformed = offsets.some((o) => Math.abs(o) > 1e-9)
+          expect(active).toEqual(deformed ? [100] : [])
+          if (deformed) keysWithShape++
+
+          const spinePose = poseAt(part, anim, time)[slotBone]!
+          const unityPose = toUnits(poseAt(part, anim, time, { unityCompatible: true })[slotBone]!)
+          for (let j = 0; j < mesh.vertexCount; j++) {
+            const spine = applyPoint(spinePose, positions[j * 2]! + offsets[j * 2]!, positions[j * 2 + 1]! + offsets[j * 2 + 1]!)
+            let vx = mesh.positions[j]!.x
+            let vy = mesh.positions[j]!.y
+            for (const s of mesh.blendShapes) {
+              const w = (weights.get(s.name) ?? 0) / 100
+              if (w === 0) continue
+              const delta = s.deltas.find((dd) => dd.index === j)
+              if (delta !== undefined) {
+                vx += w * delta.x
+                vy += w * delta.y
+              }
+            }
+            const local = applyPoint(mesh.bindposes[0]!, vx, vy)
+            const world = applyPoint(unityPose, local.x, local.y)
+            expect(Math.hypot(world.x * 100 - spine.x, world.y * 100 - spine.y)).toBeLessThan(0.5)
+            checked++
+          }
+        }
+      }
+    }
+    expect(keysWithShape).toBeGreaterThan(0)
+    expect(checked).toBeGreaterThan(100)
+    expect(mesh.blendShapes.length).toBe(keysWithShape)
+  })
+
   it('有损的地方都报出来了,不静默', () => {
     const kinds = result.issues.map((i) => `${i.level}:${i.path}`)
-    // deform 顶点动画和逐帧绘制顺序 Unity 确实没有对应物,必须报
-    expect(kinds.some((k) => k.startsWith('loss:') && k.includes('deform'))).toBe(true)
+    // deform 现在转成 Blend Shape,不再是 loss;逐帧绘制顺序还没做,必须报
+    expect(kinds.some((k) => k.startsWith('loss:') && k.includes('deform'))).toBe(false)
+    expect(kinds).toContain('info:skinnedMesh')
     expect(kinds.some((k) => k.startsWith('loss:') && k.includes('drawOrder'))).toBe(true)
     // 网格绑定姿势现在是逐骨骼解出来的,不该再有「对不齐」这类近似
     expect(result.issues.filter((i) => i.level === 'approximated').length).toBeLessThan(3)
@@ -576,5 +735,127 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
       if (typeof file.content === 'string') expect(file.content).toBe(first.content)
       else expect([...file.content]).toEqual([...(first.content as Uint8Array)])
     })
+  })
+})
+
+// ─── 加权网格上的 deform:MergeCooking2 的本地样本(不在库里,存在才跑)────────────
+
+const MC2_CUSTOMER = 'E:/UnityProject/MergeCooking2/MergeCooking2/Assets/Export/Spine/NewSpine/Customer1/customer_1.skel.bytes'
+
+/**
+ * 加权网格的 deform 是这条路线里最绕的一步:Spine 的偏移是逐影响、在各自骨骼局部空间存的,
+ * Unity 的增量是网格空间里一个向量。导出器按关键帧时刻的姿势反解增量 —— 这里照 Unity 的规则
+ * (顶点流里前 4 根归一后的权重、加完增量再蒙皮)把写出来的文件算一遍,与 Spine 比对。
+ */
+describe.skipIf(!existsSync(MC2_CUSTOMER))('加权网格的 deform → Blend Shape(MergeCooking2 本地样本)', () => {
+  const dir = MC2_CUSTOMER.slice(0, MC2_CUSTOMER.lastIndexOf('/'))
+  const part = readSkeletonPart(new Uint8Array(readFileSync(MC2_CUSTOMER)))
+  const atlas = parseAtlas(readFileSync(`${dir}/customer_1.atlas.txt`, 'utf8'))
+  const sources = new Map<string, Image>()
+  for (const page of atlas.pages) sources.set(page.name, decodePng(new Uint8Array(readFileSync(`${dir}/${page.name}`))))
+  const result = exportToUnity(part, atlas, sources, { name: 'customer_1', pixelsPerUnit: 100, renderPipeline: 'urp' })
+  const textOf = (suffix: string) => result.files.find((f) => f.path.endsWith(suffix))!.content as string
+
+  it('⭐ 加权网格:按 Unity 的规则(前 4 根归一 + 加完再蒙皮)算出的顶点,关键帧时刻与 Spine 一致', () => {
+    const prefab = readPrefab(textOf('.prefab'))
+    const renderers = readSkinnedRenderers(textOf('.prefab'))
+    expect(renderers.length).toBeGreaterThan(0)
+    const curvesByAnim = new Map(part.animations.map((a) => [a.name, readBlendShapeCurves(textOf(`@${a.name}.anim`))]))
+
+    let checked = 0
+    let weightedMeshes = 0
+    let worst = 0
+    for (const r of renderers) {
+      // Mesh 资产按 guid 找 —— 资产名是 attachment 名,节点名是 slot 名,不一定相同
+      const metaFile = result.files.find((f) => f.path.endsWith('.asset.meta') && (f.content as string).includes(`guid: ${r.meshGuid}`))!
+      const mesh = parseMesh(result.files.find((f) => f.path === metaFile.path.replace(/\.meta$/, ''))!.content as string)
+
+      // 节点名 → slot 与键名(与导出器的 claimName 约定一致;带重名后缀的这里不管)
+      let slotIndex = -1
+      let key = ''
+      part.slots.forEach((s, i) => {
+        if (r.name === s.name) {
+          slotIndex = i
+          key = s.name
+        } else if (r.name.startsWith(`${s.name}__`)) {
+          slotIndex = i
+          key = r.name.slice(s.name.length + 2)
+        }
+      })
+      if (slotIndex < 0) continue
+      const attachment = part.skins.flatMap((s) => s.slots).filter((e) => e.slot === slotIndex).flatMap((e) => e.attachments).find((a) => a.key === key && a.type === 'mesh')
+      if (attachment === undefined) continue
+      const verts = attachment.data['vertices'] as { weighted: boolean; weights: { bone: number; x: number; y: number; weight: number }[][] }
+      if (!verts.weighted) continue
+      weightedMeshes++
+
+      const boneIdx = r.bones.map((id) => part.bones.findIndex((b) => b.name === prefab.nameOf.get(id)))
+      expect(boneIdx.length).toBe(mesh.bindposes.length)
+      expect(boneIdx.every((i) => i >= 0)).toBe(true)
+      const flatLength = verts.weights.reduce((n, w) => n + w.length * 2, 0)
+
+      for (const anim of part.animations) {
+        const curves = curvesByAnim.get(anim.name)!.filter((c) => c.path === r.name)
+        for (const t of anim.timelines) {
+          if (t.kind !== 'deform' || t.owner !== slotIndex) continue
+          const d = t.frames[0] as unknown as { attachment: string; frames: Record<string, unknown>[] }
+          if (d.attachment !== key) continue
+
+          for (const frame of d.frames) {
+            const time = frame['time'] as number
+            const flat = new Array<number>(flatLength).fill(0)
+            const vs = (frame['vertices'] as number[] | undefined) ?? []
+            const start = Number(frame['start'] ?? 0)
+            vs.forEach((v, i) => (flat[start + i] = v))
+            const weights = new Map<string, number>()
+            for (const c of curves) {
+              const k = c.keys.find((kk) => Math.abs(kk.time - time) < 1e-6)
+              if (k !== undefined) weights.set(c.shape, k.value)
+            }
+
+            const poseS = poseAt(part, anim, time)
+            const poseU = poseAt(part, anim, time, { unityCompatible: true }).map(toUnits)
+            let idx = 0
+            for (let j = 0; j < mesh.vertexCount; j++) {
+              // Spine:每个影响在自己骨骼的局部空间加偏移,再按权重混合
+              let sx = 0
+              let sy = 0
+              for (const w of verts.weights[j]!) {
+                const p = applyPoint(poseS[w.bone]!, w.x + flat[idx]!, w.y + flat[idx + 1]!)
+                sx += w.weight * p.x
+                sy += w.weight * p.y
+                idx += 2
+              }
+              // Unity:网格顶点加上形变目标的增量,再用顶点流里的(前 4 根归一)权重蒙皮
+              let vx = mesh.positions[j]!.x
+              let vy = mesh.positions[j]!.y
+              for (const s of mesh.blendShapes) {
+                const w = (weights.get(s.name) ?? 0) / 100
+                if (w === 0) continue
+                const delta = s.deltas.find((dd) => dd.index === j)
+                if (delta !== undefined) {
+                  vx += w * delta.x
+                  vy += w * delta.y
+                }
+              }
+              let ux = 0
+              let uy = 0
+              for (const w of mesh.streamWeights[j]!) {
+                const local = applyPoint(mesh.bindposes[w.bone]!, vx, vy)
+                const world = applyPoint(poseU[boneIdx[w.bone]!]!, local.x, local.y)
+                ux += w.weight * world.x
+                uy += w.weight * world.y
+              }
+              worst = Math.max(worst, Math.hypot(ux * 100 - sx, uy * 100 - sy))
+              checked++
+            }
+          }
+        }
+      }
+    }
+    expect(weightedMeshes).toBeGreaterThan(0)
+    expect(checked).toBeGreaterThan(0)
+    // 顶点超过 4 根骨骼的会被截到 4 根(与 SpriteSkin 一致),那部分差异在这个样本里是亚像素的
+    expect(worst).toBeLessThan(0.5)
   })
 })
