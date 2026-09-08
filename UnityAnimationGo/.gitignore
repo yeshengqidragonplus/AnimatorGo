@@ -1,4 +1,12 @@
-# Unity 生成物 —— 都能从 Assets/ + ProjectSettings/ 重建
+# 这个工程只做本地测试,仓库里只留「能认出这是个 Unity 工程」的骨架:
+#   .gitignore / Packages/ / ProjectSettings/
+# 其余一律不进库。
+
+# 素材与产物 —— 由 res/ 里的授权素材生成,和 res/ 同性质
+/Assets/
+/Assets.meta
+
+# Unity 生成物,都能重建
 /[Ll]ibrary/
 /[Tt]emp/
 /[Oo]bj/
@@ -25,6 +33,7 @@
 *.opendb
 *.VC.db
 .vs/
+.vscode/
 .idea/
 .consulo/
 
@@ -32,8 +41,3 @@
 sysinfo.txt
 *.stackdump
 crashlytics-build.properties
-
-# 转换产物 —— 由 res/ 里的授权素材生成,和 res/ 同性质,不进公开仓库。
-# 需要时用 pnpm unity res/... --out UnityAnimationGo/Assets/AnimatorGo 重新生成。
-/Assets/AnimatorGo/
-/Assets/AnimatorGo.meta

@@ -80,17 +80,23 @@ pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--dry-run]
 pnpm unity res/spine/4.1 --out UnityAnimationGo/Assets/AnimatorGo
 ```
 
-然后在 Unity 里:`Tools ▸ AnimatorGo ▸ 检查转换产物`,或 `▸ 摆一个对比场景`。
+自检脚本的源码在 [tools/unity/AnimatorGoVerify.cs](tools/unity/AnimatorGoVerify.cs),
+拷进 `UnityAnimationGo/Assets/Editor/` 才能用:
 
-检查脚本([AnimatorGoVerify.cs](UnityAnimationGo/Assets/Editor/AnimatorGoVerify.cs))
-盯的是**两类只有 Unity 自己知道、而且都不报错**的问题:
+```bash
+cp tools/unity/AnimatorGoVerify.cs UnityAnimationGo/Assets/Editor/
+```
+
+然后在 Unity 里:`Tools ▸ AnimatorGo ▸ 检查转换产物`,或 `▸ 摆一个对比场景`。
+它盯的是**两类只有 Unity 自己知道、而且都不报错**的问题:
 
 1. **动画曲线的 `path` 指不到真实物体** —— Unity 直接忽略这条曲线,
    表现是「某个部件就是不动」,控制台一声不响
 2. **SpriteSkin 校验不过** —— 网格摊成一团或干脆不显示
 
-⚠️ **`Assets/AnimatorGo/` 是 gitignore 掉的** —— 那是 `res/` 里授权素材转出来的图,
-和 `res/` 同性质,不进公开仓库。需要时重新生成。
+⚠️ **`UnityAnimationGo/Assets/` 整个是 gitignore 掉的**,库里只留
+`Packages/` + `ProjectSettings/` + `README.md` 这层骨架。所以 Unity 侧要写的
+C# 一律放 `tools/unity/`,不要只留在工程里 —— 那等于没进版本控制。
 
 ## 当前进度
 
