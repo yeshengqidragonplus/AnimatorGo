@@ -243,8 +243,10 @@ render/   薄适配层。PixiJS / Godot / Unity / Cocos 各一个
   见 [SPINE-BINARY.md](docs/SPINE-BINARY.md) 7.4 与 `src/spine-format/bezier.ts`
 - **加权网格的绑定姿势不是 setup pose** —— 「第二套」网格是在动画中某个姿势下画的,
   必须从网格自己的逐顶点骨骼坐标反解。见 [UNITY-2D.md](docs/UNITY-2D.md) 第 6 节
-- **Spine 图集可能是按比例导出的**(实测 0.5),`.atlas` 里没记这个数,
-  只能反推,并且要按尺寸加权 —— 小图的整数裁剪框会把估计值带偏
+- ⚠️ **缩放不是全局的** —— 一个网格可以被画成图片的任意倍数。只有**加权网格**
+  没地方放自己的缩放(绑定姿势只有 TR),所以只能由它约束纹理的 `pixelsPerUnit`;
+  region 和不加权网格各自用节点 `localScale` 扛。当成一个全局常数会让个别部件
+  差出几百像素。见 [UNITY-2D.md](docs/UNITY-2D.md) 第 8 节
 - ⚠️ **`.meta` 里有顶点就必须有等量的 `weights`,哪怕这个 sprite 没有骨骼** ——
   Unity 的加载器会无条件读 `m_Weights[0]`,空数组直接 NRE,而这个异常会中断
   整个 sprite 循环,**让排在后面的 sprite 全部拿不到网格**(连带一片

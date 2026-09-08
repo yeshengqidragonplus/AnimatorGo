@@ -374,8 +374,13 @@ export function exportToUnity(
     readonly internalID: number
     /** 加权网格才有,记录 SpriteSkin 要引用的骨骼(骨架下标) */
     readonly skinBones: readonly number[] | null
-    /** 未加权网格才有:骨骼局部 → sprite 空间的刚体变换,节点要反着转回来 */
-    readonly rigid: { rotation: number } | null
+    /**
+     * 未加权网格才有:骨骼局部 → sprite 空间的相似变换。
+     * 节点要把它反过来 —— 旋转取负、缩放取倒数(见下面 nodeScale 的推导)。
+     */
+    readonly rigid: { rotation: number; scale: number } | null
+    /** 刚性网格挂到哪根骨骼上(骨架下标) */
+    readonly rigidBone: number | null
   }
   const sprites = new Map<string, SpriteInfo>()
   const metaSprites: MetaSprite[][] = baked.pages.map(() => [])
@@ -393,7 +398,13 @@ export function exportToUnity(
 
     if (item.attachment.type === 'region') {
       // 未裁剪原图的中心要落在节点原点上 —— pivot 就是中心在裁剪矩形里的归一化位置
-      sprites.set(item.spriteName, { page: rect.page, internalID: internal, skinBones: null, rigid: null })
+      sprites.set(item.spriteName, {
+        page: rect.page,
+        internalID: internal,
+        skinBones: null,
+        rigid: null,
+        rigidBone: null,
+      })
       metaSprites[rect.page]!.push({
         name: item.spriteName,
         rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
@@ -418,12 +429,16 @@ export function exportToUnity(
     const slotBone = part.slots[item.slot]!.bone
     const mesh = bindMesh(item.attachment, region, slotBone, k)
 
-    if (mesh.residual > 0.5) {
+    // 残差按 sprite 跨度的相对值判 —— 500 像素的大图差 2 像素看不出来,
+    // 40 像素的小图差 2 像素就很明显
+    const extent = Math.max(rect.width, rect.height, 1)
+    if (mesh.residual > Math.max(1, extent * 0.02)) {
       issues.add(
         'approximated',
         `mesh.${item.spriteName}`,
-        `绑定姿势拟合残差 ${mesh.residual.toFixed(1)} 像素 —— 该网格不是刚性绑定的,` +
-          'Unity 的 SpriteSkin 只能做刚性蒙皮,形状会有偏差',
+        `绑定姿势拟合残差 ${mesh.residual.toFixed(1)} 像素(占跨度 ` +
+          `${((mesh.residual / extent) * 100).toFixed(1)}%)—— 该网格在绑定姿势下` +
+          '就不是刚性的(多半是刻意做的透视/形变),Unity 的 SpriteSkin 只能刚性蒙皮',
       )
     }
     if (mesh.undetermined.length > 0) {
@@ -481,6 +496,7 @@ export function exportToUnity(
       internalID: internal,
       skinBones: mesh.bindPose === null ? null : subset,
       rigid: mesh.rigid,
+      rigidBone: mesh.rigidBone,
     })
     metaSprites[rect.page]!.push({
       name: item.spriteName,
@@ -568,10 +584,21 @@ export function exportToUnity(
         bones: info.skinBones.map((b) => boneNode[b]!),
       }
     } else if (item.attachment.type === 'mesh') {
-      // 未加权网格:整块跟着 slot 的骨骼刚性移动。
-      // pivot 已经吃掉了平移,这里只要把拟合出的旋转转回去
-      parent = boneNode[slot.bone]!
+      // 未加权网格:整块跟着 slot 的骨骼刚性移动。pivot 已经吃掉了平移,
+      // 节点只要把拟合出的旋转和缩放反过来。
+      //
+      // 推导(f 是 bindMesh 拟合出的缩放,注意它的输入已经除过 k 了):
+      //     metaVertex = f·R(θ)·(骨骼局部 / k) + t
+      //     sprite 局部 = (metaVertex − pivot) / ppu纹理,pivot 取 t,ppu纹理 = ppu / k
+      //                 = f·R(θ)·骨骼局部 / ppu
+      // 想让最终落在 骨骼局部 / ppu,所以节点 = 转 −θ、缩放 1/f。
+      // ⚠️ **不要再乘一次 k** —— 拟合的输入里已经含了。
+      // ⚠️ 挂到**顶点所属的那根骨骼**,不是 slot 的骨骼 —— 加权网格里两者可以不同
+      parent = boneNode[info.rigidBone ?? slot.bone]!
       rotation = degreesToQuaternionZ(-(info.rigid?.rotation ?? 0))
+      const f = info.rigid?.scale ?? 1
+      const inv = Math.abs(f) > 1e-9 ? 1 / f : 1
+      nodeScale = { x: inv, y: inv, z: 1 }
     } else {
       parent = boneNode[slot.bone]!
       const data = item.attachment.data

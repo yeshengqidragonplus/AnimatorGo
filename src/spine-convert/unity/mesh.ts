@@ -124,14 +124,56 @@ export function meshVertices(attachment: Attachment, region: AtlasRegion): { x: 
 }
 
 /**
- * 估算图集缩放 k(骨架单位 ÷ 图集像素)。
+ * 这个网格是不是**其实刚性**的 —— 所有顶点都只挂同一根骨骼。
  *
- * 网格用「整体相似变换」的缩放,只在拟合站得住脚时才采信;
- * region attachment 直接用 `width / originalWidth`。
+ * Spine 里「加权」只表示它走过绑定流程,不代表真的做了混合。实测
+ * MergeCooking2 的 `EatingHotDogs/Ahand_R2`:加权、但只有 1 根骨骼、
+ * 每顶点 1 根 —— 和不加权网格没有区别,整块跟着那根骨骼动。
  *
- * ⚠️ **必须按尺寸加权。** 图集里的裁剪框是整数像素,小图的比值被量化误差主导 ——
- * 11×11 的气泡算出来是 1.909,而 400 像素宽的身体算出来是 1.9998。
- * 不加权的话小图会把中位数拽偏,还会误报「缩放不一致」。
+ * 这件事很重要:**只有真正做了多骨骼混合的网格才没地方放自己的缩放**
+ * (绑定姿势只有旋转和平移)。刚性的那些可以用节点 `localScale` 扛,
+ * 不该让它们去约束纹理的 `pixelsPerUnit` —— `Ahand_R2` 自己要 k=4.5,
+ * 而同一个骨架的全局 k 是 1.0,把它算进去就是 350% 的离散。
+ *
+ * 返回那根唯一的骨骼下标;不是刚性就返回 null。
+ */
+export function rigidBoneOf(verts: SpineVertices): number | null {
+  if (!verts.weighted) return null
+  let only: number | null = null
+  for (const entry of verts.weights) {
+    const active = entry.filter((w) => w.weight > 0)
+    // 一个顶点挂了两根以上 → 真的在混合
+    if (active.length > 1) return null
+    const bone = (active[0] ?? entry[0])?.bone
+    if (bone === undefined) return null
+    if (only === null) only = bone
+    else if (only !== bone) return null
+  }
+  return only
+}
+
+/**
+ * 估算 `spritePixelsToUnits` 要用的缩放 k(骨架单位 ÷ 图集像素)。
+ *
+ * ⚠️⚠️ **只能让加权网格投票。**
+ *
+ * 一开始我把 k 当成「整张图集的导出缩放」,一个常数。**那是错的** ——
+ * 一个网格可以被画成图片的任意倍数,那个倍数就藏在顶点里,与图集无关。
+ * 实测 MergeCooking2 的 `26301`:67 个 region 都要 k=1.0,唯一那个 `house`
+ * 网格要 k=2.0,按中位数选 1.0 之后 house 的残差是 **372 像素**。
+ *
+ * 真正的分解是「谁没有别的地方放缩放」:
+ *
+ * | 类型 | 自己的缩放放哪 |
+ * |---|---|
+ * | **加权网格** | 没地方放 —— 绑定姿势只有旋转和平移,只能靠纹理的 ppu。**它才约束 k** |
+ * | 不加权网格 | 有自己的节点 Transform,`localScale` 扛得住 |
+ * | region | 同上,本来就按 `width / originalWidth` 算节点缩放 |
+ *
+ * 一个加权网格都没有时,k 完全不受约束,取 1。
+ *
+ * ⚠️ **按尺寸加权取中位数。** 裁剪框是整数像素,小图的比值被量化误差主导 ——
+ * 11×11 的气泡算出来 1.909,400 像素宽的身体算出来 1.9998。
  */
 export function estimateAtlasScale(
   samples: readonly { attachment: Attachment; region: AtlasRegion }[],
@@ -140,30 +182,15 @@ export function estimateAtlasScale(
   const values: { value: number; weight: number }[] = []
 
   for (const { attachment, region } of samples) {
-    if (attachment.type === 'region') {
-      if (region.originalWidth > 0) {
-        values.push({ value: (attachment.data['width'] as number) / region.originalWidth, weight: region.originalWidth })
-      }
-      if (region.originalHeight > 0) {
-        values.push({ value: (attachment.data['height'] as number) / region.originalHeight, weight: region.originalHeight })
-      }
-      continue
-    }
+    if (attachment.type !== 'mesh') continue
+    const verts = attachment.data['vertices'] as SpineVertices | undefined
+    if (verts === undefined) continue
+    // region、不加权网格、以及「其实刚性」的加权网格,各自的缩放都由
+    // 节点 Transform 承担 —— 只有真正做了混合的才约束 k
+    if (!verts.weighted || rigidBoneOf(verts) !== null) continue
 
-    const verts = attachment.data['vertices'] as SpineVertices
     const target = meshVertices(attachment, region)
-    if (!verts.weighted) {
-      const src: { x: number; y: number }[] = []
-      for (let i = 0; i < target.length; i++) {
-        src.push({ x: verts.positions[i * 2]!, y: verts.positions[i * 2 + 1]! })
-      }
-      // 未加权网格整块是刚性的,拟合出的缩放可以直接采信
-      const { fit, determined } = fitSimilarity(src, target)
-      if (determined && fit.scale > 1e-6) values.push({ value: 1 / fit.scale, weight: extentOf(target) })
-      continue
-    }
-
-    // 加权网格逐骨骼拟合 —— 不依赖骨架当前姿势,所以「第二套」网格也算得准
+    // 逐骨骼拟合 —— 不依赖骨架当前姿势,所以「第二套」网格也算得准
     for (const [, pairs] of groupByBone(verts, target)) {
       if (pairs.src.length < 2) continue
       const { fit, determined } = fitSimilarity(pairs.src, pairs.dst)
@@ -233,8 +260,10 @@ export interface MeshBinding {
   readonly triangles: readonly number[]
   /** 加权网格:骨架下标 → 该骨骼在 sprite 像素空间里的绑定姿势 */
   readonly bindPose: ReadonlyMap<number, Fit> | null
-  /** 未加权网格:整块的刚体变换(骨骼局部 → sprite 像素) */
+  /** 刚性网格(不加权,或所有顶点都挂同一根骨骼):整块的相似变换 */
   readonly rigid: Fit | null
+  /** 刚性网格挂到哪根骨骼上。不加权时是 slot 的骨骼,加权时是那根唯一的骨骼 */
+  readonly rigidBone: number | null
   /** 每顶点的骨骼影响,加权时才有内容 */
   readonly influences: readonly (readonly { bone: number; weight: number }[])[]
   /** 用拟合结果重建顶点的最大误差(sprite 像素) */
@@ -259,12 +288,19 @@ export function bindMesh(
   const triangles = attachment.data['triangles'] as number[]
   const vertices = meshVertices(attachment, region)
 
-  if (!verts.weighted) {
+  // ── 刚性网格:不加权,或者所有顶点都挂同一根骨骼 ──
+  const rigidBone = verts.weighted ? rigidBoneOf(verts) : slotBone
+  if (rigidBone !== null) {
+    // ⚠️ 缩放**自由拟合**,不锁 1。刚性网格有自己的节点 Transform,
+    // 它被画成图片的多少倍与图集缩放无关 —— 锁成 1 会把这个倍数当成误差。
     const src: { x: number; y: number }[] = []
     for (let i = 0; i < vertices.length; i++) {
-      src.push({ x: verts.positions[i * 2]! / atlasScale, y: verts.positions[i * 2 + 1]! / atlasScale })
+      const local = verts.weighted
+        ? { x: verts.weights[i]![0]!.x, y: verts.weights[i]![0]!.y }
+        : { x: verts.positions[i * 2]!, y: verts.positions[i * 2 + 1]! }
+      src.push({ x: local.x / atlasScale, y: local.y / atlasScale })
     }
-    const { fit } = fitSimilarity(src, vertices, 1)
+    const { fit } = fitSimilarity(src, vertices)
     let residual = 0
     for (let i = 0; i < src.length; i++) {
       const p = applyFit(fit, src[i]!.x, src[i]!.y)
@@ -275,7 +311,8 @@ export function bindMesh(
       triangles,
       bindPose: null,
       rigid: fit,
-      influences: vertices.map(() => [{ bone: slotBone, weight: 1 }]),
+      rigidBone,
+      influences: vertices.map(() => [{ bone: rigidBone, weight: 1 }]),
       residual,
       undetermined: [],
     }
@@ -336,6 +373,7 @@ export function bindMesh(
     triangles,
     bindPose,
     rigid: null,
+    rigidBone: null,
     influences: verts.weights.map((entry) => entry.map((w) => ({ bone: w.bone, weight: w.weight }))),
     residual,
     undetermined,
