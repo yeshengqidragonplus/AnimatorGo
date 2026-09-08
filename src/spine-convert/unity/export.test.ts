@@ -295,6 +295,27 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
     }
   })
 
+  /**
+   * ⚠️ **一个 sprite 的 vertices / indices 为空,会把它后面所有 sprite 的
+   * 网格数据一起带塌。** 实测:16 个 sprite 里空的那个(region attachment)排第 3,
+   * 结果第 1、2 个正常拿到自定义网格,第 3 个之后全被 Unity 用 alpha 轮廓重新生成,
+   * 连带 12 个 SpriteSkin 报 InvalidBoneWeights。
+   *
+   * 所以 region 也要写一个铺满矩形的四顶点网格。
+   */
+  it('⭐ 没有任何 sprite 的顶点为空(空的会连累后面所有 sprite)', () => {
+    const text = textOf('.png.meta')
+    // sprite 条目缩进 6 空格;缩进 4 空格的那条是「单图模式」的默认块,在最后,无害
+    expect(text).not.toMatch(/^ {6}vertices: \[]$/m)
+    expect(text).not.toMatch(/^ {6}indices: *$/m)
+
+    const meta = readMeta(text)
+    for (const sprite of meta.sprites) {
+      expect(sprite.vertices.length, `${sprite.name} 顶点为空`).toBeGreaterThanOrEqual(3)
+      expect(sprite.triangles.length, `${sprite.name} 没有三角形`).toBeGreaterThanOrEqual(3)
+    }
+  })
+
   it('三角形下标不越界', () => {
     const meta = readMeta(textOf('.png.meta'))
     for (const sprite of meta.sprites) {

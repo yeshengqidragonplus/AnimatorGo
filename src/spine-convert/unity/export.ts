@@ -186,6 +186,27 @@ function sanitize(name: string): string {
   return name.replace(/[\\/:*?"<>|]/g, '_')
 }
 
+/**
+ * 铺满矩形的四顶点网格。
+ *
+ * region attachment 本来不需要自定义网格,但 **`.meta` 里任何一个 sprite 的
+ * `vertices` / `indices` 为空,都会让它后面所有 sprite 的网格数据失效**
+ * (实测:16 个 sprite 里空的那个排第 3,结果 1、2 正常,3 之后全被 Unity
+ * 用 alpha 轮廓重新生成)。所以一律写满。
+ *
+ * 顶点在矩形局部像素空间,原点左下。2D sprite 默认不做背面剔除,绕序无所谓。
+ */
+const QUAD_TRIANGLES = [0, 1, 2, 2, 3, 0] as const
+
+function rectQuad(width: number, height: number): { x: number; y: number }[] {
+  return [
+    { x: 0, y: 0 },
+    { x: width, y: 0 },
+    { x: width, y: height },
+    { x: 0, y: height },
+  ]
+}
+
 /** 每顶点最多 4 根骨骼 —— 取权重最大的四根,重新归一化 */
 function topFour(
   influences: readonly { bone: number; weight: number }[],
@@ -374,8 +395,11 @@ export function exportToUnity(
         },
         spriteID,
         internalID: internal,
-        vertices: [],
-        triangles: [],
+        // ⚠️ **每个 sprite 都要显式给网格,一个都不能空。** 见 writeMeta.ts 的说明:
+        // 空的 vertices / indices 会把它**后面**所有 sprite 的网格数据一起带塌。
+        // 顺带好处是 Unity 的 alpha 轮廓生成完全不参与,产物是确定的。
+        vertices: rectQuad(rect.width, rect.height),
+        triangles: [...QUAD_TRIANGLES],
         bones: [],
         weights: [],
       })

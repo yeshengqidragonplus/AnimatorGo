@@ -232,6 +232,34 @@ inWeight (k1) = (t1 - cx2) / (t1 - t0)
 (每根各记自己的世界变换)。`SpriteSkin` 只校验数量对得上、引用非空
 (见包里的 `SpriteSkinUtility.Validate`),不要求层级。
 
+## 6.5 ⚠️⚠️ 任何一个 sprite 的网格为空,会连累它**后面所有** sprite
+
+`.meta` 里 `spriteSheet.sprites` 是个序列。**其中任何一条的 `vertices: []` +
+`indices:`(空值),会让它之后所有 sprite 的网格数据失效** —— Unity 转而用
+alpha 轮廓重新生成网格,而且不报任何错。
+
+实测(MX2_cat,16 个 sprite):唯一为空的是排第 3 的 region attachment,结果:
+
+| 位置 | sprite | 我们写的顶点 | Unity 实际 |
+|---|---|---|---|
+| 1 | body | 34 | **34** ✅ |
+| 2 | body2 | 48 | **48** ✅ |
+| 3 | bubble | 0(空) | 4 |
+| 4 | eyelid | 56 | 7 ✗ |
+| 5 | glass | 34 | 8 ✗ |
+| 6 | head | 70 | 10 ✗ |
+
+连带后果是 **12 个 SpriteSkin 报 `InvalidBoneWeights`** —— 因为顶点被换掉了,
+权重数组也跟着不是我们的了。两个症状,一个根因。
+
+真实样本里从没暴露过这一点:那份 `.meta` 的每个 sprite 都有网格,
+空的 `vertices: []` / `indices:` 只出现在最末尾的「单图模式」默认块里,
+后面没有别的 sprite 了。
+
+**做法:每个 sprite 都写显式网格,一个都不留空。** region attachment 用一个
+铺满矩形的四顶点网格即可。顺带好处是 Unity 的 alpha 轮廓生成完全不参与,
+产物变成确定的 —— 不会因为图片边缘的一点 alpha 差异而改变网格。
+
 ## 7. ⚠️ 顶点位置和 UV 在 Unity 里是绑死的
 
 Unity 的 sprite 网格**只存顶点位置**,UV 由「顶点在矩形里的位置」推出来。
