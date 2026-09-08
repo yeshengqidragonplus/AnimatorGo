@@ -1,0 +1,39 @@
+# Unity 生成物 —— 都能从 Assets/ + ProjectSettings/ 重建
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+/[Mm]emoryCaptures/
+/[Rr]ecordings/
+
+# IDE 生成的工程文件
+*.csproj
+*.unityproj
+*.sln
+*.slnx
+*.suo
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+.vs/
+.idea/
+.consulo/
+
+# 崩溃日志
+sysinfo.txt
+*.stackdump
+crashlytics-build.properties
+
+# 转换产物 —— 由 res/ 里的授权素材生成,和 res/ 同性质,不进公开仓库。
+# 需要时用 pnpm unity res/... --out UnityAnimationGo/Assets/AnimatorGo 重新生成。
+/Assets/AnimatorGo/
+/Assets/AnimatorGo.meta

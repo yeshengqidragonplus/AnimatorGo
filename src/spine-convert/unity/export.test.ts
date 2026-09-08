@@ -246,7 +246,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
   const part = readSkeletonPart(new Uint8Array(readFileSync(SKELETON)))
   const atlas = parseAtlas(readFileSync(ATLAS, 'utf8'))
   const sources = new Map<string, Image>([['MX2_cat.png', decodePng(new Uint8Array(readFileSync(PAGE)))]])
-  const result = exportToUnity(part, atlas, sources, { name: 'MX2_cat', pixelsPerUnit: 100 })
+  const result = exportToUnity(part, atlas, sources, { name: 'MX2_cat', pixelsPerUnit: 100, renderPipeline: 'urp' })
 
   const fileOf = (suffix: string): UnityFile =>
     result.files.find((f) => f.path.endsWith(suffix)) ?? (() => { throw new Error(`没产出 ${suffix}`) })()
@@ -523,14 +523,14 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
       part38,
       parseAtlas(readFileSync(atlas38, 'utf8')),
       new Map([['MX2_cat.png', decodePng(new Uint8Array(readFileSync(page38)))]]),
-      { name: 'MX2_cat', pixelsPerUnit: 100 },
+      { name: 'MX2_cat', pixelsPerUnit: 100, renderPipeline: 'urp' },
     )
     const degraded = out.issues.filter((i) => i.message.includes('退化为线性'))
     expect(degraded).toEqual([])
   })
 
   it('两次导出逐字节相同 —— 否则 Unity 里的引用会断', () => {
-    const again = exportToUnity(part, atlas, sources, { name: 'MX2_cat', pixelsPerUnit: 100 })
+    const again = exportToUnity(part, atlas, sources, { name: 'MX2_cat', pixelsPerUnit: 100, renderPipeline: 'urp' })
     expect(again.files.length).toBe(result.files.length)
     again.files.forEach((file, i) => {
       const first = result.files[i]!

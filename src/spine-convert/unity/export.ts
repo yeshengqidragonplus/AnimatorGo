@@ -11,7 +11,7 @@ import {
   type UnityKeyframe,
 } from '../../unity/curve.ts'
 import { writeAnim, type FloatCurve, type Vector3Curve } from '../../unity/writeAnim.ts'
-import { writePrefab, type PrefabNode, type RendererSpec, type SkinSpec } from '../../unity/writePrefab.ts'
+import { writePrefab, type PrefabNode, type RenderPipeline, type RendererSpec, type SkinSpec } from '../../unity/writePrefab.ts'
 import { writeController, CLIP_FILE_ID } from '../../unity/writeController.ts'
 import { writeNativeMeta, writePrefabMeta, writeTextureMeta, type MetaBone, type MetaSprite, type MetaWeight } from '../../unity/writeMeta.ts'
 import { unityGuid, internalId, uniqueIds } from '../../unity/ids.ts'
@@ -49,6 +49,8 @@ export interface UnityExportOptions {
   readonly name: string
   /** Spine 像素 → Unity 世界单位的换算,Unity 导入图片时的默认值是 100 */
   readonly pixelsPerUnit: number
+  /** 决定 SpriteRenderer 用哪个默认材质 —— 给错了整个角色是粉红的 */
+  readonly renderPipeline: RenderPipeline
 }
 
 export interface UnityFile {
@@ -783,6 +785,7 @@ export function exportToUnity(
     content: writePrefab(nodes, {
       seed: name,
       controller: part.animations.length === 0 ? null : { fileID: 9100000, guid: controllerGuid },
+      renderPipeline: options.renderPipeline,
     }),
   })
   files.push({ path: `${name}.prefab.meta`, content: writePrefabMeta(prefabGuid) })

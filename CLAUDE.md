@@ -65,8 +65,32 @@ pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--dry-run]
 ⚠️ **不是把原图集直接切 sprite**,而是重新烘焙一张正立的 —— Spine 图集里的区域
 可以躺着放,Unity 的 sprite 矩形不能。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 9 节。
 
+`--rp` 不给的话会**从输出目录往上找 Unity 工程的 `Packages/manifest.json`**
+自己判断内置管线还是 URP —— 两套的默认 sprite 材质不是同一个,给错了整个角色是粉红的。
+
 跑单个测试文件:`pnpm exec vitest run src/core/math.test.ts`
 跑单个用例:`pnpm exec vitest run -t "旋转差值走最短路径"`
+
+## Unity 侧的验证工程
+
+`UnityAnimationGo/` 是一个 Unity 6000.3 + URP + 2D Animation 13.0.2 的空工程,
+**专门用来验转换产物**,不是要在里面做功能。
+
+```bash
+pnpm unity res/spine/4.1 --out UnityAnimationGo/Assets/AnimatorGo
+```
+
+然后在 Unity 里:`Tools ▸ AnimatorGo ▸ 检查转换产物`,或 `▸ 摆一个对比场景`。
+
+检查脚本([AnimatorGoVerify.cs](UnityAnimationGo/Assets/Editor/AnimatorGoVerify.cs))
+盯的是**两类只有 Unity 自己知道、而且都不报错**的问题:
+
+1. **动画曲线的 `path` 指不到真实物体** —— Unity 直接忽略这条曲线,
+   表现是「某个部件就是不动」,控制台一声不响
+2. **SpriteSkin 校验不过** —— 网格摊成一团或干脆不显示
+
+⚠️ **`Assets/AnimatorGo/` 是 gitignore 掉的** —— 那是 `res/` 里授权素材转出来的图,
+和 `res/` 同性质,不进公开仓库。需要时重新生成。
 
 ## 当前进度
 

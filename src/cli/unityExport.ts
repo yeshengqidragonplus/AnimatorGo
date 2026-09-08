@@ -5,13 +5,14 @@ import { fromJsonText } from '../spine-format/json/fromJson.ts'
 import { parseAtlas } from '../core/atlas.ts'
 import { decodePng, type Image } from '../unity/png.ts'
 import { exportToUnity } from '../spine-convert/unity/export.ts'
+import type { RenderPipeline } from '../unity/writePrefab.ts'
 import type { ConversionIssue } from '../spine-convert/types.ts'
 
 /**
  * Spine → Unity 2D Animation 的命令行入口。
  *
  * ```
- * pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--dry-run]
+ * pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--dry-run]
  * ```
  *
  * 每个骨架产出一套可以**直接拖进 Assets 就能播**的资源:
@@ -30,6 +31,8 @@ interface Options {
   readonly dryRun: boolean
   /** 显式指定图集;null 表示按文件名去找 */
   readonly atlas: string | null
+  /** null 表示从输出目录所在的 Unity 工程自动认 */
+  readonly renderPipeline: RenderPipeline | null
 }
 
 function parseArgs(argv: readonly string[]): Options | string {
@@ -62,6 +65,9 @@ function parseArgs(argv: readonly string[]): Options | string {
   const atlas = flags.get('atlas') ?? null
   if (atlas !== null && !existsSync(atlas)) return `图集不存在:${atlas}`
 
+  const rp = flags.get('rp') ?? null
+  if (rp !== null && rp !== 'urp' && rp !== 'builtin') return `--rp 只能是 urp 或 builtin,收到 "${rp}"`
+
   const resolved = resolve(input)
   const base = statSync(resolved).isDirectory() ? resolved : dirname(resolved)
 
@@ -71,6 +77,7 @@ function parseArgs(argv: readonly string[]): Options | string {
     pixelsPerUnit: ppu,
     dryRun: flags.has('dry-run'),
     atlas: atlas === null ? null : resolve(atlas),
+    renderPipeline: rp as RenderPipeline | null,
   }
 }
 
@@ -149,6 +156,29 @@ function findAtlas(skeleton: string): { path: string; guessed: boolean } | null 
   return null
 }
 
+/**
+ * 从输出目录往上找 Unity 工程,看它用的是哪套渲染管线。
+ *
+ * ⚠️ **两套管线的默认 sprite 材质不是同一个**,给错了整个角色是粉红的。
+ * 输出目录通常就在 `Assets/` 下面,所以往上走能找到 `Packages/manifest.json`。
+ * 找不到就按内置管线 —— 那是 Unity 的默认。
+ */
+function detectRenderPipeline(outDir: string): { pipeline: RenderPipeline; from: string | null } {
+  let dir = resolve(outDir)
+  for (let up = 0; up < 12; up++) {
+    const manifest = join(dir, 'Packages', 'manifest.json')
+    if (existsSync(manifest)) {
+      const text = readFileSync(manifest, 'utf8')
+      const urp = text.includes('com.unity.render-pipelines.universal')
+      return { pipeline: urp ? 'urp' : 'builtin', from: manifest }
+    }
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return { pipeline: 'builtin', from: null }
+}
+
 function describe(issue: ConversionIssue): string {
   const mark = issue.level === 'loss' ? '✗' : issue.level === 'approximated' ? '≈' : 'ℹ'
   return `    ${mark} ${issue.path}:${issue.message}`
@@ -157,7 +187,7 @@ function describe(issue: ConversionIssue): string {
 function main(): void {
   const parsed = parseArgs(process.argv.slice(2))
   if (typeof parsed === 'string') {
-    console.error(`✗ ${parsed}\n\n用法:pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--dry-run]`)
+    console.error(`✗ ${parsed}\n\n用法:pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--dry-run]`)
     process.exitCode = 1
     return
   }
@@ -169,8 +199,15 @@ function main(): void {
     return
   }
 
+  const detected = detectRenderPipeline(parsed.out)
+  const pipeline = parsed.renderPipeline ?? detected.pipeline
+
   console.log(`Spine → Unity 2D Animation,共 ${files.length} 个骨架`)
-  console.log(`输出:${parsed.out}${parsed.dryRun ? '(试运行,不写文件)' : ''}\n`)
+  console.log(`输出:${parsed.out}${parsed.dryRun ? '(试运行,不写文件)' : ''}`)
+  if (parsed.renderPipeline !== null) console.log(`渲染管线:${pipeline}(命令行指定)`)
+  else if (detected.from !== null) console.log(`渲染管线:${pipeline}(认自 ${detected.from})`)
+  else console.log(`渲染管线:${pipeline}(输出目录不在 Unity 工程里,按默认;不对就加 --rp)`)
+  console.log()
 
   let failed = 0
   const counts: Record<string, number> = {}
@@ -202,7 +239,11 @@ function main(): void {
         sources.set(page.name, decodePng(new Uint8Array(readFileSync(pagePath))))
       }
 
-      const result = exportToUnity(part, atlas, sources, { name: stem, pixelsPerUnit: parsed.pixelsPerUnit })
+      const result = exportToUnity(part, atlas, sources, {
+        name: stem,
+        pixelsPerUnit: parsed.pixelsPerUnit,
+        renderPipeline: pipeline,
+      })
 
       const dir = join(parsed.out, stem)
       if (!parsed.dryRun) {

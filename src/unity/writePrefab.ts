@@ -27,8 +27,18 @@ export const CLASS_SPRITE_RENDERER = 212
  */
 export const SPRITE_SKIN_SCRIPT_GUID = '57c008f954fe54a8bb972de1018a2cb8'
 
-/** Unity 内置的 Sprites-Default 材质 */
-const DEFAULT_SPRITE_MATERIAL = '{fileID: 10754, guid: 0000000000000000f000000000000000, type: 0}'
+/**
+ * 默认 sprite 材质。**两套渲染管线不是同一个**,给错了整个角色是粉红的。
+ *
+ * - 内置管线:`Sprites-Default`,在 Unity 的内置资源里(guid 全零)
+ * - URP:`Sprite-Unlit-Default`,随 URP 包发布(包内资源 guid 跨工程稳定)
+ */
+export const SPRITE_MATERIALS = {
+  builtin: '{fileID: 10754, guid: 0000000000000000f000000000000000, type: 0}',
+  urp: '{fileID: 2100000, guid: 9dfc825aed78fcd4ba02077103263b40, type: 2}',
+} as const
+
+export type RenderPipeline = keyof typeof SPRITE_MATERIALS
 
 export interface AssetRef {
   readonly fileID: number
@@ -66,6 +76,7 @@ export interface PrefabOptions {
   readonly seed: string
   /** 挂在根节点上的 AnimatorController;不需要就传 null */
   readonly controller: AssetRef | null
+  readonly renderPipeline: RenderPipeline
 }
 
 const v3 = (v: { x: number; y: number; z: number }) =>
@@ -188,7 +199,7 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
           '  m_RenderingLayerMask: 1',
           '  m_RendererPriority: 0',
           '  m_Materials:',
-          `  - ${DEFAULT_SPRITE_MATERIAL}`,
+          `  - ${SPRITE_MATERIALS[options.renderPipeline]}`,
           '  m_StaticBatchInfo:',
           '    firstSubMesh: 0',
           '    subMeshCount: 0',
