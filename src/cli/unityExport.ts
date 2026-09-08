@@ -90,9 +90,27 @@ function stemOf(file: string): string {
   return name.slice(0, -extname(name).length)
 }
 
+/**
+ * 是不是骨架文件。
+ *
+ * ⚠️ **`.json` 不能只看后缀。** 工程里满是 `areas.json`、`locale_loading_de.json`
+ * 这类游戏配置和本地化文件 —— 实测 MergeCooking2 下 751 个候选里 200 多个是这种,
+ * 全当成骨架去转,报出来的「失败」把真正的失败埋掉了。
+ *
+ * Spine JSON 顶层一定有 `"skeleton": { "spine": "4.1.23", ... }`,认这个就够。
+ */
 function isSkeleton(file: string): boolean {
   const lower = file.toLowerCase()
-  return SKEL_SUFFIXES.some((s) => lower.endsWith(s)) || lower.endsWith(JSON_SUFFIX)
+  if (SKEL_SUFFIXES.some((s) => lower.endsWith(s))) return true
+  if (!lower.endsWith(JSON_SUFFIX)) return false
+
+  try {
+    // 只读开头一段 —— Spine 把 skeleton 写在最前面,不必为几 MB 的配置全文解析
+    const head = readFileSync(file, 'utf8').slice(0, 4096)
+    return /"skeleton"\s*:\s*\{/.test(head) && /"spine"\s*:\s*"/.test(head)
+  } catch {
+    return false
+  }
 }
 
 function collect(input: string): string[] {
@@ -179,9 +197,36 @@ function detectRenderPipeline(outDir: string): { pipeline: RenderPipeline; from:
   return { pipeline: 'builtin', from: null }
 }
 
+const MARKS: Record<string, string> = { loss: '✗', approximated: '≈', info: 'ℹ' }
+
 function describe(issue: ConversionIssue): string {
-  const mark = issue.level === 'loss' ? '✗' : issue.level === 'approximated' ? '≈' : 'ℹ'
-  return `    ${mark} ${issue.path}:${issue.message}`
+  return `    ${MARKS[issue.level] ?? '·'} ${issue.path}:${issue.message}`
+}
+
+/**
+ * 把消息里的具体数字抹成 N,好让「同一类问题」归到一起。
+ *
+ * 批量跑几百个骨架时,逐条列问题没法看 —— 要的是「哪类问题涉及多少个骨架」,
+ * 那才能排优先级。
+ */
+const normalize = (message: string) => message.replace(/-?\d+(\.\d+)?/g, 'N')
+
+interface Tally {
+  readonly level: string
+  readonly sample: string
+  count: number
+  readonly files: Set<string>
+}
+
+/** 按问题类别归并后的排行榜,涉及骨架最多的排前面 */
+function summarize(tallies: ReadonlyMap<string, Tally>, title: string): string[] {
+  if (tallies.size === 0) return []
+  const rows = [...tallies.values()].sort((a, b) => b.files.size - a.files.size || b.count - a.count)
+  return [
+    '',
+    `── ${title} ──`,
+    ...rows.map((r) => `  ${MARKS[r.level] ?? '·'} ${r.files.size} 个骨架 / ${r.count} 处  ${r.sample}`),
+  ]
 }
 
 function main(): void {
@@ -211,6 +256,20 @@ function main(): void {
 
   let failed = 0
   const counts: Record<string, number> = {}
+  const issueTally = new Map<string, Tally>()
+  const failTally = new Map<string, Tally>()
+  const versions = new Map<string, number>()
+
+  const tally = (map: Map<string, Tally>, level: string, message: string, file: string) => {
+    const key = `${level} ${normalize(message)}`
+    let row = map.get(key)
+    if (row === undefined) {
+      row = { level, sample: message, count: 0, files: new Set() }
+      map.set(key, row)
+    }
+    row.count++
+    row.files.add(file)
+  }
 
   for (const file of files) {
     const stem = stemOf(file)
@@ -255,13 +314,31 @@ function main(): void {
         }
       }
 
-      for (const issue of result.issues) counts[issue.level] = (counts[issue.level] ?? 0) + 1
+      for (const issue of result.issues) {
+        counts[issue.level] = (counts[issue.level] ?? 0) + 1
+        tally(issueTally, issue.level, issue.message, file)
+      }
+      versions.set(part.header.version, (versions.get(part.header.version) ?? 0) + 1)
       const anims = result.files.filter((f) => f.path.endsWith('.anim')).length
       console.log(`    → ${result.files.length} 个文件,${anims} 条动画`)
       for (const issue of result.issues) console.log(describe(issue))
     } catch (error) {
       failed++
-      console.log(`    ✗ ${error instanceof Error ? error.message : String(error)}`)
+      const message = error instanceof Error ? error.message : String(error)
+      console.log(`    ✗ ${message}`)
+      tally(failTally, 'loss', message, file)
+    }
+  }
+
+  // 批量跑的时候,末尾的排行榜才是有用的东西 —— 几百个骨架的逐行输出没法看
+  if (files.length > 1) {
+    for (const line of summarize(failTally, '转换失败,按涉及骨架数排')) console.log(line)
+    for (const line of summarize(issueTally, '有损与近似,按涉及骨架数排')) console.log(line)
+    if (versions.size > 0) {
+      const list = [...versions.entries()].sort((a, b) => b[1] - a[1]).map(([v, n]) => `${v} × ${n}`)
+      console.log(`
+── Spine 版本 ──
+  ${list.join('   ')}`)
     }
   }
 

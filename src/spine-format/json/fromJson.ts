@@ -460,7 +460,15 @@ function animationFromJson(
 
 export function fromJson(root: Json, major?: SpineMajor): SkeletonPart {
   const skeleton = (root['skeleton'] as Json) ?? {}
-  const version = str(skeleton['spine']) ?? '4.1.23'
+  const version = str(skeleton['spine'])
+
+  // ⚠️ **不是 Spine 骨架就当场报错,别默认成 4.1 的空骨架。**
+  // 实测在 MergeCooking2 上批量跑,`areas.json` / `locale_loading_de.json` 这类
+  // 游戏配置和本地化文件全被当成骨架读进来了,一路到「找不到图集」才失败 ——
+  // 216 个「失败」里绝大多数是这个,把真正的失败埋掉了。
+  if (version === null) {
+    throw new Error('不是 Spine 骨架 JSON —— 顶层没有 skeleton.spine 版本号')
+  }
   const resolved: SpineMajor = major ?? (version.startsWith('3.') ? '3.8' : '4.x')
   const is38 = resolved === '3.8'
   const table = new StringTable()
