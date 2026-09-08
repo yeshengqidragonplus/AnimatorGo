@@ -245,6 +245,7 @@ render/   薄适配层。PixiJS / Godot / Unity / Cocos 各一个
   必须从网格自己的逐顶点骨骼坐标反解。见 [UNITY-2D.md](docs/UNITY-2D.md) 第 6 节
 - **Spine 图集可能是按比例导出的**(实测 0.5),`.atlas` 里没记这个数,
   只能反推,并且要按尺寸加权 —— 小图的整数裁剪框会把估计值带偏
-- ⚠️ **`.meta` 里任何一个 sprite 的网格为空,会连累它后面所有 sprite** ——
-  Unity 静默改用 alpha 轮廓重新生成,还会让 SpriteSkin 报 InvalidBoneWeights。
-  所以 region 也要写满四顶点网格。见 [UNITY-2D.md](docs/UNITY-2D.md) 6.5
+- ⚠️ **`.meta` 里有顶点就必须有等量的 `weights`,哪怕这个 sprite 没有骨骼** ——
+  Unity 的加载器会无条件读 `m_Weights[0]`,空数组直接 NRE,而这个异常会中断
+  整个 sprite 循环,**让排在后面的 sprite 全部拿不到网格**(连带一片
+  SpriteSkin 报 InvalidBoneWeights)。见 [UNITY-2D.md](docs/UNITY-2D.md) 6.5

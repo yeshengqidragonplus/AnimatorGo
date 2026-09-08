@@ -288,6 +288,9 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
       for (const w of sprite.weights) {
         // Unity 在权重和小于 0.999 时会警告
         expect(w.weight.reduce((n, v) => n + v, 0)).toBeCloseTo(1, 3)
+        // 没有骨骼的 sprite(region、不加权网格)里权重只是占位 —— 它不挂
+        // SpriteSkin,这些数值不参与任何计算,骨骼下标无从校验
+        if (sprite.bones.length === 0) continue
         for (let i = 0; i < 4; i++) {
           if (w.weight[i]! > 0) expect(w.bone[i]!).toBeLessThan(sprite.bones.length)
         }
@@ -313,6 +316,20 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
     for (const sprite of meta.sprites) {
       expect(sprite.vertices.length, `${sprite.name} 顶点为空`).toBeGreaterThanOrEqual(3)
       expect(sprite.triangles.length, `${sprite.name} 没有三角形`).toBeGreaterThanOrEqual(3)
+    }
+  })
+
+  /**
+   * ⚠️ **有顶点就必须有等量的 weights,哪怕这个 sprite 没有骨骼。**
+   * Unity 的加载器只要 `m_Vertices` 非空就无条件读 `m_Weights[0]`,空数组直接 NRE,
+   * 而抛出来的异常会中断整个 sprite 循环 —— **排在后面的 sprite 全部拿不到网格**。
+   * 实测:不加权的 `eyelid` 排第 4,它一抛,#4~#16 全废。
+   */
+  it('⭐ 每个有顶点的 sprite 都有等量 weights(空数组会让 Unity 抛异常中断)', () => {
+    const meta = readMeta(textOf('.png.meta'))
+    for (const sprite of meta.sprites) {
+      if (sprite.vertices.length === 0) continue
+      expect(sprite.weights.length, `${sprite.name} 权重条数`).toBe(sprite.vertices.length)
     }
   })
 

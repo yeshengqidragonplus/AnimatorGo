@@ -65,6 +65,16 @@ export interface TextureMetaOptions {
   readonly sprites: readonly MetaSprite[]
 }
 
+/**
+ * 没有骨骼的 sprite 也得填的占位权重。全绑到 0 号槽、权重 1 ——
+ * 与真实样本里 `bones: []` 那条 sprite 的写法一致。
+ * 这个 sprite 不会挂 SpriteSkin,所以这些数值不参与任何计算。
+ */
+const UNWEIGHTED: MetaWeight = {
+  weights: [1, 0, 0, 0],
+  bones: [0, 0, 0, 0],
+}
+
 /** Unity 的 SpriteAlignment.Custom */
 const ALIGNMENT_CUSTOM = 9
 
@@ -139,11 +149,37 @@ function spriteLines(sprite: MetaSprite): string[] {
 
   lines.push('      edges: []')
 
-  if (sprite.weights.length === 0) {
+  // ⚠️⚠️ **有顶点就必须有等量的 weights,哪怕这个 sprite 根本没有骨骼。**
+  //
+  // Unity 的加载器(2d.sprite 包的 SpriteMeshDataTransfer.LoadVertex2DMetaData)
+  // 只要 m_Vertices 非空,就**无条件**去读 m_Weights[0]:
+  //
+  //     if (verticesSP.arraySize > 0) {
+  //         var wsp = weightsSP.GetArrayElementAtIndex(0);   // ← 空数组 → null
+  //         ... wsp.FindPropertyRelative("weight[0]")        // ← NullReferenceException
+  //
+  // 抛出来的异常会让 SpritePostProcess 的整个 sprite 循环中断,
+  // **排在它后面的 sprite 全部拿不到自定义网格和权重**,连带一片
+  // SpriteSkin 报 InvalidBoneWeights —— 而且只在 Unity 的控制台里一闪而过。
+  //
+  // 真实样本里那条 `bones: []` 的 sprite 也是带 weights 的(`weight[0]: 1`),
+  // 当初照抄时漏了这一点。
+  const weights =
+    sprite.weights.length > 0
+      ? sprite.weights
+      : sprite.vertices.map(() => UNWEIGHTED)
+
+  if (weights.length === 0) {
     lines.push('      weights: []')
   } else {
+    if (weights.length !== sprite.vertices.length) {
+      throw new Error(
+        `sprite "${sprite.name}" 的权重条数(${weights.length})与顶点数` +
+          `(${sprite.vertices.length})不符 —— Unity 会读越界`,
+      )
+    }
     lines.push('      weights:')
-    for (const w of sprite.weights) {
+    for (const w of weights) {
       lines.push(
         `      - 'weight[0]': ${num(w.weights[0])}`,
         `        'weight[1]': ${num(w.weights[1])}`,

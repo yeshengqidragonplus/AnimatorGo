@@ -232,33 +232,47 @@ inWeight (k1) = (t1 - cx2) / (t1 - t0)
 (每根各记自己的世界变换)。`SpriteSkin` 只校验数量对得上、引用非空
 (见包里的 `SpriteSkinUtility.Validate`),不要求层级。
 
-## 6.5 ⚠️⚠️ 任何一个 sprite 的网格为空,会连累它**后面所有** sprite
+## 6.5 ⚠️⚠️ 有顶点就必须有等量的 `weights`,哪怕这个 sprite 没有骨骼
 
-`.meta` 里 `spriteSheet.sprites` 是个序列。**其中任何一条的 `vertices: []` +
-`indices:`(空值),会让它之后所有 sprite 的网格数据失效** —— Unity 转而用
-alpha 轮廓重新生成网格,而且不报任何错。
+Unity 的加载器(`com.unity.2d.sprite` 的
+`SpriteMeshDataTransfer.LoadVertex2DMetaData`)只要 `m_Vertices` 非空,
+就**无条件**去读 `m_Weights[0]`:
 
-实测(MX2_cat,16 个 sprite):唯一为空的是排第 3 的 region attachment,结果:
+```csharp
+var vertices = new Vertex2DMetaData[verticesSP.arraySize];
+if (verticesSP.arraySize > 0)
+{
+    var weightsSP = so.FindPropertyRelative("m_Weights");
+    var wsp = weightsSP.GetArrayElementAtIndex(0);        // ← 空数组 → null
+    ... wsp.FindPropertyRelative("weight[0]")             // ← NullReferenceException
+```
+
+**抛出来的异常会中断 `SpritePostProcess` 的整个 sprite 循环**,于是
+**排在它后面的 sprite 全部拿不到自定义网格和权重** —— Unity 改用 alpha 轮廓
+重新生成,连带一片 SpriteSkin 报 `InvalidBoneWeights`。异常只在控制台一闪而过。
+
+实测(MX2_cat,16 个 sprite):不加权网格 `eyelid` 排第 4,它一抛,#4~#16 全废:
 
 | 位置 | sprite | 我们写的顶点 | Unity 实际 |
 |---|---|---|---|
 | 1 | body | 34 | **34** ✅ |
 | 2 | body2 | 48 | **48** ✅ |
-| 3 | bubble | 0(空) | 4 |
-| 4 | eyelid | 56 | 7 ✗ |
+| 3 | bubble | 4 | **4** ✅ |
+| 4 | eyelid | 56 | 7 ✗ ← 有顶点、`weights: []` |
 | 5 | glass | 34 | 8 ✗ |
 | 6 | head | 70 | 10 ✗ |
 
-连带后果是 **12 个 SpriteSkin 报 `InvalidBoneWeights`** —— 因为顶点被换掉了,
-权重数组也跟着不是我们的了。两个症状,一个根因。
+真实样本里那条 `bones: []` 的 sprite **也是带 weights 的**(`weight[0]: 1`,
+`boneIndex` 全 0),照抄时漏了这一点。没有骨骼的 sprite 不挂 `SpriteSkin`,
+所以这些数值不参与任何计算,纯粹是喂给加载器的占位。
 
-真实样本里从没暴露过这一点:那份 `.meta` 的每个 sprite 都有网格,
-空的 `vertices: []` / `indices:` 只出现在最末尾的「单图模式」默认块里,
-后面没有别的 sprite 了。
+**两条硬规则:**
 
-**做法:每个 sprite 都写显式网格,一个都不留空。** region attachment 用一个
-铺满矩形的四顶点网格即可。顺带好处是 Unity 的 alpha 轮廓生成完全不参与,
-产物变成确定的 —— 不会因为图片边缘的一点 alpha 差异而改变网格。
+1. **`weights` 的条数必须等于 `vertices` 的条数**,没有骨骼时用
+   `weight[0]: 1` + `boneIndex` 全 0 占位
+2. **每个 sprite 都写显式网格,一个都不留空** —— region attachment 用一个
+   铺满矩形的四顶点网格。顺带好处是 Unity 的 alpha 轮廓生成完全不参与,
+   产物变成确定的,不会因为图片边缘的一点 alpha 差异而改变网格
 
 ## 7. ⚠️ 顶点位置和 UV 在 Unity 里是绑死的
 

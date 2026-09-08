@@ -167,8 +167,11 @@ public static class AnimatorGoVerify
 
                 int weightCount = 0;
                 int maxIndex = -1;
+                // ⚠️ 没有骨骼的 sprite 没有 BlendWeight 通道,硬读会拿到别的顶点流
+                // (表现是「最大下标」变成十亿级的数 —— 那是浮点位模式被当成整数)
                 try
                 {
+                    if (boneCount == 0) throw new System.InvalidOperationException();
                     NativeSlice<BoneWeight> weights =
                         sprite.GetVertexAttribute<BoneWeight>(VertexAttribute.BlendWeight);
                     weightCount = weights.Length;
