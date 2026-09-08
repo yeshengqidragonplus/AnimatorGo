@@ -1,4 +1,4 @@
-# 开发进度与交接(2026-08-31)
+# 开发进度与交接(2026-09-08)
 
 ## 产品定位
 
@@ -68,13 +68,37 @@ pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--dry-run]
 
 两份形状正好互补 —— 一份全是蒙皮网格,一份全是换图。
 
+### ✅ 已在 Unity 里跑通(2026-09-08)
+
+Unity 6000.3 + URP + 2D Animation 13.0.2,`UnityAnimationGo/` 里实测:
+
+```
+SpriteSkin 14 个,校验不过 0 个
+每个 sprite 的顶点数与写入值逐个吻合(head 70 顶点 / 101 三角,eyelid 56 / 75)
+骨骼下标全部在范围内,指不到物体的动画曲线 0 条
+```
+
+**画面确认无误** —— 蒙皮网格变形、换图、绘制顺序都对。
+
+### Unity 侧的自检循环
+
+`tools/unity/AnimatorGoVerify.cs` + `pnpm check:unity`。
+另外可以用 **Unity batchmode 在本地跑完自检**,不必人工开 Unity:
+
+```bash
+Unity.exe -batchmode -quit -nographics -projectPath <工程>           -executeMethod AnimatorGoVerify.Verify -logFile <日志>
+```
+
+⚠️ **这一步别省。** Unity 侧有一类问题「只有 Unity 自己知道、而且都不报错」——
+曲线 path 指不到物体、`.meta` 里一个空数组让加载器抛异常中断整个循环。
+靠人工开 Unity 反馈,一个 bug 要来回三四轮。
+
 ## 未完成
 
 按依赖顺序:
 
-1. **在 Unity 里实际打开验证** —— 产物**还没有在 Unity 里打开过**。
-   数学上验过了,但 prefab / `.meta` 的字段集合是照真实样本抄的,
-   可能有 Unity 版本差异。这是下一步第一件事。
+1. **拿更多真实素材过一遍** —— 目前只验了 2 个骨架。规模能暴露 2 个样本暴露不了的东西
+   (多皮肤、IK、path 约束、多页图集、超大骨架)
 2. **Unity → Spine**(反方向)
 3. **Godot / Cocos 导出**
 4. `.skel` 里没有样本覆盖的区域:path 约束的字段顺序、音频事件的 `volume` / `balance`
