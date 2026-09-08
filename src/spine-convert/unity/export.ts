@@ -51,6 +51,14 @@ export interface UnityExportOptions {
   readonly pixelsPerUnit: number
   /** 决定 SpriteRenderer 用哪个默认材质 —— 给错了整个角色是粉红的 */
   readonly renderPipeline: RenderPipeline
+  /**
+   * 跳过图集 PNG 的编码。
+   *
+   * 只给试运行用:批量摸底几百个骨架时,PNG 编码占了绝大部分时间,
+   * 而问题报告一条都不依赖它。**烘焙照做**(区域越界、缺图都在那一步暴露),
+   * 只是不把像素压成 PNG。
+   */
+  readonly skipImages?: boolean
 }
 
 export interface UnityFile {
@@ -789,7 +797,7 @@ export function exportToUnity(
   // ── 6. 汇总产物 ──
   baked.pages.forEach((page, i) => {
     const pageName = baked.pages.length === 1 ? name : `${name}_${i}`
-    files.push({ path: `${pageName}.png`, content: encodePng(page) })
+    files.push({ path: `${pageName}.png`, content: options.skipImages === true ? '' : encodePng(page) })
     files.push({
       path: `${pageName}.png.meta`,
       content: writeTextureMeta({

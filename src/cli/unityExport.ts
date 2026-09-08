@@ -243,6 +243,8 @@ function main(): void {
         name: stem,
         pixelsPerUnit: parsed.pixelsPerUnit,
         renderPipeline: pipeline,
+        // 试运行不写文件,那就别费时间编码 PNG
+        skipImages: parsed.dryRun,
       })
 
       const dir = join(parsed.out, stem)
