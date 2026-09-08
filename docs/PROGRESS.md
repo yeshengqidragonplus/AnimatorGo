@@ -110,16 +110,16 @@ Unity.exe -batchmode -quit -nographics -projectPath <工程>           -executeM
 
 | 骨架数 | 问题 | 性质 |
 |---|---|---|
-| 170 (32%) | **deform 顶点动画** | SpriteSkin 无对应物。**已定用 `SkinnedMeshRenderer` + Blend Shape 解**,见 [DECISIONS.md](DECISIONS.md) |
+| 170 (32%) | **deform 顶点动画** | SpriteSkin 无对应物。候选解法 `SkinnedMeshRenderer` + Blend Shape,**排查中、未定**,见 [DECISIONS.md](DECISIONS.md) |
 | 95 | 每顶点 >4 根骨骼 | Unity 的 `BoneWeight` 硬限制 |
 | 38 | 网格在绑定姿势下就非刚性 | 顶点位置与 UV 绑死,表达不了(多半是刻意做的透视) |
 | 29 | 加权网格之间缩放不一致 | 一张纹理只有一个 `pixelsPerUnit` |
 | 22 | clipping 遮罩 | 无对应物 |
 | 20 | 贝塞尔控制点贴端点 | 退化为线性 |
-| 16 | 逐帧绘制顺序 | `sortingOrder` 是静态的 |
+| 16 | 逐帧绘制顺序 | ~~`sortingOrder` 是静态的~~ 排查证实 `m_SortingOrder` **可以打关键帧,能做、未做** |
 | 9 | `transformMode` 非默认继承 | 无对应物 |
 | **7** | **linkedmesh(共享网格)** | 纯功能缺口,做得了 |
-| 3 | IK / transform / path 约束 | 位置已烘进曲线,外观一致但不可再调 |
+| 3 | IK / transform / path 约束 | 无对应物,**也没有烘进曲线**(之前「已烘进曲线」的说法不对,代码里没有求解器)—— 受约束驱动的骨骼停在自己的关键帧上 |
 
 ### deform 到底动多大(2026-09-08 摸底,1118 条时间轴)
 
@@ -154,20 +154,57 @@ Unity.exe -batchmode -quit -nographics -projectPath <工程>           -executeM
 `wave`(全靠 deform)、`blackrichwoman`(骨骼 + 63 条加权网格 deform 的典型角色)、
 `17701` / `13901`(地图建筑,非加权大幅 deform)、`customer_1`(≤ 14 px,轻度)。
 
+### Blend Shape 路线的排查结论(2026-09-09)
+
+排查脚本 [tools/unity/AnimatorGoProbe.cs](../tools/unity/AnimatorGoProbe.cs):用 Unity 自己的 API
+造出带蒙皮 + 形变目标的 Mesh、SkinnedMeshRenderer、动画曲线,存成资产拿 YAML,并做数值验证。
+编辑器占着 UnityAnimationGo 时,把 `Packages/` `ProjectSettings/` `Assets/Settings/` 拷到临时目录
+另起一个工程跑 batchmode(**Q7 要渲染,不能加 `-nographics`**)。Unity 6000.3.2f1,全部通过:
+
+| 问题 | 结论 |
+|---|---|
+| Blend Shape 增量与蒙皮的顺序 | **加完再蒙皮**,与 Spine 同序(反向假设误差 1.41,正向 0) |
+| 权重是否线性 | 是,50 = 半个增量 |
+| 每顶点 >4 根骨骼 | 6 根全部参与蒙皮,误差 0。**但工程 Quality 的 `skinWeights` 必须是 Unlimited**,默认 4 根时误差 0.6 |
+| ⚠️ 真实工程的 Quality 设置 | UnityAnimationGo 六档里 Low/Medium/High 是 **2 根**,Very High 4 根,只有 Ultra 是 Unlimited;MergeCooking2 三档是 2 / 4 / 2 根。SkinnedMeshRenderer 按 `m_Quality: 0`(Auto)走会被**降到 2 根**,比 SpriteSkin 还差。导出时必须写 `m_Quality: 4`(Bone4,每渲染器上限就是 4),>4 根只有在工程 Quality 为 Unlimited 时才成立 —— 要像认渲染管线那样从 `ProjectSettings/QualitySettings.asset` 读出来再决定报不报 approximated |
+| 绑定矩阵里的非等比缩放 | 保留,误差 0(SpriteSkin 的「只有 TR」限制是 2D 包自己的,不是 Unity 的) |
+| `m_SortingOrder` 能否打关键帧 | **能**,SpriteRenderer 和 SkinnedMeshRenderer 都能;Animation 窗口里列出 SpriteRenderer 的;2.5 取整成 3 |
+| `blendShape.<名>` 曲线 | 能驱动权重;`.anim` 里 `attribute: blendShape.shape0`,`classID: 137` |
+| SkinnedMeshRenderer 用 URP `Sprite-Unlit-Default`,与 SpriteRenderer 按 `sortingOrder` 互通 | **是**(渲染到 RenderTexture 读像素验证)。同 order 时 Sprite 在上 —— 别打平 |
+| Mesh `.asset` 的 YAML | 拿到样本。顶点流 3 个 stream:位置 float32×3;颜色 UNorm8×4 + UV float32×2;权重 UNorm16×4 + 骨骼下标 UInt16×4(只放归一化后的前 4 根)。**>4 根的完整权重另存 `m_VariableBoneCountWeights`**(每顶点起始字偏移表 + 总字数 + (骨骼 u16, 权重 UNorm16) 列表)。形变目标稀疏存在 `m_Shapes`(只存非零顶点 + 下标)。`nameHash` 和曲线绑定哈希都是 **CRC32**。`m_BoneNameHashes` 可以为空 |
+
+MC2 数据侧(458 条加权网格上的 deform,脚本在会话 scratchpad):
+
+- 偏移确实是**每影响一份、在各自骨骼的局部空间**(338 条的下标范围超过顶点数×2,只能这么解释)
+- 同一顶点各影响的偏移换到世界空间**并不一致**:setup 姿势下 21.8% 的(顶点×帧)分歧 >0.5 px,
+  关键帧时刻的姿势下仍有 12%。所以 Blend Shape 的「单一绑定空间增量」**不能直接抄某个 dᵢ**
+- 正确做法是**按关键帧时刻的姿势反解**:M(Pₖ)·δ = Δₖ,其中 M = Σ wᵢ Bᵢ(Pₖ) Bᵢ(S)⁻¹,Δₖ 是 Spine 在
+  该时刻的世界偏移。关键帧时刻由此精确;**关键帧之间**与 Spine 的分歧:中位 0、90 分位 0.18 px、
+  99 分位 1.5 px,458 条里 431 条 <0.5 px,最大 20 px(`female_lead` 一条)。这就是该方案要报的
+  approximated 量级
+- 规模:有 deform 的网格 624 个,形变目标合计 5695;433 个网格 ≤5 个目标,9 个 >100
+  (`race_haibao` 几个 4 顶点小网格逐帧打了 200–400 个键)
+- 反解 δ 需要一个**姿势求值器**(时间 → 每根骨骼的世界矩阵)。排查脚本里写了个不含约束、
+  不含非默认继承模式的版本;正式实现应进 `core/`,VAT 以后也吃它
+
+顺带发现两处**此前的说法不对**,已改:IK 的提示说「位置已烘进曲线」,但代码里没有 IK 求解;
+逐帧绘制顺序判为「做不到」,实测能做。
+
 ## 未完成
 
 路线已定(2026-09-09,见 [DECISIONS.md](DECISIONS.md)):**Spine → Unity 先做正常动画,
 VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
-1. **deform → Blend Shape**(`SkinnedMeshRenderer`)—— 32% 的骨架受影响,优先级最高。
-   第一步照老办法:在 UnityAnimationGo 里用 Unity 自己的 API 造一个带蒙皮 + 形变目标的
-   Mesh 存成 `.asset`,拿 YAML 当标准答案,再写、回读、batchmode 验。
-   顺带验两件事:Mesh 每顶点能否 >4 根骨骼;`sortingOrder` 能否打关键帧
+1. **deform 解法排查**(候选:`SkinnedMeshRenderer` + Blend Shape)—— 32% 的骨架受影响,优先级最高。
+   **先查再定**,排查脚本 `tools/unity/AnimatorGoProbe.cs`:用 Unity 自己的 API 造带蒙皮 + 形变目标的
+   Mesh 存成 `.asset` 拿 YAML 当标准答案,并数值验证:增量是否「加完再蒙皮」、每顶点能否 >4 根骨骼、
+   绑定矩阵的缩放是否保留、`sortingOrder` 能否打关键帧、SkinnedMesh 与 Sprite 的排序是否互通
 2. **linkedmesh** —— 7 个骨架 / 138 处
-3. **Unity → Spine**(反方向)
-4. **Godot / Cocos 导出**
-5. `.skel` 里没有样本覆盖的区域:path 约束的字段顺序、音频事件的 `volume` / `balance`
-6. **VAT 出口** —— 极限性能时才需要。来源有两个:Spine 直出,以及 Unity 正常动画烘焙。
+3. **逐帧绘制顺序 → `m_SortingOrder` 阶梯曲线** —— 16 个骨架,排查证实能做
+4. **Unity → Spine**(反方向)
+5. **Godot / Cocos 导出**
+6. `.skel` 里没有样本覆盖的区域:path 约束的字段顺序、音频事件的 `volume` / `balance`
+7. **VAT 出口** —— 极限性能时才需要。来源有两个:Spine 直出,以及 Unity 正常动画烘焙。
    求值器按「(数据, 时间) → 顶点数组」设计,让两边共用
 
 烘焙不许旋转,打包效率会降 —— BBQ_grill 原图集 1024×512,烘焙后是 1024×1024。
@@ -175,11 +212,11 @@ VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
 ### 已知转不过去的东西(都会报出来,不静默)
 
-- **deform 顶点关键帧** —— Unity 的 SpriteSkin 只做骨骼蒙皮(**待解**:Blend Shape 路线已定,未实现)
-- **逐帧绘制顺序** —— `sortingOrder` 是静态的
+- **deform 顶点关键帧** —— Unity 的 SpriteSkin 只做骨骼蒙皮(**待解**:候选 Blend Shape 路线,排查中)
+- **逐帧绘制顺序** —— 尚未转换(排查证实 `m_SortingOrder` 可以打关键帧,待实现)
 - **path / transform 约束** —— 没有对应物
 - **两色染色(dark color)** —— 没有对应物
-- **IK** —— 骨骼最终位置已经烘进曲线,外观一致但不可再调
+- **IK** —— 没有对应物,也没有烘进曲线;受 IK 驱动的骨骼会停在自己的关键帧上
 - 每顶点超过 4 根骨骼 —— 取权重最大的四根重新归一化
 
 ## 编辑器 MVP(冻结)

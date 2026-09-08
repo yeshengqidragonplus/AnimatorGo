@@ -93,12 +93,15 @@ VAT 动画,这是我们最终目标。眼下先做正常动画,以后再考虑 V
 - **触发 VAT 的条件是极限性能**(大量同屏实例、一个 draw call),不是保真度。
   正常动画路线上碰到的表达力缺口,先在正常动画里解决,不拿 VAT 当逃生口
 
-### 正常动画路线上 deform 的解法:Blend Shape
+### 正常动画路线上 deform 的候选解法:Blend Shape · 排查中 · 2026-09-09
 
 Spine 的 deform 顶点动画在 MergeCooking2 里占 **32% 的骨架**,且数据证明不是微小起伏
 (128 / 170 个骨架最大偏移 ≥ 20 px,详见 [PROGRESS.md](PROGRESS.md))。**不能不管。**
 
-选定:**有 deform 的网格走 `SkinnedMeshRenderer` + Blend Shape**。每个 deform 关键帧
+**尚未定案。** 用户要求先排查再定(*"没有调查就没有发言权"*),排查脚本在
+`tools/unity/AnimatorGoProbe.cs`,结论记在 [PROGRESS.md](PROGRESS.md)。下面是候选方案和对比。
+
+候选:**有 deform 的网格走 `SkinnedMeshRenderer` + Blend Shape**。每个 deform 关键帧
 是一个形变目标,两帧之间的插值等价于两个目标的权重交叉,权重由 `Animator` 驱动。
 增量「加完再蒙皮」的顺序与 Spine 一致。这是 Unity 自带的原生组件,零运行时代码,
 权重曲线在 Animation 窗口里可以直接改 —— 初心保住。
@@ -106,9 +109,9 @@ Spine 的 deform 顶点动画在 MergeCooking2 里占 **32% 的骨架**,且数�
 顺带解决的:绑定姿势非刚性(Mesh 的绑定矩阵是任意 4×4)、顶点与 UV 绑死导致的缩放不一致
 (Mesh 的位置和 UV 独立)。每顶点 >4 骨骼大概率也解,**要实测**。
 
-**否决的替代方案:**
+**对比过的替代方案(随排查结论一起定):**
 - **每个会动的顶点挂一根辅助骨骼** —— 纯资产、零运行时,但节点和曲线膨胀严重;
-  加权网格上的 deform 只能烘成绝对位置曲线,该网格从此不再由骨骼驱动。被 Blend Shape 全面替代
+  加权网格上的 deform 只能烘成绝对位置曲线,该网格从此不再由骨骼驱动。若 Blend Shape 成立则被全面替代
 - **自写一个薄的 deform 渲染组件** —— `SpriteRenderer` 没有公开的写顶点接口,
   真做就得换 `MeshRenderer` 自己填顶点,等于重写一个薄版 spine-unity。重新引入运行时,违背路线
 - **「只处理整块变换的 deform」这条捷径** —— 数据否了:全部 deform 都是整块平移/旋转/缩放的
@@ -117,8 +120,9 @@ Spine 的 deform 顶点动画在 MergeCooking2 里占 **32% 的骨架**,且数�
 **待定的子决策:** 哪些网格走 `SkinnedMeshRenderer`。倾向「只有需要的走」(有 deform /
 非刚性 / 缩放不一致的),现有已验证的 SpriteSkin 输出不动;等做出来验过再看要不要收成一套。
 
-**已知仍然做不到的:** clipping 遮罩。逐帧绘制顺序此前判定为做不到,
-但 `sortingOrder` 是可序列化整数,**能否打关键帧要重新验证**,之前判断得太快。
+**已知仍然做不到的:** clipping 遮罩。逐帧绘制顺序此前判定为做不到 —— 排查证实
+`m_SortingOrder` 可以打关键帧(SpriteRenderer 与 SkinnedMeshRenderer 都行),能做、未做。
+排查结论全文见 [PROGRESS.md](PROGRESS.md)「Blend Shape 路线的排查结论」。
 
 ## 架构
 

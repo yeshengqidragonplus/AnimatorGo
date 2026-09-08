@@ -791,11 +791,11 @@ export function exportToUnity(
         if (t.kind === 'deform') {
           issues.loss(`deform[${t.owner}]`, 'Unity 的 SpriteSkin 只做骨骼蒙皮,没有逐顶点关键帧,该时间轴已丢弃')
         } else if (t.kind === 'drawOrder') {
-          issues.loss('drawOrder', 'Unity 的 sortingOrder 是静态的,无法逐帧改变绘制顺序,该时间轴已丢弃')
+          issues.loss('drawOrder', '逐帧绘制顺序尚未转换,该时间轴已丢弃(排查证实 m_SortingOrder 可以打关键帧,能做、未做)')
         } else if (t.kind === 'transform' || t.kind.startsWith('path')) {
           issues.loss(t.kind, 'Unity 没有 transform / path 约束的对应物,该时间轴已丢弃')
         } else if (t.kind === 'ik') {
-          issues.loss('ik', 'Spine 的 IK 约束没有直接搬过去 —— 骨骼的最终位置已经烘进曲线,外观一致但不可再调')
+          issues.loss('ik', 'Unity 没有 IK 约束的对应物,也没有把 IK 的结果烘进曲线 —— 受 IK 驱动的骨骼会停在自己的关键帧上,外观会不一致')
         } else if (t.kind === 'event') {
           issues.add('info', 'event', 'Spine 事件没有转成 Unity 的 AnimationEvent(没有对应的回调函数名)')
         }
