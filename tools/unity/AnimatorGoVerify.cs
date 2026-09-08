@@ -16,9 +16,12 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using Unity.Collections;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.U2D;
 using UnityEngine.U2D.Animation;
 
 public static class AnimatorGoVerify
@@ -134,7 +137,13 @@ public static class AnimatorGoVerify
         return unresolved;
     }
 
-    /// sprite 导入结果:网格 sprite 必须真的带上顶点和三角形
+    /// sprite 的导入结果 —— 逐个把数字摆出来。
+    ///
+    /// 只说「InvalidBoneWeights」没法定位,因为 Unity 的判据是
+    /// **四个 boneIndex 槽位全都要 < bindPose 数**(见 BurstedSpriteSkinUtilities
+    /// .ValidateBoneWeights),而且**不看权重是否为 0**。所以这里把
+    /// 顶点数 / 三角形数 / 骨骼数 / bindPose 数 / 权重条数 / 最大骨骼下标
+    /// 一并列出,一眼能看出是哪一项对不上。
     static int CheckSprites(StringBuilder report)
     {
         string[] texGuids = AssetDatabase.FindAssets("t:Texture2D", new[] { AssetRoot });
@@ -144,15 +153,50 @@ public static class AnimatorGoVerify
         {
             string path = AssetDatabase.GUIDToAssetPath(guid);
             Sprite[] sprites = AssetDatabase.LoadAllAssetsAtPath(path).OfType<Sprite>().ToArray();
-            // 默认矩形是 2 个三角形 = 6 个下标,多于 6 说明自定义网格生效了
-            int meshed = sprites.Count(s => s.triangles.Length > 6);
-            var empty = sprites.Where(s => s.vertices.Length == 0).Select(s => s.name).ToList();
 
-            report.AppendLine(
-                $"── {System.IO.Path.GetFileName(path)} ── sprite {sprites.Length} 个,"
-                + $"带自定义网格的 {meshed} 个,顶点为空的 {empty.Count} 个");
-            foreach (string name in empty) report.AppendLine($"    ✗ {name} 没有顶点");
-            problems += empty.Count;
+            report.AppendLine($"── {System.IO.Path.GetFileName(path)} ── sprite {sprites.Length} 个");
+            report.AppendLine("    名字        顶点  三角  骨骼  bindPose  权重  最大下标");
+
+            foreach (Sprite sprite in sprites.OrderBy(s => s.name))
+            {
+                int vertexCount = sprite.GetVertexCount();
+                // 默认矩形是 2 个三角形 = 6 个下标,多于 6 说明自定义网格生效了
+                int triangles = sprite.triangles.Length / 3;
+                int boneCount = sprite.GetBones().Length;
+                int bindPoses = sprite.GetBindPoses().Length;
+
+                int weightCount = 0;
+                int maxIndex = -1;
+                try
+                {
+                    NativeSlice<BoneWeight> weights =
+                        sprite.GetVertexAttribute<BoneWeight>(VertexAttribute.BlendWeight);
+                    weightCount = weights.Length;
+                    for (int i = 0; i < weights.Length; i++)
+                    {
+                        BoneWeight w = weights[i];
+                        maxIndex = Mathf.Max(maxIndex,
+                            Mathf.Max(w.boneIndex0, w.boneIndex1),
+                            Mathf.Max(w.boneIndex2, w.boneIndex3));
+                    }
+                }
+                catch (System.Exception)
+                {
+                    // 没有 BlendWeight 通道 —— 不加权的 sprite 本来就没有
+                }
+
+                var flags = new List<string>();
+                if (vertexCount == 0) flags.Add("没有顶点");
+                if (boneCount > 0 && bindPoses != boneCount) flags.Add($"bindPose 数与骨骼数不符");
+                if (boneCount > 0 && weightCount != vertexCount) flags.Add("权重条数与顶点数不符");
+                if (bindPoses > 0 && maxIndex >= bindPoses) flags.Add($"骨骼下标越界({maxIndex} ≥ {bindPoses})");
+
+                report.AppendLine(
+                    $"    {sprite.name,-10} {vertexCount,5} {triangles,5} {boneCount,5} "
+                    + $"{bindPoses,9} {weightCount,5} {maxIndex,9}"
+                    + (flags.Count == 0 ? "" : "   ✗ " + string.Join("、", flags)));
+                problems += flags.Count > 0 ? 1 : 0;
+            }
         }
 
         return problems;

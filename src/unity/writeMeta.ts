@@ -214,8 +214,11 @@ export function writeTextureMeta(options: TextureMetaOptions): string {
     // 2 = Multiple
     '  spriteMode: 2',
     '  spriteExtrude: 1',
-    // 0 = FullRect。我们自己给了网格,不需要 Unity 再生成紧贴轮廓的
-    '  spriteMeshType: 0',
+    // 1 = Tight。⚠️ **跟真实样本保持一致,别自作聪明改成 FullRect** ——
+    // 从 Unity 的 Skinning Editor 里画出来的那份样本就是 1,而带自定义网格的
+    // sprite 走的正是这条路。曾经想「我们自己给了网格,用 FullRect 省事」,
+    // 结果 16 个 sprite 里只有 2 个真的拿到了自定义网格。
+    '  spriteMeshType: 1',
     '  alignment: 0',
     '  spritePivot: {x: 0.5, y: 0.5}',
     `  spritePixelsToUnits: ${num(pixelsPerUnit)}`,
