@@ -8,6 +8,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 核心能力:Spine / Unity / Godot / Cocos 之间互转,以及 Spine 3.8 ⇄ 4.1 版本互转。
 
+**Spine → Unity 有两种出口,顺序已定(2026-09-09):**
+
+1. **正常动画**(现在做):Unity 原生骨骼 + `Animator` + `.anim`,**在 Unity 里可编辑** —— 这是初心,
+   「没有 Spine license 的人也能改」。deform 顶点动画用 `SkinnedMeshRenderer` 的 Blend Shape 解
+2. **VAT**(终局,以后做):顶点位置烘进贴图、shader 取,只播放不可编辑,极限性能时用。
+   来源既可以是 Spine,也可以是 Unity 正常动画 —— 它是正常动画的下游烘焙,不是平行管线
+
+**不要拿 VAT 当正常动画路线上表达力缺口的逃生口。** 理由见 [docs/DECISIONS.md](docs/DECISIONS.md)。
+
 仓库里已有一个编辑器 MVP(骨骼、时间轴、图集、slot、Electron 壳、多语言)——
 那是转向之前做的。**代码保留,但停止投入**,编辑器降级为可选的查看/临时编辑视图。
 

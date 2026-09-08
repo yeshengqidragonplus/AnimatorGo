@@ -110,7 +110,7 @@ Unity.exe -batchmode -quit -nographics -projectPath <工程>           -executeM
 
 | 骨架数 | 问题 | 性质 |
 |---|---|---|
-| 170 (32%) | **deform 顶点动画** | Unity 无对应物。理论上可以「每个顶点一根骨骼」硬编,代价很大 |
+| 170 (32%) | **deform 顶点动画** | SpriteSkin 无对应物。**已定用 `SkinnedMeshRenderer` + Blend Shape 解**,见 [DECISIONS.md](DECISIONS.md) |
 | 95 | 每顶点 >4 根骨骼 | Unity 的 `BoneWeight` 硬限制 |
 | 38 | 网格在绑定姿势下就非刚性 | 顶点位置与 UV 绑死,表达不了(多半是刻意做的透视) |
 | 29 | 加权网格之间缩放不一致 | 一张纹理只有一个 `pixelsPerUnit` |
@@ -118,24 +118,64 @@ Unity.exe -batchmode -quit -nographics -projectPath <工程>           -executeM
 | 20 | 贝塞尔控制点贴端点 | 退化为线性 |
 | 16 | 逐帧绘制顺序 | `sortingOrder` 是静态的 |
 | 9 | `transformMode` 非默认继承 | 无对应物 |
-| **7** | **linkedmesh(共享网格)** | ⭐ **唯一一个纯功能缺口,做得了** |
+| **7** | **linkedmesh(共享网格)** | 纯功能缺口,做得了 |
 | 3 | IK / transform / path 约束 | 位置已烘进曲线,外观一致但不可再调 |
+
+### deform 到底动多大(2026-09-08 摸底,1118 条时间轴)
+
+「deform 只是微小的呼吸起伏,丢了看不出」—— **这个猜测被数据否了。**
+把每条 deform 时间轴的最大顶点偏移算出来:
+
+| 最大偏移 | 时间轴 | 骨架 |
+|---|---|---|
+| < 1 px | 38 | 23 |
+| 1 – 5 px | 51 | 27 |
+| 5 – 20 px | 355 | 94 |
+| 20 – 50 px | 312 | 88 |
+| **≥ 50 px** | **362** | **75** |
+
+170 个骨架里 **128 个**的最大偏移 ≥ 20 px,只有 1 个在 5 px 以下。
+极端的如 `Map3/17701` 的 `first_confirm`:1817 px 宽的网格,顶点偏移 1793 px ——
+整个建筑「出现」的动作全靠 deform。`NewSpine/wave` 14 条动画全是 deform 做的波浪,
+转过去就是一张静止图。
+
+**「整块变换」能不能用一根辅助骨骼精确还原?** 对每帧拟合平移 / 相似 / 仿射变换(容差 0.5 px):
+
+| 性质 | 时间轴 | 骨架 |
+|---|---|---|
+| 整块平移 / 旋转缩放 / 仿射 | 177 | — |
+| **真·自由形变(顶点各走各的)** | **515** | **137** |
+| 多骨骼加权网格上的 deform(未分析) | 402 | 51 |
+
+全部 deform 都是整块变换、一根辅助骨骼就能精确还原的骨架只有 **10 个**。
+所以「只处理刚性情形」这条捷径几乎没有覆盖面;要做就得做真·逐顶点。
+
+已挑 5 个转进 `UnityAnimationGo/Assets/AnimatorGo/` 供肉眼对比:
+`wave`(全靠 deform)、`blackrichwoman`(骨骼 + 63 条加权网格 deform 的典型角色)、
+`17701` / `13901`(地图建筑,非加权大幅 deform)、`customer_1`(≤ 14 px,轻度)。
 
 ## 未完成
 
-按依赖顺序:
+路线已定(2026-09-09,见 [DECISIONS.md](DECISIONS.md)):**Spine → Unity 先做正常动画,
+VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
-1. **linkedmesh** —— 上表里唯一「能做但没做」的。7 个骨架 / 138 处
-2. **Unity → Spine**(反方向)
-3. **Godot / Cocos 导出**
-4. `.skel` 里没有样本覆盖的区域:path 约束的字段顺序、音频事件的 `volume` / `balance`
+1. **deform → Blend Shape**(`SkinnedMeshRenderer`)—— 32% 的骨架受影响,优先级最高。
+   第一步照老办法:在 UnityAnimationGo 里用 Unity 自己的 API 造一个带蒙皮 + 形变目标的
+   Mesh 存成 `.asset`,拿 YAML 当标准答案,再写、回读、batchmode 验。
+   顺带验两件事:Mesh 每顶点能否 >4 根骨骼;`sortingOrder` 能否打关键帧
+2. **linkedmesh** —— 7 个骨架 / 138 处
+3. **Unity → Spine**(反方向)
+4. **Godot / Cocos 导出**
+5. `.skel` 里没有样本覆盖的区域:path 约束的字段顺序、音频事件的 `volume` / `balance`
+6. **VAT 出口** —— 极限性能时才需要。来源有两个:Spine 直出,以及 Unity 正常动画烘焙。
+   求值器按「(数据, 时间) → 顶点数组」设计,让两边共用
 
 烘焙不许旋转,打包效率会降 —— BBQ_grill 原图集 1024×512,烘焙后是 1024×1024。
 目前固定 POT,需要的话可以加个 `--npot` 省显存。
 
 ### 已知转不过去的东西(都会报出来,不静默)
 
-- **deform 顶点关键帧** —— Unity 的 SpriteSkin 只做骨骼蒙皮
+- **deform 顶点关键帧** —— Unity 的 SpriteSkin 只做骨骼蒙皮(**待解**:Blend Shape 路线已定,未实现)
 - **逐帧绘制顺序** —— `sortingOrder` 是静态的
 - **path / transform 约束** —— 没有对应物
 - **两色染色(dark color)** —— 没有对应物
