@@ -156,19 +156,30 @@ public static class AnimatorGoRender
     static string Describe(Camera cam, GameObject root)
     {
         var sb = new System.Text.StringBuilder();
-        sb.AppendLine("name\tsortingOrder\tkind\txMin\tyMin\txMax\tyMax");
         Renderer[] renderers = root.GetComponentsInChildren<Renderer>(false)
             .Where(r => r.enabled && r.gameObject.activeInHierarchy)
             .OrderBy(r => r.sortingOrder)
             .ToArray();
+        if (renderers.Length > 0)
+        {
+            // 这一帧整体在世界里占多大 —— 摆多个 prefab 对比时,用它判断会不会互相甩到对方身上
+            Bounds all = renderers[0].bounds;
+            foreach (Renderer r in renderers) all.Encapsulate(r.bounds);
+            sb.AppendLine($"# world bounds (relative to root {root.transform.position.x:0.##},{root.transform.position.y:0.##}): "
+                + $"x {all.min.x - root.transform.position.x:0.##} .. {all.max.x - root.transform.position.x:0.##}, "
+                + $"y {all.min.y - root.transform.position.y:0.##} .. {all.max.y - root.transform.position.y:0.##}");
+        }
+        sb.AppendLine($"# camera ortho size {cam.orthographicSize:0.###} at {cam.transform.position.x:0.##},{cam.transform.position.y:0.##}");
+        sb.AppendLine("name\tsortingOrder\tkind\txMin\tyMin\txMax\tyMax\tworldMin\tworldMax");
         foreach (Renderer r in renderers)
         {
             Bounds b = r.bounds;
             Vector3 min = cam.WorldToScreenPoint(b.min);
             Vector3 max = cam.WorldToScreenPoint(b.max);
-            // 屏幕坐标原点在左下,翻成图片的左上原点
+            // 屏幕坐标原点在左下,翻成图片的左上原点;后两列是世界坐标,用来核对包围盒本身对不对
             sb.AppendLine(
-                $"{r.name}\t{r.sortingOrder}\t{r.GetType().Name}\t{min.x:0}\t{Height - max.y:0}\t{max.x:0}\t{Height - min.y:0}");
+                $"{r.name}\t{r.sortingOrder}\t{r.GetType().Name}\t{min.x:0}\t{Height - max.y:0}\t{max.x:0}\t{Height - min.y:0}"
+                + $"\t({b.min.x:0.##},{b.min.y:0.##})\t({b.max.x:0.##},{b.max.y:0.##})");
         }
         return sb.ToString();
     }

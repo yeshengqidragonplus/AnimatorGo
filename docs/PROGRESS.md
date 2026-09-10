@@ -225,6 +225,15 @@ SpriteSkin 41 个全部 Ready;SkinnedMeshRenderer 59 个、形变目标 373 个,
 顺序,挪过位的 slot 在**每条**动画里都写 `m_SortingOrder` 阶梯曲线(没挪的动画写 setup 值,
 不依赖 Write Defaults 还原)。SpriteRenderer(212)与 SkinnedMeshRenderer(137)都能被驱动(排查过)。
 
+**对比场景的间距是写死的 12 单位,这对真实素材远远不够。** 用渲染工具量了各 prefab 播完所有动画
+实际占到的范围(Unity 单位,ppu 100):blackrichwoman 宽 17.4、高 30.4(图集缩放 k=7.7,骨架单位
+本来就是像素的 7.7 倍);17701 宽 22.5;wave 宽 17.9。12 单位间距一播就互相甩到对方身上 ——
+用户「运行起来脸上有叠加的东西」很可能就是隔壁 prefab 的部件。`摆一个对比场景` 改成先逐条动画采样、
+按实际范围排,相机也按总范围框。**摆多个 prefab 对比时别再手写间距。**
+
+**Animator 窗口开着时,进 Play / 重编译都会让 `UnityEditor.Graphs.Edge.WakeUp` 报一次 NRE** ——
+编辑器自身的老毛病,与产物无关(controller 结构与能正常用的版本一致)。关掉 Animator 窗口就没了。
+
 **新工具 `tools/unity/AnimatorGoRender.cs`**:把产物的动画在编辑器里逐帧渲成 PNG(`SampleAnimation`
 + 手动推 SpriteSkin 蒙皮 + 相机渲到 RenderTexture),我自己能看,不用等人截图。
 环境变量选 prefab / 动画 / 采样数;`ANIMATORGO_RENDER_DEBUG=1` 顺带写每帧亮着的渲染器占图上哪块,

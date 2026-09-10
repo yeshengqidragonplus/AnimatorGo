@@ -270,27 +270,81 @@ public static class AnimatorGoVerify
 
         var scene = EditorSceneManager.NewScene(NewSceneSetup.DefaultGameObjects, NewSceneMode.Single);
 
-        // 每个角色横向排开,免得叠在一起看不出谁是谁
+        // 每个角色横向排开,免得叠在一起看不出谁是谁。
+        // ⚠️ 间距不能写死:地图建筑的 first_confirm 会把部件甩出去 18 个单位(1800 像素),
+        // 固定 12 单位摆的话,一播就甩到隔壁角色脸上 —— 用户就是这么看到「脸上叠加了东西」的。
+        // 所以先把每条动画采样一遍,按动画里实际占到的范围摆。
+        const float margin = 2f;
         float x = 0f;
+        float top = 0f;
+        float bottom = 0f;
         foreach (string guid in prefabGuids)
         {
-            var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(AssetDatabase.GUIDToAssetPath(guid));
+            string path = AssetDatabase.GUIDToAssetPath(guid);
+            var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(path);
+            Bounds extent = AnimatedExtent(prefab, path);
             var instance = (GameObject)PrefabUtility.InstantiatePrefab(prefab);
-            instance.transform.position = new Vector3(x, 0f, 0f);
-            x += 12f;
+            instance.transform.position = new Vector3(x - extent.min.x + margin, 0f, 0f);
+            x = instance.transform.position.x + extent.max.x + margin;
+            top = Mathf.Max(top, extent.max.y);
+            bottom = Mathf.Min(bottom, extent.min.y);
         }
 
         Camera camera = Camera.main;
         if (camera != null)
         {
             camera.orthographic = true;
-            camera.orthographicSize = 8f;
-            camera.transform.position = new Vector3((x - 12f) / 2f, 0f, -10f);
+            float halfWidth = x / 2f / camera.aspect;
+            camera.orthographicSize = Mathf.Max((top - bottom) / 2f, halfWidth) * 1.05f;
+            camera.transform.position = new Vector3(x / 2f, (top + bottom) / 2f, -10f);
             camera.clearFlags = CameraClearFlags.SolidColor;
             camera.backgroundColor = new Color(0.22f, 0.24f, 0.27f);
         }
 
         EditorSceneManager.SaveScene(scene, ScenePath);
         Debug.Log($"场景已存到 {ScenePath} —— 直接播就能看");
+    }
+
+    /// 这个 prefab 播完所有动画一共会占到多大(相对自己的原点)。
+    /// 逐条动画采样几帧取渲染器包围盒的并集;SpriteSkin 的蒙皮没推,所以留了余量。
+    static Bounds AnimatedExtent(GameObject prefab, string prefabPath)
+    {
+        var temp = (GameObject)PrefabUtility.InstantiatePrefab(prefab);
+        try
+        {
+            temp.transform.position = Vector3.zero;
+            Bounds all = new Bounds(Vector3.zero, Vector3.zero);
+            bool any = false;
+            void Accumulate()
+            {
+                foreach (Renderer r in temp.GetComponentsInChildren<Renderer>(false))
+                {
+                    if (!r.enabled) continue;
+                    if (!any) { all = r.bounds; any = true; }
+                    else all.Encapsulate(r.bounds);
+                }
+            }
+            Accumulate();
+
+            int cut = prefabPath.LastIndexOf('/');
+            string folder = cut < 0 ? AssetRoot : prefabPath.Substring(0, cut);
+            foreach (string clipGuid in AssetDatabase.FindAssets("t:AnimationClip", new[] { folder }))
+            {
+                var clip = AssetDatabase.LoadAssetAtPath<AnimationClip>(AssetDatabase.GUIDToAssetPath(clipGuid));
+                const int steps = 8;
+                for (int i = 0; i <= steps; i++)
+                {
+                    clip.SampleAnimation(temp, clip.length * i / steps);
+                    Accumulate();
+                }
+            }
+            if (!any) return new Bounds(Vector3.zero, new Vector3(4f, 4f, 0f));
+            all.Expand(all.size * 0.2f);
+            return all;
+        }
+        finally
+        {
+            UnityEngine.Object.DestroyImmediate(temp);
+        }
     }
 }
