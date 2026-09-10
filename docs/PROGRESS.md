@@ -1,4 +1,4 @@
-# 开发进度与交接(2026-09-08)
+# 开发进度与交接(2026-09-10)
 
 ## 产品定位
 
@@ -233,6 +233,11 @@ SpriteSkin 41 个全部 Ready;SkinnedMeshRenderer 59 个、形变目标 373 个,
 修法:烘焙前按像素判断并还原成直通 alpha(`src/spine-convert/unity/alpha.ts`),报 info。
 这一类「只有半透明多的部件才露馅」的问题,靶子是 Spine 里靠 alpha 藏/显的部件(眼白、眼睫、红晕)。
 
+**✅ 2026-09-10 用户在对比场景 Play 里确认:blackrichwoman / blackrichwoman@Pirate 已正常。**
+今天四个 bug(皮肤全导出、挂图节点初始全亮、逐帧绘制顺序没转、预乘 alpha)全是
+「setup 姿势看不出、一播就露馅」的,靠三张截图 + 在 Hierarchy 里指认叠加物是谁(`face4`)定位。
+**以后验产物一律要 Play 起来看,静态对比不算数;** 我这边用 `AnimatorGoRender.cs` 自己渲,不等截图。
+
 **对比场景的间距是写死的 12 单位,这对真实素材远远不够。** 用渲染工具量了各 prefab 播完所有动画
 实际占到的范围(Unity 单位,ppu 100):blackrichwoman 宽 17.4、高 30.4(图集缩放 k=7.7,骨架单位
 本来就是像素的 7.7 倍);17701 宽 22.5;wave 宽 17.9。12 单位间距一播就互相甩到对方身上 ——
@@ -290,9 +295,9 @@ controller 两层。**只对多皮肤骨架启用**,单皮肤骨架产物不变�
 路线已定(2026-09-09,见 [DECISIONS.md](DECISIONS.md)):**Spine → Unity 先做正常动画,
 VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
-1. **deform 的 Unity 肉眼确认** —— 六个样本已在 `UnityAnimationGo/Assets/AnimatorGo/`,等用户看
-2. **linkedmesh** —— 7 个骨架 / 138 处
-3. **跨度 < 64px 的加权网格不参与缩放分流**的边界(`Valentines_flower1/2`、`WestCowboy-sign` 缩放差 50% 留在 SpriteSkin)
+1. **linkedmesh** —— 7 个骨架 / 138 处,唯一剩下的纯功能缺口
+2. **跨度 < 64px 的加权网格不参与缩放分流**的边界(`Valentines_flower1/2`、`WestCowboy-sign` 缩放差 50% 留在 SpriteSkin)
+3. **运行时换皮肤**(同一实例 `SetSkin`)—— 方案已在 Unity 里验过(见上),等确认游戏里真有这个需求再做
 4. **Unity → Spine**(反方向)
 5. **Godot / Cocos 导出**
 6. `.skel` 里没有样本覆盖的区域:path 约束的字段顺序、音频事件的 `volume` / `balance`

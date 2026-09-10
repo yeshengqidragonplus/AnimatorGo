@@ -112,16 +112,21 @@ cp tools/unity/AnimatorGoVerify.cs UnityAnimationGo/Assets/Editor/
 ```
 
 然后在 Unity 里:`Tools ▸ AnimatorGo ▸ 检查转换产物`,或 `▸ 摆一个对比场景`。
-
-**自己看效果不用等人截图**:`tools/unity/AnimatorGoRender.cs` 把产物的动画在编辑器里逐帧渲成 PNG
-(batchmode 可跑,不能加 `-nographics`;环境变量 `ANIMATORGO_RENDER_PREFABS` / `_CLIPS` / `_STEPS` /
-`_DEBUG=1` 选范围,输出到工程目录下 `Renders/`),然后用 Read 直接看图。编辑器占着 UnityAnimationGo 时,
-把 `Packages/` `ProjectSettings/` `Assets/Settings/` 拷到临时目录另起一个工程跑。
 它盯的是**两类只有 Unity 自己知道、而且都不报错**的问题:
 
 1. **动画曲线的 `path` 指不到真实物体** —— Unity 直接忽略这条曲线,
    表现是「某个部件就是不动」,控制台一声不响
 2. **SpriteSkin 校验不过** —— 网格摊成一团或干脆不显示
+
+**自己看效果不用等人截图**:`tools/unity/AnimatorGoRender.cs` 把产物的动画在编辑器里逐帧渲成 PNG
+(batchmode 可跑,不能加 `-nographics`),然后用 Read 直接看图。环境变量选范围:
+`ANIMATORGO_RENDER_PREFABS` / `_CLIPS` / `_STEPS`;`_MODE=animator` 走真正的 Animator 状态机(含 Write
+Defaults,最接近运行时);`_FOCUS=<物体名>` 放大看局部;`_HIDE=a,b` 关掉某些渲染器对比;`_DEBUG=1` 顺带写
+每帧亮着的渲染器占图上哪块、颜色是什么。输出到工程目录下 `Renders/`。编辑器占着 UnityAnimationGo 时,
+把 `Packages/` `ProjectSettings/` `Assets/Settings/` 拷到临时目录另起一个工程跑。
+
+⚠️ **验产物一律要 Play 起来看,setup 姿势的静态对比不算数。** 皮肤全导出、挂图节点初始全亮、
+逐帧绘制顺序、预乘 alpha —— 四个 bug 全是「场景里看着好的,一播就露馅」。
 
 ⚠️ **`UnityAnimationGo/Assets/` 整个是 gitignore 掉的**,库里只留
 `Packages/` + `ProjectSettings/` + `README.md` 这层骨架。所以 Unity 侧要写的
