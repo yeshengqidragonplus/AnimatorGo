@@ -273,6 +273,9 @@ render/   薄适配层。PixiJS / Godot / Unity / Cocos 各一个
 - ⚠️ **Blend Shape 的增量不能抄 Spine 的逐影响偏移** —— 那些偏移换到世界空间并不一致
   (MC2 里 12~22% 的顶点分歧 >0.5px)。要按关键帧时刻的姿势反解 `M(Pₖ)·δ = Δₖ`。
   增量是「加完再蒙皮」(实测),与 Spine 同序。见 [UNITY-2D.md](docs/UNITY-2D.md) 11.4
+- ⚠️ **Spine 的图集是预乘 alpha 的,Unity 的 sprite 材质按直通 alpha 混合** —— 不还原的话半透明部件
+  发黑(face4 的红晕变成脸上一块深色叠加物),实心图只有一圈暗边看不出来。烘焙前按像素判断并还原,
+  见 [UNITY-2D.md](docs/UNITY-2D.md) 第 10 节
 - ⚠️ **SkinnedMeshRenderer 不会自动带 sprite 的纹理**,挂默认材质是纯白;每张图集页要写
   一个引用了它的 `.mat`。渲染器 `m_Quality` 写死 4 —— 真实工程 Low/Medium 档只有 2 根,Auto 会更差
 - ⚠️ **`.meta` 里有顶点就必须有等量的 `weights`,哪怕这个 sprite 没有骨骼** ——

@@ -32,6 +32,7 @@ import {
 } from '../../spine-eval/pose.ts'
 import { drawOrderOf, layerOfSlot, type DrawOrderOffset } from '../../spine-eval/drawOrder.ts'
 import { bakeAtlas, type BakedRect } from './bakeAtlas.ts'
+import { detectPremultiplied, unpremultiply } from './alpha.ts'
 import { attachmentScale, bindMesh, estimateAtlasScale, uvToRect, type SpineVertices } from './mesh.ts'
 
 /**
@@ -447,7 +448,23 @@ export function exportToUnity(
   }
 
   // ── 2. 烘焙图集 ──
-  const baked = bakeAtlas(atlas, sources, used.map((u) => u.regionName))
+  // Spine 导给 spine-unity 的图集默认是预乘 alpha,Unity 的 sprite 材质按直通 alpha 混合 ——
+  // 不还原的话半透明部件发黑(blackrichwoman 的 face4 红晕变成脸上一块深色叠加物)。见 alpha.ts
+  const straightSources = new Map<string, Image>()
+  for (const [pageName, image] of sources) {
+    const declared = atlas.pages.find((p) => p.name === pageName)?.pma === true
+    if (declared || detectPremultiplied(image)) {
+      straightSources.set(pageName, unpremultiply(image))
+      issues.add(
+        'info',
+        `atlas.${pageName}`,
+        `图集页是预乘 alpha(${declared ? '.atlas 里声明了 pma' : '按像素判断'}),Unity 的 sprite 材质要直通 alpha,已在烘焙时还原`,
+      )
+    } else {
+      straightSources.set(pageName, image)
+    }
+  }
+  const baked = bakeAtlas(atlas, straightSources, used.map((u) => u.regionName))
   for (const missing of baked.missing) {
     issues.loss(`region.${missing}`, `图集里没有 "${missing}",用到它的部件不会显示`)
   }

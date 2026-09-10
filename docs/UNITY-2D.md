@@ -377,6 +377,17 @@ URP 工程里可能要换成 `Sprite-Unlit-Default`。这属于一眼能看出�
 guid `13c02b14c4d048fa9653293d54f6e0e1` 取自包内样本;内置管线用 `Sprites/Default`
 (内置 shader fileID 10753)—— **这条没实测**,验证工程是 URP 的。
 
+### ⚠️ 图集是预乘 alpha 的,Unity 的 sprite 材质不是
+
+Spine 导给 spine-unity 的图集**默认预乘 alpha**(spine-unity 的 shader 按 PMA 采样)。
+实测 MergeCooking2 全部图集和 MX2_cat 都是:半透明像素里没有一个通道大于 alpha。
+Unity 自带的 sprite 材质按直通 alpha 混合,拿 PMA 图喂它等于 rgb 被乘了两次 alpha ——
+**半透明越多的部件越发黑**。实心图只在边缘有一圈暗边看不出来;blackrichwoman 的 `face4`
+(生气时的红晕,几乎全是半透明笔触)直接变成脸上一块深色的「叠加物」,用户在 Play 里一眼看到。
+
+处理:烘焙前把源图还原成直通 alpha(`rgb × 255 / a`,见 `alpha.ts`),报一条 info。
+3.8 的 `.atlas` 没有 pma 字段,只能按像素判断;4.x 有 `pma: true` 直接信。
+
 ## 11. SkinnedMeshRenderer 路径:deform / 非刚性 / 缩放不一致的网格
 
 `SpriteRenderer + SpriteSkin` 是默认路径,已验证的效果不动。**只有三类 SpriteSkin

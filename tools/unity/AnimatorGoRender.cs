@@ -37,6 +37,9 @@ public static class AnimatorGoRender
         // sample = AnimationClip.SampleAnimation 直接写属性(默认);
         // animator = 走真正的 Animator 状态机(Play + Update(0)),连 Write Defaults 一起,更接近运行时
         bool viaAnimator = Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_MODE") == "animator";
+        // 排查用:只框住某个渲染器(按物体名)放大看;把某些渲染器关掉对比
+        string focus = Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_FOCUS");
+        string[] hide = Split(Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_HIDE"));
         string outDir = Path.Combine(Directory.GetCurrentDirectory(), "Renders");
         Directory.CreateDirectory(outDir);
 
@@ -99,9 +102,14 @@ public static class AnimatorGoRender
                             skin.alwaysUpdate = true;
                             DeformNow(skin);
                         }
-                        Frame(cam, root);
+                        foreach (Renderer r in root.GetComponentsInChildren<Renderer>(true))
+                        {
+                            if (hide.Contains(r.name)) r.enabled = false;
+                        }
+                        Frame(cam, root, focus);
                         cam.Render();
-                        string stem = Path.Combine(outDir, $"{prefabName}_{clipName}_{i}_{t:0.00}s{(viaAnimator ? "_animator" : "")}");
+                        string suffix = (viaAnimator ? "_animator" : "") + (string.IsNullOrEmpty(focus) ? "" : $"_focus-{focus}") + (hide.Length > 0 ? "_hide" : "");
+                        string stem = Path.Combine(outDir, $"{prefabName}_{clipName}_{i}_{t:0.00}s{suffix}");
                         File.WriteAllBytes(stem + ".png", ReadPng(rt));
                         if (debug) File.WriteAllText(stem + ".txt", Describe(cam, root));
                         written++;
@@ -136,11 +144,12 @@ public static class AnimatorGoRender
         return value.Split(',').Select(x => x.Trim()).Where(x => x.Length > 0).ToArray();
     }
 
-    /// 相机框住所有亮着的渲染器
-    static void Frame(Camera cam, GameObject root)
+    /// 相机框住所有亮着的渲染器;给了 focus 就只框那个物体(放大看局部)
+    static void Frame(Camera cam, GameObject root, string focus = null)
     {
         Renderer[] renderers = root.GetComponentsInChildren<Renderer>(false)
             .Where(r => r.enabled && r.gameObject.activeInHierarchy)
+            .Where(r => string.IsNullOrEmpty(focus) || r.name == focus)
             .ToArray();
         if (renderers.Length == 0) return;
 
@@ -170,16 +179,18 @@ public static class AnimatorGoRender
                 + $"y {all.min.y - root.transform.position.y:0.##} .. {all.max.y - root.transform.position.y:0.##}");
         }
         sb.AppendLine($"# camera ortho size {cam.orthographicSize:0.###} at {cam.transform.position.x:0.##},{cam.transform.position.y:0.##}");
-        sb.AppendLine("name\tsortingOrder\tkind\txMin\tyMin\txMax\tyMax\tworldMin\tworldMax");
+        sb.AppendLine("name\tsortingOrder\tkind\txMin\tyMin\txMax\tyMax\tworldMin\tworldMax\tcolor");
         foreach (Renderer r in renderers)
         {
             Bounds b = r.bounds;
             Vector3 min = cam.WorldToScreenPoint(b.min);
             Vector3 max = cam.WorldToScreenPoint(b.max);
-            // 屏幕坐标原点在左下,翻成图片的左上原点;后两列是世界坐标,用来核对包围盒本身对不对
+            // Spine 常用 alpha=0 藏部件(眼白、眼睫),所以把 SpriteRenderer 的颜色也列出来
+            string color = r is SpriteRenderer sr ? $"rgba({sr.color.r:0.##},{sr.color.g:0.##},{sr.color.b:0.##},{sr.color.a:0.##})" : "-";
+            // 屏幕坐标原点在左下,翻成图片的左上原点;world 两列用来核对包围盒本身对不对
             sb.AppendLine(
                 $"{r.name}\t{r.sortingOrder}\t{r.GetType().Name}\t{min.x:0}\t{Height - max.y:0}\t{max.x:0}\t{Height - min.y:0}"
-                + $"\t({b.min.x:0.##},{b.min.y:0.##})\t({b.max.x:0.##},{b.max.y:0.##})");
+                + $"\t({b.min.x:0.##},{b.min.y:0.##})\t({b.max.x:0.##},{b.max.y:0.##})\t{color}");
         }
         return sb.ToString();
     }

@@ -225,6 +225,14 @@ SpriteSkin 41 个全部 Ready;SkinnedMeshRenderer 59 个、形变目标 373 个,
 顺序,挪过位的 slot 在**每条**动画里都写 `m_SortingOrder` 阶梯曲线(没挪的动画写 setup 值,
 不依赖 Write Defaults 还原)。SpriteRenderer(212)与 SkinnedMeshRenderer(137)都能被驱动(排查过)。
 
+**用户在 Play 里指认「脸上叠加的东西」是 `face4`(2026-09-10)—— 根因是预乘 alpha。**
+`face4` 是生气时脸上的红晕,几乎全是半透明笔触,setup 时 alpha 0、`angry` 里 alpha 1,颜色曲线没错。
+错的是贴图:Spine 导给 spine-unity 的图集**默认预乘 alpha**(量了 MC2 全部样本和 MX2_cat,半透明像素
+里没有一个通道大于 alpha),Unity 的 sprite 材质按直通 alpha 混合,rgb 被乘了两次 alpha → 半透明部件
+发黑,红晕成了深色叠加物;实心图只在边缘一圈暗边,所以 MX2_cat「看起来完美」。
+修法:烘焙前按像素判断并还原成直通 alpha(`src/spine-convert/unity/alpha.ts`),报 info。
+这一类「只有半透明多的部件才露馅」的问题,靶子是 Spine 里靠 alpha 藏/显的部件(眼白、眼睫、红晕)。
+
 **对比场景的间距是写死的 12 单位,这对真实素材远远不够。** 用渲染工具量了各 prefab 播完所有动画
 实际占到的范围(Unity 单位,ppu 100):blackrichwoman 宽 17.4、高 30.4(图集缩放 k=7.7,骨架单位
 本来就是像素的 7.7 倍);17701 宽 22.5;wave 宽 17.9。12 单位间距一播就互相甩到对方身上 ——

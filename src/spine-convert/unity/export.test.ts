@@ -785,6 +785,34 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
     expect(checked).toBeGreaterThan(0)
   })
 
+  /**
+   * Spine 导出的图集是预乘 alpha(MX2_cat 也是),Unity 的 sprite 材质要直通 alpha。
+   * 烘焙后的图必须已经还原:半透明像素里要有 RGB 大于 alpha 的。
+   */
+  it('⭐ 预乘 alpha 的图集烘焙后是直通 alpha', () => {
+    const source = sources.get('MX2_cat.png')!
+    let semi = 0
+    let over = 0
+    for (let i = 0; i < source.data.length; i += 4) {
+      const a = source.data[i + 3]!
+      if (a === 0 || a === 255) continue
+      semi++
+      if (Math.max(source.data[i]!, source.data[i + 1]!, source.data[i + 2]!) > a + 2) over++
+    }
+    expect(semi).toBeGreaterThan(1000)
+    expect(over).toBe(0) // 源图确实是预乘的
+
+    const baked = decodePng(fileOf('.png').content as Uint8Array)
+    let bakedOver = 0
+    for (let i = 0; i < baked.data.length; i += 4) {
+      const a = baked.data[i + 3]!
+      if (a === 0 || a === 255) continue
+      if (Math.max(baked.data[i]!, baked.data[i + 1]!, baked.data[i + 2]!) > a + 2) bakedOver++
+    }
+    expect(bakedOver).toBeGreaterThan(100)
+    expect(result.issues.some((i) => i.level === 'info' && i.message.includes('预乘'))).toBe(true)
+  })
+
   it('有损的地方都报出来了,不静默', () => {
     const kinds = result.issues.map((i) => `${i.level}:${i.path}`)
     // deform 转成 Blend Shape、逐帧绘制顺序转成 m_SortingOrder 曲线,都不再是 loss
