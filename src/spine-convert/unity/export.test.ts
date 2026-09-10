@@ -767,9 +767,10 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
       }
     }
     expect(disabledFound).toBe(disabledExpected)
-    // 只有一套皮肤:GameObject 全部激活,没有皮肤层
+    // 只有一套皮肤:GameObject 全部激活,没有皮肤层,贴图也只有一张
     expect([...prefab.activeOf.values()].every((a) => a)).toBe(true)
     expect(result.files.some((f) => f.path.includes('@skin@'))).toBe(false)
+    expect(result.files.filter((f) => f.path.endsWith('.png')).map((f) => f.path)).toEqual(['MX2_cat.png'])
     expect(textOf('.controller')).not.toContain('m_Name: Skin')
 
     // 换图时间轴打在渲染器的 m_Enabled 上,不碰 m_IsActive
@@ -966,6 +967,21 @@ describe.skipIf(!existsSync(MC2_BRW))('皮肤:全部导进一个 prefab,皮肤�
     expect(curveMap(angry, 'm_Enabled').has('eye__eye4')).toBe(true)
 
     expect(result.issues.find((i) => i.path === 'skin')?.message).toContain('animator.Play')
+
+    // 贴图按皮肤拆:本体一张,每套具名皮肤各一张;海盗帽只在海盗那张里
+    const pngs = result.files.filter((f) => f.path.endsWith('.png')).map((f) => f.path).sort()
+    expect(pngs).toEqual(
+      ['brw.png', ...['3rd_anniversary', 'Christmas_day', 'Pirate', 'Valentines_day', 'WestCowboy'].map((s) => `brw@skin@${s}.png`)].sort(),
+    )
+    // 牛仔帽是 region → 牛仔那张贴图的 sprite 表里有它,本体那张没有
+    expect(textIn(result, 'brw@skin@WestCowboy.png.meta')).toContain('name: WestCowboy-hat')
+    expect(textIn(result, 'brw.png.meta')).not.toContain('name: WestCowboy-hat')
+    expect(textIn(result, 'brw.png.meta')).toContain('name: hair-b')
+    // 海盗三件都走 SkinnedMeshRenderer(非刚性),它们的材质引用的是海盗那张贴图
+    const pirateGuid = /guid: ([0-9a-f]+)/.exec(textIn(result, 'brw@skin@Pirate.png.meta'))![1]!
+    expect(textIn(result, 'brw@skin@Pirate.mat')).toContain(`m_Texture: {fileID: 2800000, guid: ${pirateGuid}`)
+    const pirateMatGuid = /guid: ([0-9a-f]+)/.exec(textIn(result, 'brw@skin@Pirate.mat.meta'))![1]!
+    expect(readSkinnedRenderers(textIn(result, '.prefab')).find((r) => r.name === PIRATE_HAT)?.materialGuid).toBe(pirateMatGuid)
   })
 
   it('--skin Pirate:初始皮肤是海盗 —— 海盗三件亮,别的皮肤灭,皮肤层默认 state 是 Pirate', () => {

@@ -483,21 +483,53 @@ export function exportToUnity(
       straightSources.set(pageName, image)
     }
   }
-  const baked = bakeAtlas(atlas, straightSources, used.map((u) => u.regionName))
+  // ── 按皮肤分组烘焙:默认皮肤一组(<骨架>.png),每套具名皮肤各一组(<骨架>@skin@<皮肤>.png)──
+  // 学 Spine「每皮肤一页」的打包方式:换装件的图不混进本体的图里,好归档、好按皮肤打包。
+  // 两套具名皮肤共用的图归默认组 —— 默认组反正总在。
+  // ⚠️ 这不会让运行时少加载贴图:prefab 里所有皮肤的节点都硬引用着自己的 sprite,
+  // 实例化时 Unity 会把每张贴图都加载进来。要按需加载得走 Addressables 之类的软引用,那是游戏侧的事。
+  const groupOf = new Map<string, string>()
+  for (const u of used) {
+    const group = isDefaultSkin(u.skin) ? '' : u.skin
+    const prev = groupOf.get(u.regionName)
+    if (prev === undefined) groupOf.set(u.regionName, group)
+    else if (prev !== group) groupOf.set(u.regionName, '')
+  }
+  const groups: { skin: string; names: string[] }[] = [{ skin: '', names: [] }, ...namedSkins.map((s) => ({ skin: s.name, names: [] as string[] }))]
+  for (const [regionName, group] of groupOf) (groups.find((g) => g.skin === group) ?? groups[0]!).names.push(regionName)
+
+  const pages: Image[] = []
+  /** 页下标 → 文件名(不含扩展名) */
+  const pageNames: string[] = []
+  const rects = new Map<string, BakedRect>()
+  const missingRegions: string[] = []
+  for (const group of groups) {
+    if (group.names.length === 0) continue
+    const part1 = bakeAtlas(atlas, straightSources, group.names)
+    const offset = pages.length
+    const base = group.skin === '' ? name : sanitize(`${name}@skin@${group.skin}`)
+    part1.pages.forEach((page, i) => {
+      pages.push(page)
+      pageNames.push(part1.pages.length === 1 ? base : `${base}_${i}`)
+    })
+    for (const [regionName, rect] of part1.rects) rects.set(regionName, { ...rect, page: rect.page + offset })
+    missingRegions.push(...part1.missing)
+    if (part1.pages.length > 1) {
+      issues.add(
+        'info',
+        'atlas',
+        `${group.skin === '' ? '默认皮肤' : `皮肤 "${group.skin}"`}的图烘焙后有 ${part1.pages.length} 页 —— ` +
+          '一个 SpriteRenderer 只能引用一张图,跨页的部件会分批渲染',
+      )
+    }
+  }
+  const baked = { pages, rects, missing: missingRegions }
   for (const missing of baked.missing) {
     issues.loss(`region.${missing}`, `图集里没有 "${missing}",用到它的部件不会显示`)
   }
-  if (baked.pages.length > 1) {
-    issues.add(
-      'info',
-      'atlas',
-      `烘焙后有 ${baked.pages.length} 张图集页 —— 一个 SpriteRenderer 只能引用一张图,` +
-        '跨页的部件会分批渲染',
-    )
-  }
 
-  const textureGuids = baked.pages.map((_, i) => unityGuid(`${name}/texture/${i}`))
-  const materialGuids = baked.pages.map((_, i) => unityGuid(`${name}/material/${i}`))
+  const textureGuids = baked.pages.map((_, i) => unityGuid(`${name}/texture/${pageNames[i]}`))
+  const materialGuids = baked.pages.map((_, i) => unityGuid(`${name}/material/${pageNames[i]}`))
 
   // ── 图集缩放 ──
   // Spine 导出图集时可以带缩放,`.atlas` 里没记,只能从数据反推。
@@ -1426,7 +1458,7 @@ export function exportToUnity(
 
   // ── 6. 汇总产物 ──
   baked.pages.forEach((page, i) => {
-    const pageName = baked.pages.length === 1 ? name : `${name}_${i}`
+    const pageName = pageNames[i]!
     files.push({ path: `${pageName}.png`, content: options.skipImages === true ? '' : encodePng(page) })
     files.push({
       path: `${pageName}.png.meta`,
@@ -1460,7 +1492,7 @@ export function exportToUnity(
   }
   // SkinnedMeshRenderer 不会像 SpriteRenderer 那样自动带上 sprite 的纹理,材质要显式引用图集页
   for (const page of new Set(skinned.map((g) => g.page))) {
-    const pageName = baked.pages.length === 1 ? name : `${name}_${page}`
+    const pageName = pageNames[page]!
     files.push({
       path: `${pageName}.mat`,
       content: writeSpriteMaterial({

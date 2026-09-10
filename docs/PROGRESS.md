@@ -291,6 +291,8 @@ Animator 会把没写的分量当 0 写进去,把物体挪到原点。
 - `--skin` 只定初始皮肤,不再过滤;产物名不再带后缀。单皮肤骨架没有皮肤层、没有皮肤 clip
 - `AnimatorGoRender` 跳过皮肤 clip,`ANIMATORGO_RENDER_SKIN=<皮肤>` 在 animator 模式下走
   `animator.Play(皮肤, 1)`,和游戏里那一行一模一样;`AnimatorGoVerify` 顺带校验皮肤 clip 的绑定
+- 贴图按皮肤拆(用户问的):默认皮肤 `<骨架>.png`,每套具名皮肤 `<骨架>@skin@<皮肤>.png`,共用的图归默认。
+  **不会让运行时少加载**(prefab 硬引用全部 sprite),收益是归档与按皮肤打包;按需加载要游戏侧走软引用
 
 验证:MX2_cat 单皮肤用例改查渲染器 `m_Enabled`、无皮肤层;blackrichwoman 本地用例查 6 套皮肤的节点、
 初始亮灭、皮肤 clip 的内容、controller 两层与默认 state、动画 clip 不碰 `m_IsActive`。

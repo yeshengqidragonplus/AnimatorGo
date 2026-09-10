@@ -78,7 +78,8 @@ pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [
 所以显隐拆成两个互相独立的开关:渲染器 `m_Enabled` 管换图(attachment 时间轴驱动),GameObject
 `m_IsActive` 管皮肤(controller 第 1 层 `Skin`,每套皮肤一个 state,一条静态 clip)。切皮肤 =
 `animator.Play("皮肤名", 1)`,零脚本。`--skin` 只定初始皮肤(默认皮肤空着就取第一套具名皮肤)。
-具名皮肤的挂图节点名带 `@皮肤名`。单皮肤骨架没有这一层。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 13 节。
+具名皮肤的挂图节点名带 `@皮肤名`,贴图也按皮肤拆(`<骨架>@skin@<皮肤>.png`)。单皮肤骨架没有这一层。
+⚠️ 拆贴图**不会**让运行时少加载 —— prefab 硬引用着所有皮肤的 sprite。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 13 节。
 
 产出**可以直接拖进 Assets 就播**的一整套:烘焙后的图集 PNG + `.meta`
 (含骨骼、网格、权重)、prefab(骨骼层级 + SpriteRenderer + SpriteSkin + Animator)、
