@@ -132,6 +132,30 @@ Spine 的 deform 顶点动画在 MergeCooking2 里占 **32% 的骨架**,且数�
 `m_SortingOrder` 可以打关键帧(SpriteRenderer 与 SkinnedMeshRenderer 都行),2026-09-10 已做。
 排查结论全文见 [PROGRESS.md](PROGRESS.md)「Blend Shape 路线的排查结论」。
 
+## 皮肤:一个 prefab 装全部,Animator 皮肤层切 · 已定 · 2026-09-10
+
+Spine 的皮肤是运行时查表(键名 → 当前皮肤 → 默认皮肤),Unity 没有这张表。一个挂图节点要同时
+满足「换图时间轴说这个键名亮着」和「属于当前皮肤」才该显示。用户看了 blackrichwoman 的对比图后
+问「怎么动态换肤」,先用 `tools/unity/AnimatorGoProbeSkin.cs` 验过再做。
+
+**定:两个互相独立的显隐开关,各由 Animator 的一层驱动,零运行时脚本。**
+
+| 开关 | 谁控制 | 对应 Spine |
+|---|---|---|
+| 渲染器 `m_Enabled` | 基础层:换图时间轴的阶梯曲线 | 时间轴按键名亮灭 |
+| GameObject `m_IsActive` | 皮肤层(override,权重 1):每套皮肤一个 state,一条静态 clip | `SetSkin()` |
+
+切皮肤 = `animator.Play("皮肤名", 1)`。渲染要两个开关都开(AND),实测成立。
+
+**否决的替代方案:**
+- **一套皮肤一份 prefab**(曾短暂采用)—— 正确但不能在同一个实例上切;动画和图集每套复制一份
+- **Unity 自带的 SpriteLibrary + SpriteResolver** —— 它是「同一个渲染器换 sprite」,网格顶点数不同的
+  attachment 换不过去,和「一个 attachment 一个物体」的根基冲突
+- **每套皮肤一个父节点分组** —— 挂图节点要挂在骨骼下继承变换,不能同时挂在皮肤组下
+
+代价:一张图集含所有皮肤的图(MC2 的换装件都很小;十套整身换装的骨架要另议)。
+换图时间轴的开关从 `m_IsActive` 挪到了渲染器 `m_Enabled`,**单皮肤骨架也一起改**,两种编码并存不值得。
+
 ## 架构
 
 ### ~~自建格式 + 每引擎一个运行时~~ · **已推翻** · 2026-08-06

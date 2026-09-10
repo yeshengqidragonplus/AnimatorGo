@@ -94,9 +94,8 @@ export interface UnityExportOptions {
    */
   readonly skipImages?: boolean
   /**
-   * 导出哪套皮肤(与默认皮肤一起)。Spine 一次只有一套皮肤生效,Unity 没有皮肤的概念,
-   * 所以**一次导出一套**;不给时只导默认皮肤(默认皮肤空着就自动选第一套)。
-   * 全部导出会让所有换装件同时出现 —— 实测 blackrichwoman:海盗帽上叠着生日帽和圣诞围巾。
+   * 初始皮肤(Animator 皮肤层的默认 state)。**所有皮肤都会导进同一个 prefab**,运行时用
+   * `animator.Play("皮肤名", 1)` 切;不给时初始是默认皮肤(默认皮肤空着就取第一套具名皮肤)。
    */
   readonly skin?: string
 }
@@ -381,39 +380,59 @@ export function exportToUnity(
     }
   }
 
-  // ── 皮肤:一次只导一套 ──
+  // ── 皮肤:全部导进一个 prefab,运行时靠 Animator 的皮肤层切 ──
+  //
+  // Spine 的皮肤是运行时查表(键名 → 当前皮肤 → 默认皮肤),Unity 没有这张表。
+  // 一个挂图节点要同时满足两个条件才该显示:换图时间轴说这个键名亮着、且它属于当前皮肤。
+  // 两个条件放在两个互相独立的开关上(渲染器 m_Enabled / GameObject m_IsActive),
+  // 各由 Animator 的一层驱动;皮肤层每套皮肤一个 state,切皮肤 = animator.Play("皮肤名", 1)。
+  // 方案在 tools/unity/AnimatorGoProbeSkin.cs 里验过。
   const isRenderable = (a: Attachment) => a.type === 'region' || a.type === 'mesh'
   const renderCount = (s: Skin) => s.slots.reduce((n, e) => n + e.attachments.filter(isRenderable).length, 0)
   const defaultSkin = part.skins.find((s) => s.name === 'default') ?? part.skins[0]
-  const otherSkins = part.skins.filter((s) => s !== defaultSkin)
-  let chosenSkin: Skin | null = null
+  const namedSkins = part.skins.filter((s) => s !== defaultSkin && renderCount(s) > 0)
+  let initialSkin: Skin | undefined = defaultSkin
   if (options.skin !== undefined) {
     const found = part.skins.find((s) => s.name === options.skin)
     if (found === undefined) {
       throw new Error(`骨架里没有皮肤 "${options.skin}",有:${part.skins.map((s) => s.name).join('、')}`)
     }
-    if (found !== defaultSkin) chosenSkin = found
-  } else if (defaultSkin !== undefined && renderCount(defaultSkin) === 0 && otherSkins.length > 0) {
-    // 不少骨架把所有东西都放在具名皮肤里,默认皮肤是空的 —— 只导默认就是一个空角色
-    chosenSkin = otherSkins[0]!
-    issues.add('info', 'skin', `默认皮肤没有可渲染的 attachment,自动选了皮肤 "${chosenSkin.name}"(用 --skin 指定别的)`)
+    initialSkin = found
+  } else if (defaultSkin !== undefined && renderCount(defaultSkin) === 0 && namedSkins.length > 0) {
+    // 不少骨架把所有东西都放在具名皮肤里,默认皮肤是空的 —— 初始就选默认会是一个空角色
+    initialSkin = namedSkins[0]!
+    issues.add('info', 'skin', `默认皮肤没有可渲染的 attachment,初始皮肤取 "${initialSkin.name}"(用 --skin 指定别的)`)
   }
-  const selectedSkins = [defaultSkin, chosenSkin].filter((s): s is Skin => s !== undefined && s !== null)
-  const skippedSkins = otherSkins.filter((s) => s !== chosenSkin)
-  if (skippedSkins.length > 0) {
+  /** 皮肤层的 state:默认皮肤 + 每套有东西的具名皮肤;只有一套皮肤就不需要这一层 */
+  const skinStates: Skin[] = namedSkins.length > 0 ? [defaultSkin, ...namedSkins].filter((s): s is Skin => s !== undefined) : []
+  if (skinStates.length > 0) {
     issues.add(
       'info',
       'skin',
-      `Spine 一次只有一套皮肤生效,本次导出 ${selectedSkins.map((s) => `"${s.name}"`).join(' + ')};` +
-        `未导出 ${skippedSkins.map((s) => `"${s.name}"(${renderCount(s)} 件)`).join('、')} —— 用 --skin 选`,
+      `${skinStates.length} 套皮肤全部导进一个 prefab(${skinStates.map((s) => `"${s.name}"`).join('、')}),初始 "${initialSkin?.name}";` +
+        '运行时切换:animator.Play("皮肤名", 1)',
     )
+  }
+  const isDefaultSkin = (skinName: string) => skinName === defaultSkin?.name
+  /** 皮肤 `skin` 生效时这个挂图节点该不该亮 —— 皮肤那一维,不含换图时间轴 */
+  const visibleUnderSkin = (item: SlotAttachment, skin: Skin | undefined): boolean => {
+    if (skin === undefined) return isDefaultSkin(item.skin)
+    if (item.skin === skin.name) return true
+    if (!isDefaultSkin(item.skin)) return false
+    // 默认皮肤的件,被具名皮肤里同 slot 同键名的那件盖住(Spine 先查皮肤再查默认)
+    return !skin.slots.some((e) => e.slot === item.slot && e.attachments.some((a) => a.key === item.key && isRenderable(a)))
+  }
+  /** 挂图节点名:slot 名(键名与 slot 同名)或 slot__键名;具名皮肤的再带 @皮肤名,免得和别的皮肤同键名的撞 */
+  const attachmentNodeName = (item: SlotAttachment, slotName: string): string => {
+    const base = item.key === slotName ? slotName : `${slotName}__${item.key}`
+    return sanitize(isDefaultSkin(item.skin) ? base : `${base}@${item.skin}`)
   }
 
   // ── 1. 收集 attachment ──
   const used: SlotAttachment[] = []
   const spriteNames = new Set<string>()
 
-  for (const skin of selectedSkins) {
+  for (const skin of part.skins) {
     for (const entry of skin.slots) {
       for (const attachment of entry.attachments) {
         if (attachment.type === 'region' || attachment.type === 'mesh') {
@@ -837,17 +856,20 @@ export function exportToUnity(
       item.node = nodes.length
       geo.nodeIndex = item.node
       nodes.push({
-        name: claimName(0, sanitize(item.key === slot.name ? slot.name : `${slot.name}__${item.key}`)),
+        name: claimName(0, attachmentNodeName(item, slot.name)),
         parent: 0,
         position: { x: 0, y: 0, z: 0 },
         rotation: { x: 0, y: 0, z: 0, w: 1 },
         scale: { x: 1, y: 1, z: 1 },
         renderer: null,
         skin: null,
-        active: item.key === slot.attachmentName,
+        // 皮肤那一维:属于初始皮肤才亮
+        active: visibleUnderSkin(item, initialSkin),
         skinnedMesh: {
           mesh: { fileID: MESH_FILE_ID, guid: meshGuidOf(item.spriteName) },
           material: { fileID: MATERIAL_FILE_ID, guid: materialGuids[info.page]! },
+          // 换图那一维:setup pose 只亮 attachmentName 那一个
+          enabled: item.key === slot.attachmentName,
           bones: geo.subset.map((b) => boneNode[b]!),
           rootBone: boneNode[geo.subset[0]!]!,
           blendShapeCount: 0, // 动画转完再补
@@ -864,6 +886,8 @@ export function exportToUnity(
       // Spine 的 slots 数组顺序就是绘制顺序,先画的在下层
       sortingOrder: item.slot,
       color,
+      // 换图那一维:setup pose 只亮 attachmentName 那一个;表情变体初始是灭的
+      enabled: item.key === slot.attachmentName,
     }
 
     let parent: number
@@ -916,15 +940,15 @@ export function exportToUnity(
 
     item.node = nodes.length
     nodes.push({
-      name: claimName(parent, sanitize(item.key === slot.name ? slot.name : `${slot.name}__${item.key}`)),
+      name: claimName(parent, attachmentNodeName(item, slot.name)),
       parent,
       position,
       rotation,
       scale: nodeScale,
       renderer,
       skin,
-      // setup pose:一个 slot 只亮 attachmentName 那一个;表情变体、换装件初始是灭的
-      active: item.key === slot.attachmentName,
+      // 皮肤那一维:属于初始皮肤才亮。换图那一维在 renderer.enabled 上
+      active: visibleUnderSkin(item, initialSkin),
     })
   }
 
@@ -1262,7 +1286,9 @@ export function exportToUnity(
         }
 
         // 换图:Spine 是「这一刻挂哪个 attachment」,Unity 侧一个 attachment 一个物体,
-        // 所以变成一组互斥的 m_IsActive 阶梯曲线
+        // 所以变成一组互斥的阶梯曲线,打在**渲染器的 m_Enabled** 上。
+        // 不能打在 GameObject 的 m_IsActive 上 —— 那是皮肤层的开关;同一个键名在几套皮肤里各有
+        // 一个节点,它们共用这条曲线,谁真的显示由皮肤层决定(两个开关是 AND)
         if (t.kind === 'attachment') {
           const slot = part.slots[t.owner]
           const list = slotNodes.get(t.owner)
@@ -1275,7 +1301,8 @@ export function exportToUnity(
             const keys: UnityKeyframe[] = []
             if (times[0]! > 0) keys.push(key(0, slot.attachmentName === item.key ? 1 : 0, true))
             times.forEach((time, i) => keys.push(key(time, names[i] === item.key ? 1 : 0, true)))
-            floats.push({ path: paths[item.node]!, attribute: 'm_IsActive', classID: 1, keys })
+            const classID = sprites.get(item.spriteName)?.skinned === true ? 137 : 212
+            floats.push({ path: paths[item.node]!, attribute: 'm_Enabled', classID, keys })
           }
           continue
         }
@@ -1318,12 +1345,8 @@ export function exportToUnity(
           const d = t.frames[0] as unknown as DeformRecord
           const geo = skinnedByKey.get(`${skinNameOf(d.skin)}/${t.owner}/${d.attachment}`)
           if (geo === undefined || geo.nodeIndex < 0) {
-            const skinName = skinNameOf(d.skin)
-            const type = attachmentTypeOf(skinName, t.owner, d.attachment)
-            if (!selectedSkins.some((s) => s.name === skinName)) {
-              // 这条 deform 属于没导出的皮肤,连它的网格都不在产物里 —— 不是丢失,是本次不导
-              issues.add('info', `deform[${t.owner}]`, `deform 指向皮肤 "${skinName}" 的 "${d.attachment}",该皮肤本次未导出,已跳过`)
-            } else if (type !== null && type !== 'mesh' && type !== 'linkedmesh') {
+            const type = attachmentTypeOf(skinNameOf(d.skin), t.owner, d.attachment)
+            if (type !== null && type !== 'mesh' && type !== 'linkedmesh') {
               // 实测 MergeCooking2 的 wave:deform 打在 path 上(路径约束用),没有可渲染的东西
               issues.add('info', `deform[${t.owner}]`, `deform 指向的 "${d.attachment}" 是 ${type},不参与渲染,已跳过`)
             } else {
@@ -1460,25 +1483,57 @@ export function exportToUnity(
     issues.loss(`color.${spriteName}`, 'slot 颜色动画在 SkinnedMeshRenderer 上没有对应属性(静态颜色已烘进顶点色),已丢弃')
   }
 
+  // ── 皮肤层:每套皮肤一条静态 clip,只写挂图节点的 m_IsActive ──
+  // 剪辑名 <骨架>@skin@<皮肤>,和动画剪辑区分开(AnimatorGoRender 靠这个跳过它们)
+  const skinClips: { name: string; guid: string }[] = []
+  for (const skin of skinStates) {
+    const clipName = sanitize(`${name}@skin@${skin.name}`)
+    const guid = unityGuid(`${name}/skin/${skin.name}`)
+    const skinFloats: FloatCurve[] = []
+    for (const item of used) {
+      if (item.node < 0) continue
+      const on = visibleUnderSkin(item, skin) ? 1 : 0
+      // 两个键撑出一点长度,免得零长度 clip 在某些版本里被当成空
+      skinFloats.push({ path: paths[item.node]!, attribute: 'm_IsActive', classID: 1, keys: [key(0, on, true), key(1 / 60, on, true)] })
+    }
+    files.push({
+      path: `${clipName}.anim`,
+      content: writeAnim({
+        name: clipName,
+        sampleRate: part.header.fps ?? 30,
+        loop: false,
+        position: [],
+        euler: [],
+        scale: [],
+        float: skinFloats,
+        pptr: [],
+      }),
+    })
+    files.push({ path: `${clipName}.anim.meta`, content: writeNativeMeta(guid, CLIP_FILE_ID) })
+    skinClips.push({ name: skin.name, guid })
+  }
+
   const controllerGuid = unityGuid(`${name}/controller`)
   const prefabGuid = unityGuid(`${name}/prefab`)
+  const needsController = part.animations.length > 0 || skinClips.length > 0
 
   files.push({
     path: `${name}.prefab`,
     content: writePrefab(nodes, {
       seed: name,
-      controller: part.animations.length === 0 ? null : { fileID: 9100000, guid: controllerGuid },
+      controller: needsController ? { fileID: 9100000, guid: controllerGuid } : null,
       renderPipeline: options.renderPipeline,
     }),
   })
   files.push({ path: `${name}.prefab.meta`, content: writePrefabMeta(prefabGuid) })
 
-  if (part.animations.length > 0) {
+  if (needsController) {
     files.push({
       path: `${name}.controller`,
       content: writeController(
         name,
         part.animations.map((a) => ({ name: sanitize(`${name}@${a.name}`), guid: clipGuids.get(a.name)! })),
+        skinClips.length > 0 ? [{ name: 'Skin', states: skinClips, defaultState: initialSkin?.name ?? skinClips[0]!.name }] : [],
       ),
     })
     files.push({ path: `${name}.controller.meta`, content: writeNativeMeta(controllerGuid, 9100000) })

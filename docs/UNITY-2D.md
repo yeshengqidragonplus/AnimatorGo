@@ -15,8 +15,8 @@
 |---|---|---|
 | 骨骼层级 | `bones[]`(在 sprite 的 `.meta` 里)+ 场景 Transform | ✅ 可映射 |
 | 网格 + 顶点权重 | `vertices` / `indices` / `weights` | ⚠️ **每顶点最多 4 根骨骼** |
-| slot 换图 | 一个 attachment 一个物体 + `m_IsActive` 曲线;初始显隐按 setup pose(同一 slot 只亮 `attachmentName` 那个) | ✅ 可映射(不必用 SpriteLibrary) |
-| 皮肤 | —— | ⚠️ Unity 没有;**一次导出一套**(默认 + `--skin` 选的),产物名带 `@皮肤名` |
+| slot 换图 | 一个 attachment 一个物体 + 渲染器 `m_Enabled` 阶梯曲线;初始显隐按 setup pose(同一 slot 只亮 `attachmentName` 那个) | ✅ 可映射(不必用 SpriteLibrary) |
+| 皮肤 | 没有查表;用 GameObject `m_IsActive` + Animator 第二层「每套皮肤一个 state」 | ✅ **一个 prefab 装全部皮肤**,`animator.Play("皮肤名", 1)` 切,见第 13 节 |
 | 骨骼 TRS 动画 | `.anim` 的 Position / Euler / Scale 曲线 | ✅ 可映射 |
 | IK | 包内 `IK/` 模块 | ⚠️ 有,但**未转换也未烘进曲线**,受 IK 驱动的骨骼停在自己的关键帧上 |
 | **deform 顶点关键帧** | 2D 包里没有;用 **`SkinnedMeshRenderer` 的 Blend Shape** | ✅ **走另一条网格路径**,见第 11 节 |
@@ -507,7 +507,53 @@ Spine 的 drawOrder 一帧只存「哪些 slot 挪了几位」(`offsets: [{slot,
 静态顺序下 `angry` 的手表整个消失在左臂后面 —— setup 姿势手臂不交叉所以场景里看不出,
 一播就错。这是用户第一个撞上的播放问题。
 
-## 13. 待确认
+## 13. 皮肤:两个显隐开关 + Animator 皮肤层
+
+Spine 的皮肤是运行时查表:换图时间轴写的是**键名**,播放时拿键名先查当前皮肤、查不到再查默认皮肤。
+Unity 没有这张表。我们把表拆掉了(一个 attachment 一个物体),于是一个挂图节点要同时满足两个条件才该显示:
+
+1. 换图时间轴说这个键名此刻是亮的(动画驱动,逐帧变)
+2. 这个节点属于当前皮肤(运行时状态,切皮肤才变)
+
+Unity 的渲染器恰好自带两个互相独立的开关,渲染要两个都开(AND,实测):
+
+| 开关 | 谁控制 | 对应 Spine |
+|---|---|---|
+| 渲染器 `m_Enabled`(SpriteRenderer classID 212 / SkinnedMeshRenderer 137) | 基础层:换图时间轴的阶梯曲线;setup pose 的初始值也写在这 | 时间轴按键名亮灭 |
+| GameObject `m_IsActive`(classID 1) | 皮肤层 `Skin`(override,权重 1):每套皮肤一个 state,state 里是一条静态 clip `<骨架>@skin@<皮肤>` | `SetSkin()` |
+
+**切皮肤 = `animator.Play("皮肤名", 1)`。** 零脚本。
+
+### 13.1 节点与 clip 怎么写
+
+- 所有皮肤的 attachment 都建节点。具名皮肤的节点名带 `@皮肤名`(`WestCowboy_scarf@Christmas_day`),
+  免得同一 slot 同键名的三条围巾撞名;默认皮肤的节点名不变
+- 换图时间轴对某个键名的曲线,打在**所有**同 slot 同键名的节点上(三条围巾共用一条曲线),
+  谁真的显示由皮肤层决定
+- 皮肤 clip 里每个挂图节点一条 `m_IsActive` 常量曲线:属于该皮肤的 1;默认皮肤的件,被该皮肤里
+  同 slot 同键名的一件盖住就 0(Spine「先查皮肤再查默认」),否则 1;其余皮肤的 0。
+  两个键(0 与 1/60 秒)撑一点长度
+- prefab 里的初始值:`m_IsActive` = 属于初始皮肤(`--skin`,默认是默认皮肤;默认皮肤空着就取第一套
+  具名皮肤);渲染器 `m_Enabled` = 键名等于 slot 的 `attachmentName`
+- controller 第 1 层 `Skin`:`m_BlendingMode: 0`(override)、`m_DefaultWeight: 1`,默认 state = 初始皮肤。
+  单皮肤骨架没有这一层,也没有皮肤 clip
+
+### 13.2 实测(`tools/unity/AnimatorGoProbeSkin.cs`,Unity 6000.3,渲染到 RenderTexture 读像素)
+
+- SpriteRenderer / SkinnedMeshRenderer 的 `m_Enabled` 都能被曲线驱动,Animation 窗口里选得到
+- 皮肤层切 state 立即生效、切回也对,不干扰基础层的换图节奏
+- 被皮肤层灭掉的物体,基础层对它渲染器 `m_Enabled` 的曲线在重新点亮后仍然生效
+- 两个开关确实是 AND:皮肤开着但渲染器关着就是不显示
+
+⚠️ 探针里踩的坑:**别用 Transform 的单分量曲线**(如 `m_LocalPosition.z`)撑 clip 长度 ——
+Animator 会把没写的分量当 0 写进去,把物体挪到原点。
+
+### 13.3 代价
+
+一张图集含所有皮肤的图 —— MergeCooking2 的换装件都是几件小东西,无所谓;十套整身换装的骨架要另议
+(Spine 那边也有「每皮肤一页」的打包选项,到时候可以学)。
+
+## 14. 待确认
 
 - `.anim` 里驱动 `SpriteResolver` 的曲线具体形态(尚无样本)。
   目前换 attachment 走的是**一个 attachment 一个物体 + `m_IsActive` 阶梯曲线**,

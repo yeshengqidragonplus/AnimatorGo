@@ -159,8 +159,10 @@ interface PrefabBack {
   /** Transform 的 fileID → 物体名。挂图节点常和骨骼同名,只能靠父节点区分 */
   nameOf: Map<string, string>
   transforms: Map<string, { father: string; x: number; y: number; rotation: number; sx: number; sy: number }>
-  /** Transform 的 fileID → 物体的 m_IsActive */
+  /** Transform 的 fileID → 物体的 m_IsActive(皮肤那一维) */
   activeOf: Map<string, boolean>
+  /** Transform 的 fileID → 该物体上渲染器(SpriteRenderer / SkinnedMeshRenderer)的 m_Enabled(换图那一维);没有渲染器的物体不在表里 */
+  enabledOf: Map<string, boolean>
   skinCount: number
 }
 
@@ -183,6 +185,7 @@ function readPrefab(text: string): PrefabBack {
   const transforms = new Map<string, { father: string; x: number; y: number; rotation: number; sx: number; sy: number }>()
   const goName = new Map<string, string>()
   const goActive = new Map<string, boolean>()
+  const goEnabled = new Map<string, boolean>()
   const goOfTransform = new Map<string, string>()
   let skinCount = 0
 
@@ -195,6 +198,8 @@ function readPrefab(text: string): PrefabBack {
     if (cls === '1') {
       goName.set(id!, /m_Name: (.*)/.exec(doc)![1]!.trim())
       goActive.set(id!, /m_IsActive: (\d)/.exec(doc)![1] === '1')
+    } else if (cls === '212' || cls === '137') {
+      goEnabled.set(go!, /m_Enabled: (\d)/.exec(doc)![1] === '1')
     } else if (cls === '4') {
       const rot = pair(/m_LocalRotation: .*/.exec(doc)![0], 'z', 'w')
       const pos = pair(/m_LocalPosition: .*/.exec(doc)![0], 'x', 'y')
@@ -214,14 +219,36 @@ function readPrefab(text: string): PrefabBack {
   const byName = new Map<string, string>()
   const nameOf = new Map<string, string>()
   const activeOf = new Map<string, boolean>()
+  const enabledOf = new Map<string, boolean>()
   for (const id of transforms.keys()) {
     const go = goOfTransform.get(id)!
     const name = goName.get(go)!
     nameOf.set(id, name)
     activeOf.set(id, goActive.get(go) ?? true)
+    const enabled = goEnabled.get(go)
+    if (enabled !== undefined) enabledOf.set(id, enabled)
     if (!byName.has(name)) byName.set(name, id)
   }
-  return { byName, nameOf, transforms, activeOf, skinCount }
+  return { byName, nameOf, transforms, activeOf, enabledOf, skinCount }
+}
+
+/** `.anim` 里某个属性(精确匹配)的单值曲线:path → 关键帧 */
+function curveMap(text: string, attribute: string): Map<string, { time: number; value: number }[]> {
+  return new Map(
+    readFloatCurves(text, attribute)
+      .filter((c) => c.attribute === attribute)
+      .map((c) => [c.path, c.keys] as const),
+  )
+}
+
+/** controller 里某一层的默认 state 名 */
+function defaultStateOf(controller: string, layerName: string): string | null {
+  const docs = controller.split(/^--- /m).slice(1)
+  const machine = docs.find((d) => d.startsWith('!u!1107') && new RegExp(`^\\s{2}m_Name: ${layerName}$`, 'm').test(d))
+  const defaultId = machine === undefined ? undefined : /m_DefaultState: \{fileID: (-?\d+)}/.exec(machine)?.[1]
+  if (defaultId === undefined) return null
+  const state = docs.find((d) => d.startsWith(`!u!1102 &${defaultId}`))
+  return state === undefined ? null : (/^\s{2}m_Name: (.*)$/m.exec(state)?.[1]?.trim() ?? null)
 }
 
 function worldOf(prefab: PrefabBack, id: string, cache: Map<string, Affine>): Affine {
@@ -711,9 +738,13 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
    * 之前所有挂图节点都是 `m_IsActive: 1` —— 没有 attachment 时间轴的动画里,
    * 表情变体会全部叠在一起(blackrichwoman 的 `stand` 里五套眼睛同时出现)。
    */
-  it('⭐ 挂图节点的初始显隐按 setup pose:同一 slot 只亮一个', () => {
+  /**
+   * 两个显隐开关各管一维:渲染器 m_Enabled 是换图(setup pose 只亮 attachmentName 那一个,
+   * attachment 时间轴驱动它),GameObject m_IsActive 是皮肤(单皮肤骨架全亮)。
+   */
+  it('⭐ 挂图节点的初始显隐按 setup pose:同一 slot 只亮一个(渲染器 m_Enabled),皮肤那一维全亮', () => {
     const prefab = readPrefab(textOf('.prefab'))
-    // 期望:默认皮肤里每个可渲染 attachment 一个节点,key ≠ slot.attachmentName 的必须是灭的
+    // 期望:每个可渲染 attachment 一个节点,key ≠ slot.attachmentName 的渲染器必须是灭的
     const expected = new Map<string, boolean>()
     for (const skin of part.skins) {
       for (const entry of skin.slots) {
@@ -724,18 +755,27 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
         }
       }
     }
-    const inactiveExpected = [...expected.values()].filter((v) => !v).length
-    expect(inactiveExpected).toBeGreaterThan(0) // MX2_cat 有表情变体,否则这条用例没意义
+    const disabledExpected = [...expected.values()].filter((v) => !v).length
+    expect(disabledExpected).toBeGreaterThan(0) // MX2_cat 有表情变体,否则这条用例没意义
 
-    let inactiveFound = 0
-    for (const [id, active] of prefab.activeOf) {
+    let disabledFound = 0
+    for (const [id, enabled] of prefab.enabledOf) {
       const name = prefab.nameOf.get(id)!
-      if (!active) {
-        inactiveFound++
+      if (!enabled) {
+        disabledFound++
         expect(expected.get(name)).toBe(false)
       }
     }
-    expect(inactiveFound).toBe(inactiveExpected)
+    expect(disabledFound).toBe(disabledExpected)
+    // 只有一套皮肤:GameObject 全部激活,没有皮肤层
+    expect([...prefab.activeOf.values()].every((a) => a)).toBe(true)
+    expect(result.files.some((f) => f.path.includes('@skin@'))).toBe(false)
+    expect(textOf('.controller')).not.toContain('m_Name: Skin')
+
+    // 换图时间轴打在渲染器的 m_Enabled 上,不碰 m_IsActive
+    const anims = result.files.filter((f) => f.path.endsWith('.anim')).map((f) => f.content as string)
+    expect(anims.some((a) => a.includes('attribute: m_Enabled'))).toBe(true)
+    expect(anims.some((a) => a.includes('attribute: m_IsActive'))).toBe(false)
   })
 
   /**
@@ -868,39 +908,77 @@ const MC2_BRW = 'E:/UnityProject/MergeCooking2/MergeCooking2/Assets/Export/Spine
  * blackrichwoman 有 default + 5 套换装皮肤(3rd_anniversary / Christmas_day / Pirate / Valentines_day / WestCowboy)。
  * Spine 一次只有一套生效;之前全部导出,海盗帽上叠着生日帽和圣诞围巾。
  */
-describe.skipIf(!existsSync(MC2_BRW))('皮肤:一次只导一套(MergeCooking2 本地样本)', () => {
+describe.skipIf(!existsSync(MC2_BRW))('皮肤:全部导进一个 prefab,皮肤层切(MergeCooking2 本地样本)', () => {
   const dir = MC2_BRW.slice(0, MC2_BRW.lastIndexOf('/'))
   const part = readSkeletonPart(new Uint8Array(readFileSync(MC2_BRW)))
   const atlas = parseAtlas(readFileSync(`${dir}/blackrichwoman.atlas.txt`, 'utf8'))
   const sources = new Map<string, Image>()
   for (const page of atlas.pages) sources.set(page.name, decodePng(new Uint8Array(readFileSync(`${dir}/${page.name}`))))
-  const names = (result: ReturnType<typeof exportToUnity>) => {
-    const prefab = readPrefab((result.files.find((f) => f.path.endsWith('.prefab'))!.content as string))
-    return prefab
-  }
+  const textIn = (result: ReturnType<typeof exportToUnity>, suffix: string) =>
+    result.files.find((f) => f.path.endsWith(suffix))!.content as string
+  const prefabOf = (result: ReturnType<typeof exportToUnity>) => readPrefab(textIn(result, '.prefab'))
+  const isOn = (prefab: PrefabBack, name: string) => prefab.activeOf.get(prefab.byName.get(name)!)
+  const isEnabled = (prefab: PrefabBack, name: string) => prefab.enabledOf.get(prefab.byName.get(name)!)
 
-  it('不给 --skin:只有默认皮肤,换装件一个都不出现,表情变体初始是灭的', () => {
-    const prefab = names(exportToUnity(part, atlas, sources, { name: 'brw', pixelsPerUnit: 100, renderPipeline: 'urp' }))
+  // 6 套皮肤:default(本体)+ 5 套换装。具名皮肤的节点带 @皮肤名;同一个 slot 的围巾在三套皮肤里各一个节点
+  const PIRATE_HAT = 'Pirate_hat@Pirate'
+  const PARTY_HAT = '3rd_anniversary_mz1__3rd_anniversary@3rd_anniversary'
+  const SCARVES = ['WestCowboy_scarf@Christmas_day', 'WestCowboy_scarf@Valentines_day', 'WestCowboy_scarf@WestCowboy']
+
+  it('默认初始:所有皮肤的节点都在,只有默认皮肤的亮;表情变体靠渲染器 m_Enabled 灭', () => {
+    const result = exportToUnity(part, atlas, sources, { name: 'brw', pixelsPerUnit: 100, renderPipeline: 'urp' })
+    const prefab = prefabOf(result)
     const all = [...prefab.nameOf.values()]
-    for (const costume of ['Pirate_hat', '3rd_anniversary_mz1', 'WestCowboy_scarf', 'flower', 'Valentines_flower1']) {
-      expect(all).not.toContain(costume)
+    for (const costume of [PIRATE_HAT, PARTY_HAT, ...SCARVES]) {
+      expect(all).toContain(costume)
+      expect(isOn(prefab, costume)).toBe(false)
     }
-    expect(all).toContain('eye')
-    expect(all).toContain('eye__eye4')
-    expect(prefab.activeOf.get(prefab.byName.get('eye__eye4')!)).toBe(false)
-    expect(prefab.activeOf.get(prefab.byName.get('mouth__mouth1')!)).toBe(true) // slot mouth 的 setup 是 mouth1
-    expect(prefab.activeOf.get(prefab.byName.get('mouth__mouth2')!)).toBe(false)
+    // 皮肤那一维:默认皮肤全亮(连表情变体也亮,它们靠换图那一维灭)
+    expect(isOn(prefab, 'eye')).toBe(true)
+    expect(isOn(prefab, 'eye__eye4')).toBe(true)
+    expect(isEnabled(prefab, 'eye')).toBe(true)
+    expect(isEnabled(prefab, 'eye__eye4')).toBe(false)
+    expect(isEnabled(prefab, 'mouth__mouth1')).toBe(true) // slot mouth 的 setup 是 mouth1
+    expect(isEnabled(prefab, 'mouth__mouth2')).toBe(false)
+
+    // 皮肤层:6 条静态 clip,controller 多一层,默认 state 是 default
+    const skinClips = result.files.filter((f) => f.path.includes('@skin@') && f.path.endsWith('.anim')).map((f) => f.path)
+    expect(skinClips.sort()).toEqual(
+      ['3rd_anniversary', 'Christmas_day', 'Pirate', 'Valentines_day', 'WestCowboy', 'default'].map((s) => `brw@skin@${s}.anim`).sort(),
+    )
+    const controller = textIn(result, '.controller')
+    expect(controller).toContain('m_Name: Skin')
+    expect(defaultStateOf(controller, 'Skin')).toBe('default')
+    expect(defaultStateOf(controller, 'Base Layer')).toBe('brw@angry')
+
+    // 皮肤 clip 只写 m_IsActive:Pirate 的 clip 亮海盗帽、灭其他皮肤的件、默认皮肤的件保持亮
+    const pirate = curveMap(textIn(result, '@skin@Pirate.anim'), 'm_IsActive')
+    const at = (path: string) => pirate.get(path)![0]!.value
+    expect(at(PIRATE_HAT)).toBe(1)
+    expect(at(PARTY_HAT)).toBe(0)
+    for (const s of SCARVES) expect(at(s)).toBe(0)
+    expect(at('head')).toBe(1)
+    expect(curveMap(textIn(result, '@skin@Pirate.anim'), 'm_Enabled').size).toBe(0)
+
+    // 动画 clip 只动渲染器 m_Enabled,不碰 m_IsActive —— 三条围巾共用同一条曲线,由皮肤层决定谁真的显示
+    const angry = textIn(result, '@angry.anim')
+    expect(curveMap(angry, 'm_IsActive').size).toBe(0)
+    expect(curveMap(angry, 'm_Enabled').has('eye__eye4')).toBe(true)
+
+    expect(result.issues.find((i) => i.path === 'skin')?.message).toContain('animator.Play')
   })
 
-  it('--skin Pirate:只多出海盗那三件,生日帽和圣诞围巾不来', () => {
+  it('--skin Pirate:初始皮肤是海盗 —— 海盗三件亮,别的皮肤灭,皮肤层默认 state 是 Pirate', () => {
     const result = exportToUnity(part, atlas, sources, { name: 'brw', pixelsPerUnit: 100, renderPipeline: 'urp', skin: 'Pirate' })
-    const all = [...names(result).nameOf.values()]
-    expect(all).toContain('Pirate_hat')
-    expect(all).toContain('Pirate_waistband')
-    expect(all).not.toContain('3rd_anniversary_mz1')
-    expect(all).not.toContain('WestCowboy_scarf')
-    const skinInfo = result.issues.find((i) => i.path === 'skin')
-    expect(skinInfo?.message).toContain('"default" + "Pirate"')
+    const prefab = prefabOf(result)
+    expect(isOn(prefab, PIRATE_HAT)).toBe(true)
+    expect(isOn(prefab, 'Pirate_waistband@Pirate')).toBe(true)
+    expect(isOn(prefab, PARTY_HAT)).toBe(false)
+    for (const s of SCARVES) expect(isOn(prefab, s)).toBe(false)
+    expect(isOn(prefab, 'head')).toBe(true)
+    expect(defaultStateOf(textIn(result, '.controller'), 'Skin')).toBe('Pirate')
+    // 产物名不再带皮肤后缀 —— 一个 prefab 装全部皮肤
+    expect(result.files.some((f) => f.path === 'brw.prefab')).toBe(true)
   })
 
   it('不存在的皮肤名当场报错,并列出有哪些', () => {

@@ -39,6 +39,8 @@ public static class AnimatorGoRender
         bool viaAnimator = Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_MODE") == "animator";
         // 排查用:只框住某个渲染器(按物体名)放大看;把某些渲染器关掉对比
         string focus = Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_FOCUS");
+        // 多皮肤骨架看哪套皮肤(皮肤层的 state 名);空 = prefab 里的初始皮肤
+        string skinState = Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_SKIN");
         string[] hide = Split(Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_HIDE"));
         string outDir = Path.Combine(Directory.GetCurrentDirectory(), "Renders");
         Directory.CreateDirectory(outDir);
@@ -65,7 +67,9 @@ public static class AnimatorGoRender
             foreach (string clipGuid in AssetDatabase.FindAssets("t:AnimationClip", new[] { folder }))
             {
                 var clip = AssetDatabase.LoadAssetAtPath<AnimationClip>(AssetDatabase.GUIDToAssetPath(clipGuid));
-                // 剪辑名是 <骨架>[@皮肤]@<动画>,皮肤名里也有 @,取最后一个
+                // 皮肤层的静态 clip(<骨架>@skin@<皮肤>)不是动画,跳过;想看某套皮肤用 ANIMATORGO_RENDER_SKIN
+                if (clip.name.Contains("@skin@")) continue;
+                // 剪辑名是 <骨架>@<动画>,取最后一个 @ 后面那段
                 int at = clip.name.LastIndexOf('@');
                 string clipName = at < 0 ? clip.name : clip.name.Substring(at + 1);
                 if (clipFilter.Length > 0 && !clipFilter.Contains(clipName)) continue;
@@ -79,6 +83,21 @@ public static class AnimatorGoRender
                     if (viaAnimator && animator != null)
                     {
                         animator.Rebind(); // 记下默认值(Write Defaults 用的就是这一份)
+                        // 多皮肤骨架:皮肤层(第 1 层)切到指定 state,就是运行时 animator.Play("皮肤名", 1) 那一行
+                        if (!string.IsNullOrEmpty(skinState) && animator.GetLayerIndex("Skin") >= 0)
+                        {
+                            animator.Play(skinState, animator.GetLayerIndex("Skin"));
+                            animator.Update(0f);
+                        }
+                    }
+                    else if (!string.IsNullOrEmpty(skinState))
+                    {
+                        // 不走 Animator 时,把皮肤 clip 采一下 —— 它只写 m_IsActive,和动画 clip 不打架
+                        foreach (string skinGuid in AssetDatabase.FindAssets("t:AnimationClip", new[] { folder }))
+                        {
+                            var skinClip = AssetDatabase.LoadAssetAtPath<AnimationClip>(AssetDatabase.GUIDToAssetPath(skinGuid));
+                            if (skinClip.name.EndsWith("@skin@" + skinState)) skinClip.SampleAnimation(root, 0f);
+                        }
                     }
                     for (int i = 0; i < steps; i++)
                     {
@@ -108,7 +127,7 @@ public static class AnimatorGoRender
                         }
                         Frame(cam, root, focus);
                         cam.Render();
-                        string suffix = (viaAnimator ? "_animator" : "") + (string.IsNullOrEmpty(focus) ? "" : $"_focus-{focus}") + (hide.Length > 0 ? "_hide" : "");
+                        string suffix = (viaAnimator ? "_animator" : "") + (string.IsNullOrEmpty(skinState) ? "" : $"_skin-{skinState}") + (string.IsNullOrEmpty(focus) ? "" : $"_focus-{focus}") + (hide.Length > 0 ? "_hide" : "");
                         string stem = Path.Combine(outDir, $"{prefabName}_{clipName}_{i}_{t:0.00}s{suffix}");
                         File.WriteAllBytes(stem + ".png", ReadPng(rt));
                         if (debug) File.WriteAllText(stem + ".txt", Describe(cam, root));

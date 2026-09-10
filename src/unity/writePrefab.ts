@@ -52,6 +52,14 @@ export interface RendererSpec {
   /** 越大越靠前 */
   readonly sortingOrder: number
   readonly color: { r: number; g: number; b: number; a: number }
+  /**
+   * 渲染器初始是否启用(`m_Enabled`)。不给就是启用。
+   *
+   * 这是「换图」那一维的开关:一个 slot 下只有 setup 的 `attachmentName` 那一个亮着,
+   * 表情变体初始是灭的;attachment 时间轴以阶梯曲线驱动它。皮肤那一维走 GameObject 的
+   * `m_IsActive`(见 PrefabNode.active),两个开关是 AND,各由 Animator 的一层驱动。
+   */
+  readonly enabled?: boolean
 }
 
 /** 蒙皮网格才需要。骨骼下标指向 nodes 数组 */
@@ -76,6 +84,8 @@ export interface SkinnedMeshSpec {
   readonly rootBone: number
   readonly blendShapeCount: number
   readonly sortingOrder: number
+  /** 与 RendererSpec.enabled 同义:换图那一维的初始开关 */
+  readonly enabled?: boolean
   /**
    * 每顶点用几根骨骼蒙皮。**4 = Bone4,写死,外观不随工程 Quality 档位变**(学 Spine);
    * 0 = Auto 跟随 Quality —— 真实工程的 Low/Medium/High 档往往只有 2 根,会比 SpriteSkin 还差。
@@ -98,8 +108,8 @@ export interface PrefabNode {
   /**
    * 物体初始是否激活(`m_IsActive`)。不给就是激活。
    *
-   * 挂图节点要按 Spine 的 setup pose 来:一个 slot 下只有 `attachmentName` 那一个亮着,
-   * 其余(表情变体、换装件)必须是灭的 —— 否则没有 attachment 时间轴的动画里它们会全部叠在一起。
+   * 这是「皮肤」那一维的开关:挂图节点属于初始皮肤(或默认皮肤且没被初始皮肤盖住)才亮。
+   * 换图那一维在渲染器的 `m_Enabled` 上(见 RendererSpec.enabled)。
    */
   readonly active?: boolean
 }
@@ -222,7 +232,7 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
           '  serializedVersion: 2',
           ...COMMON_HEADER,
           `  m_GameObject: {fileID: ${id.go}}`,
-          '  m_Enabled: 1',
+          `  m_Enabled: ${r.enabled === false ? 0 : 1}`,
           '  m_CastShadows: 0',
           '  m_ReceiveShadows: 0',
           '  m_DynamicOccludee: 1',
@@ -307,7 +317,7 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
           'SkinnedMeshRenderer:',
           ...COMMON_HEADER,
           `  m_GameObject: {fileID: ${id.go}}`,
-          '  m_Enabled: 1',
+          `  m_Enabled: ${m.enabled === false ? 0 : 1}`,
           '  m_CastShadows: 0',
           '  m_ReceiveShadows: 0',
           '  m_DynamicOccludee: 1',

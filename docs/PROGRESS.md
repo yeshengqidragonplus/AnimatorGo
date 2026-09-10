@@ -216,8 +216,8 @@ SpriteSkin 41 个全部 Ready;SkinnedMeshRenderer 59 个、形变目标 373 个,
 
 | 现象 | 原因 | 修法 |
 |---|---|---|
-| 海盗帽上叠着生日帽和圣诞围巾 | **所有皮肤的 attachment 全部导出**。Spine 一次只有一套皮肤生效,Unity 没有皮肤概念 | 一次只导一套:默认皮肤 + `--skin` 选的那套(默认皮肤空着就自动选第一套);产物名带 `@皮肤名`;未导出的皮肤报 info |
-| `stand` 里五套眼睛、四张嘴叠在一起 | 所有挂图节点 `m_IsActive: 1`,只靠 attachment 时间轴关;没有该时间轴的动画里就全亮 | 初始显隐按 setup pose:同一 slot 只亮 `attachmentName` 那一个 |
+| 海盗帽上叠着生日帽和圣诞围巾 | **所有皮肤的 attachment 全部导出且全亮**。Spine 一次只有一套皮肤生效,Unity 没有皮肤概念 | 先做成「一次只导一套」;当天升级为「全部导进一个 prefab + Animator 皮肤层」,见下文 |
+| `stand` 里五套眼睛、四张嘴叠在一起 | 所有挂图节点初始全亮,只靠 attachment 时间轴关;没有该时间轴的动画里就全亮 | 初始显隐按 setup pose:同一 slot 只亮 `attachmentName` 那一个(现在在渲染器 `m_Enabled` 上) |
 
 同时确认了 blackrichwoman 的 6 条动画都用 drawOrder 把右手提到脸前面(+28 层),静态顺序下
 手会被脸挡住、`angry` 里手表消失 —— **这就是用户说的「场景里好的,运行起来不对」**:setup 姿势
@@ -257,13 +257,12 @@ SpriteSkin 41 个全部 Ready;SkinnedMeshRenderer 59 个、形变目标 373 个,
 另一个边界:跨度 < 64px 的加权网格不参与缩放分流,`Valentines_flower1/2`、`WestCowboy-sign`
 这几个小件缩放差 50% 却留在 SpriteSkin 路径(该骨架默认皮肤看不到它们)。待修。
 
-### 运行时换皮肤:方案已在 Unity 里验过,未实现(2026-09-10)
+### ✅ 运行时换皮肤:一个 prefab 装全部皮肤 + Animator 皮肤层(2026-09-10)
 
-现在是「一套皮肤一份 prefab」,换皮肤 = 换 prefab 实例。同一个实例运行时切皮肤需要另一种结构,
 难点是 Spine 的皮肤是运行时查表(键名 → 当前皮肤 → 默认皮肤),Unity 没有这张表,
 一个节点要同时满足「换图时间轴说这个键名亮着」和「属于当前皮肤」两个条件。
 
-方案:**两个互相独立的显隐开关 + Animator 分层,零运行时脚本**
+方案:**两个互相独立的显隐开关 + Animator 分层,零运行时脚本**。先用探针在 Unity 里验过,再实现。
 
 | 开关 | 谁控制 | 对应 Spine |
 |---|---|---|
@@ -280,8 +279,22 @@ SpriteRenderer / SkinnedMeshRenderer 的 `m_Enabled` 都能被曲线驱动且 An
 ⚠️ 探针里踩的坑:**别用 Transform 的单分量曲线**(如 `m_LocalPosition.z`)撑 clip 长度 ——
 Animator 会把没写的分量当 0 写进去,把物体挪到原点。
 
-产物形态会变:一个 prefab 装全部皮肤(节点名带 `@皮肤名`),一张图集含所有皮肤的图,动画一套,
-controller 两层。**只对多皮肤骨架启用**,单皮肤骨架产物不变。等确认游戏里真有运行时切皮肤的需求再做。
+实现(`export.ts` / `writePrefab.ts` / `writeController.ts`):
+
+- 所有皮肤的 attachment 都建节点;具名皮肤的节点名带 `@皮肤名`(同一 slot 同键名的围巾在三套皮肤里各一个节点)
+- 换图时间轴的阶梯曲线从 GameObject `m_IsActive` 挪到渲染器 `m_Enabled`(SpriteRenderer classID 212 /
+  SkinnedMeshRenderer 137);setup pose 的初始显隐也写在渲染器上。**单皮肤骨架也这么写**,
+  两种编码并存不值得,而且视觉上等价
+- 每套皮肤一条静态 clip `<骨架>@skin@<皮肤>`,只写所有挂图节点的 `m_IsActive`:属于该皮肤的亮,
+  默认皮肤里被它同 slot 同键名盖住的灭,其余皮肤的灭
+- controller 加第 1 层 `Skin`(override,权重 1),每套皮肤一个 state,默认 state = `--skin` 或默认皮肤
+- `--skin` 只定初始皮肤,不再过滤;产物名不再带后缀。单皮肤骨架没有皮肤层、没有皮肤 clip
+- `AnimatorGoRender` 跳过皮肤 clip,`ANIMATORGO_RENDER_SKIN=<皮肤>` 在 animator 模式下走
+  `animator.Play(皮肤, 1)`,和游戏里那一行一模一样;`AnimatorGoVerify` 顺带校验皮肤 clip 的绑定
+
+验证:MX2_cat 单皮肤用例改查渲染器 `m_Enabled`、无皮肤层;blackrichwoman 本地用例查 6 套皮肤的节点、
+初始亮灭、皮肤 clip 的内容、controller 两层与默认 state、动画 clip 不碰 `m_IsActive`。
+Unity batchmode 自检 + `angry` 三套皮肤各渲两帧肉眼看(见下)。
 
 顺带解掉的:绑定姿势非刚性(38 个骨架)、加权网格缩放不一致(29 个)—— 同样的网格路径。
 顺带发现的:`wave` 的 deform 打在 `path` attachment 上(路径约束用),不参与渲染,报 info 跳过。

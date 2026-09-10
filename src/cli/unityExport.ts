@@ -35,7 +35,7 @@ interface Options {
   readonly renderPipeline: RenderPipeline | null
   /** SkinnedMeshRenderer 的蒙皮根数:bone4 写死 4 根(默认),auto 跟随工程 Quality */
   readonly skinQuality: 'bone4' | 'auto'
-  /** 导出哪套皮肤(与默认皮肤一起);null = 只导默认皮肤 */
+  /** 初始皮肤(皮肤层的默认 state);null = 默认皮肤。所有皮肤都会导出 */
   readonly skin: string | null
 }
 
@@ -271,7 +271,7 @@ function summarize(tallies: ReadonlyMap<string, Tally>, title: string): string[]
 function main(): void {
   const parsed = parseArgs(process.argv.slice(2))
   if (typeof parsed === 'string') {
-    console.error(`✗ ${parsed}\n\n用法:pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--skin 皮肤名] [--skin-quality bone4|auto] [--dry-run]`)
+    console.error(`✗ ${parsed}\n\n用法:pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--skin 初始皮肤] [--skin-quality bone4|auto] [--dry-run]`)
     process.exitCode = 1
     return
   }
@@ -329,9 +329,8 @@ function main(): void {
 
   for (const file of files) {
     const base = stemOf(file)
-    // 带皮肤时产物名加后缀,同一个骨架的不同皮肤才能并存在一个输出目录里
-    const stem = parsed.skin === null ? base : `${base}@${parsed.skin}`
-    console.log(`  ${basename(file)}${parsed.skin === null ? '' : `(皮肤 ${parsed.skin})`}`)
+    const stem = base
+    console.log(`  ${basename(file)}${parsed.skin === null ? '' : `(初始皮肤 ${parsed.skin})`}`)
 
     try {
       const part = readSkeleton(file)
