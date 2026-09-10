@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { basename, dirname, extname, join, resolve } from 'node:path'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { readSkeletonPart, type SkeletonPart } from '../spine-format/binary/readSkeleton.ts'
 import { fromJsonText } from '../spine-format/json/fromJson.ts'
 import { parseAtlas } from '../core/atlas.ts'
@@ -37,6 +38,8 @@ interface Options {
   readonly skinQuality: 'bone4' | 'auto'
   /** 初始皮肤(皮肤层的默认 state);null = 默认皮肤。所有皮肤都会导出 */
   readonly skin: string | null
+  /** 皮肤怎么切:animator 零脚本(默认),script 挂 AnimatorGoSkins 组件按需加载 */
+  readonly skins: 'animator' | 'script'
 }
 
 function parseArgs(argv: readonly string[]): Options | string {
@@ -75,6 +78,9 @@ function parseArgs(argv: readonly string[]): Options | string {
   const skinQuality = flags.get('skin-quality') ?? 'bone4'
   if (skinQuality !== 'bone4' && skinQuality !== 'auto') return `--skin-quality 只能是 bone4 或 auto,收到 "${skinQuality}"`
 
+  const skins = flags.get('skins') ?? 'animator'
+  if (skins !== 'animator' && skins !== 'script') return `--skins 只能是 animator 或 script,收到 "${skins}"`
+
   const resolved = resolve(input)
   const base = statSync(resolved).isDirectory() ? resolved : dirname(resolved)
 
@@ -87,7 +93,32 @@ function parseArgs(argv: readonly string[]): Options | string {
     renderPipeline: rp as RenderPipeline | null,
     skinQuality,
     skin: flags.get('skin') ?? null,
+    skins,
   }
+}
+
+/** 输出目录所在的 Unity 工程根(有 Packages/manifest.json 的那层);不在工程里返回 null */
+function findUnityProject(outDir: string): string | null {
+  let dir = resolve(outDir)
+  for (let up = 0; up < 12; up++) {
+    if (existsSync(join(dir, 'Packages', 'manifest.json'))) return dir
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return null
+}
+
+/**
+ * 带脚本模式的运行时脚本,随产物拷进工程**一次**(放在输出目录下 AnimatorGoRuntime/,
+ * 不放每个骨架目录 —— 同一个类出现两次就编译不过)。`.cs.meta` 带固定 GUID,prefab 靠它认组件。
+ */
+function installRuntime(outDir: string): string {
+  const src = fileURLToPath(new URL('../../tools/unity/runtime/', import.meta.url))
+  const dir = join(outDir, 'AnimatorGoRuntime')
+  mkdirSync(dir, { recursive: true })
+  for (const file of ['AnimatorGoSkins.cs', 'AnimatorGoSkins.cs.meta']) copyFileSync(join(src, file), join(dir, file))
+  return dir
 }
 
 /** 骨架文件名去掉后缀 —— `.skel.bytes` 要去两层 */
@@ -271,7 +302,7 @@ function summarize(tallies: ReadonlyMap<string, Tally>, title: string): string[]
 function main(): void {
   const parsed = parseArgs(process.argv.slice(2))
   if (typeof parsed === 'string') {
-    console.error(`✗ ${parsed}\n\n用法:pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--skin 初始皮肤] [--skin-quality bone4|auto] [--dry-run]`)
+    console.error(`✗ ${parsed}\n\n用法:pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--skin 初始皮肤] [--skins animator|script] [--skin-quality bone4|auto] [--dry-run]`)
     process.exitCode = 1
     return
   }
@@ -327,10 +358,18 @@ function main(): void {
     row.files.add(file)
   }
 
+  const projectRoot = findUnityProject(parsed.out)
+  if (parsed.skins === 'script') {
+    if (parsed.dryRun) console.log('皮肤:带脚本模式(试运行,不拷运行时脚本)')
+    else console.log(`皮肤:带脚本模式,运行时脚本已放到 ${installRuntime(parsed.out)}(游戏启动时接 AnimatorGoSkins.LoadAsset)`)
+  }
+
   for (const file of files) {
     const base = stemOf(file)
     const stem = base
     console.log(`  ${basename(file)}${parsed.skin === null ? '' : `(初始皮肤 ${parsed.skin})`}`)
+    // 软引用要写 Assets/ 下的路径;输出目录不在工程里就只写文件名
+    const assetFolder = projectRoot === null ? '' : relative(projectRoot, join(parsed.out, stem)).split(sep).join('/')
 
     try {
       const part = readSkeleton(file)
@@ -360,6 +399,8 @@ function main(): void {
         pixelsPerUnit: parsed.pixelsPerUnit,
         renderPipeline: pipeline,
         skinQuality: parsed.skinQuality,
+        skins: parsed.skins,
+        assetFolder,
         ...(parsed.skin === null ? {} : { skin: parsed.skin }),
         // 试运行不写文件,那就别费时间编码 PNG
         skipImages: parsed.dryRun,

@@ -38,6 +38,40 @@ public static class AnimatorGoVerify
         var report = new StringBuilder();
         int problems = 0;
 
+        // 带脚本模式的运行时脚本:prefab 靠固定 GUID 认它,GUID 对不上就是一个 missing script
+        const string skinsGuid = "4f1a4e2b9c3d4a5e8b7c6d5e4f3a2b10";
+        string skinsPath = AssetDatabase.GUIDToAssetPath(skinsGuid);
+        var skinsScript = string.IsNullOrEmpty(skinsPath) ? null : AssetDatabase.LoadAssetAtPath<MonoScript>(skinsPath);
+        report.AppendLine($"AnimatorGoSkins 脚本:GUID → \"{skinsPath}\",MonoScript {(skinsScript == null ? "无" : "有")},类 {(skinsScript == null || skinsScript.GetClass() == null ? "无" : skinsScript.GetClass().Name)}");
+        foreach (string g in AssetDatabase.FindAssets("t:MonoScript", new[] { AssetRoot }))
+        {
+            var ms = AssetDatabase.LoadAssetAtPath<MonoScript>(AssetDatabase.GUIDToAssetPath(g));
+            report.AppendLine($"  {AssetDatabase.GUIDToAssetPath(g)}  guid={g}  类={(ms == null || ms.GetClass() == null ? "无" : ms.GetClass().FullName)}");
+        }
+        // 类到底编进了哪个程序集(区分「没编出来」和「MonoScript 没挂上类」)
+        var owners = System.AppDomain.CurrentDomain.GetAssemblies()
+            .Where(a => a.GetType("AnimatorGoSkins") != null)
+            .Select(a => a.GetName().Name)
+            .ToArray();
+        report.AppendLine($"  含 AnimatorGoSkins 类型的程序集:{(owners.Length == 0 ? "(没有 —— 脚本没编进任何程序集)" : string.Join(", ", owners))}");
+        if (skinsScript != null)
+        {
+            // MonoScript 记下的类名 / 命名空间 / 程序集 —— 与实际编出来的对不上就挂不上类
+            var so = new SerializedObject(skinsScript);
+            string F(string name) { var p = so.FindProperty(name); return p == null ? "(无此字段)" : p.stringValue; }
+            report.AppendLine($"  MonoScript 记录:类名 \"{F("m_ClassName")}\",命名空间 \"{F("m_Namespace")}\",程序集 \"{F("m_AssemblyName")}\"");
+            var control = AssetDatabase.LoadAssetAtPath<MonoScript>("Packages/com.unity.2d.animation/Runtime/SpriteSkin.cs");
+            report.AppendLine($"  对照:包里的 SpriteSkin.cs 的类 = {(control == null ? "(没找到脚本)" : control.GetClass() == null ? "无" : control.GetClass().FullName)}");
+        }
+        if (skinsScript != null && skinsScript.GetClass() == null)
+        {
+            // 类编出来了、MonoScript 却没挂上 —— 强制重导一次脚本资产再看
+            AssetDatabase.ImportAsset(skinsPath, ImportAssetOptions.ForceUpdate);
+            var again = AssetDatabase.LoadAssetAtPath<MonoScript>(skinsPath);
+            report.AppendLine($"  强制重导脚本后:类 {(again == null || again.GetClass() == null ? "仍无" : again.GetClass().Name)}");
+        }
+        report.AppendLine();
+
         foreach (string guid in prefabGuids)
         {
             string path = AssetDatabase.GUIDToAssetPath(guid);
@@ -48,6 +82,9 @@ public static class AnimatorGoVerify
             try
             {
                 report.AppendLine($"── {System.IO.Path.GetFileName(path)} ──");
+                // 根节点上有什么组件 —— 带脚本模式要能看到 AnimatorGoSkins;脚本没编上会显示成 missing
+                report.AppendLine("  根节点组件:" + string.Join(", ",
+                    root.GetComponents<Component>().Select(c => c == null ? "(missing script)" : c.GetType().Name)));
                 problems += CheckSkins(root, report);
                 problems += CheckSkinnedMeshes(root, report);
                 problems += CheckClips(root, path, report);
@@ -89,9 +126,18 @@ public static class AnimatorGoVerify
     {
         SpriteSkin[] skins = root.GetComponentsInChildren<SpriteSkin>(true);
         var bad = new List<string>();
+        // 带脚本模式(--skins script):换装件的 sprite 是软引用,由 AnimatorGoSkins 切到时才装上,
+        // prefab 里是空的 —— 那不是问题。按名字找组件,免得自检脚本依赖运行时脚本
+        bool managedSkins = root.GetComponent("AnimatorGoSkins") != null;
+        int deferred = 0;
 
         foreach (SpriteSkin skin in skins)
         {
+            if (managedSkins && skin.GetComponent<SpriteRenderer>().sprite == null)
+            {
+                deferred++;
+                continue;
+            }
             // 表情变体、换装件按 setup pose 初始是灭的(m_IsActive 0)。灭着的物体 Awake 没跑过,
             // SpriteSkin 还没拿到自己的 SpriteRenderer,校验会一律报 SpriteNotFound —— 那不是产物的问题。
             // 这是 LoadPrefabContents 出来的临时实例,临时点亮再校验,不影响资产。
@@ -102,7 +148,7 @@ public static class AnimatorGoVerify
             if (state != SpriteSkinState.Ready) bad.Add($"{skin.name} → {state}");
         }
 
-        report.AppendLine($"  SpriteSkin {skins.Length} 个,校验不过 {bad.Count} 个");
+        report.AppendLine($"  SpriteSkin {skins.Length} 个,校验不过 {bad.Count} 个" + (deferred > 0 ? $"(换装件 {deferred} 个由 AnimatorGoSkins 切到时再装 sprite,未校验)" : ""));
         foreach (string line in bad) report.AppendLine($"    ✗ {line}");
         return bad.Count;
     }
@@ -127,7 +173,8 @@ public static class AnimatorGoVerify
             int boneCount = r.bones == null ? 0 : r.bones.Length;
             if (boneCount != mesh.bindposes.Length) bad.Add($"{r.name}:骨骼 {boneCount} 根 ≠ 绑定矩阵 {mesh.bindposes.Length} 个");
             else if (r.bones.Any(b => b == null)) bad.Add($"{r.name}:有骨骼引用为空");
-            if (r.sharedMaterial == null || r.sharedMaterial.mainTexture == null) bad.Add($"{r.name}:材质没有纹理,渲染出来是纯白");
+            bool deferredMaterial = r.sharedMaterial == null && root.GetComponent("AnimatorGoSkins") != null;
+            if (!deferredMaterial && (r.sharedMaterial == null || r.sharedMaterial.mainTexture == null)) bad.Add($"{r.name}:材质没有纹理,渲染出来是纯白");
 
             shapes += mesh.blendShapeCount;
             var per = mesh.GetBonesPerVertex();

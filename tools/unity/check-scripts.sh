@@ -70,7 +70,7 @@ managed="$data/Managed/UnityEngine"
 # 包的程序集是 Unity 编译出来的,工程没打开过就没有 —— 有就用上,没有就少几个引用
 script_assemblies=$(towin "$PWD/UnityAnimationGo/Library/ScriptAssemblies")
 
-files=(tools/unity/*.cs)
+files=(tools/unity/*.cs tools/unity/runtime/*.cs)
 [ -e "${files[0]}" ] || skip "tools/unity/ 下没有 .cs"
 
 echo "Unity:$editor"

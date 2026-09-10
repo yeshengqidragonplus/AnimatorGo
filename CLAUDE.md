@@ -71,7 +71,7 @@ pnpm convert <输入路径> --to 4.1 [--out 目录] [--format skel|json] [--dry-
 导出到 Unity 2D Animation:
 
 ```bash
-pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--skin 皮肤名] [--skin-quality bone4|auto] [--dry-run]
+pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--skin 初始皮肤] [--skins animator|script] [--skin-quality bone4|auto] [--dry-run]
 ```
 
 **皮肤全部导进一个 prefab,运行时靠 Animator 的皮肤层切。** Spine 的皮肤是运行时查表,Unity 没有,
@@ -79,7 +79,10 @@ pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [
 `m_IsActive` 管皮肤(controller 第 1 层 `Skin`,每套皮肤一个 state,一条静态 clip)。切皮肤 =
 `animator.Play("皮肤名", 1)`,零脚本。`--skin` 只定初始皮肤(默认皮肤空着就取第一套具名皮肤)。
 具名皮肤的挂图节点名带 `@皮肤名`,贴图也按皮肤拆(`<骨架>@skin@<皮肤>.png`)。单皮肤骨架没有这一层。
-⚠️ 拆贴图**不会**让运行时少加载 —— prefab 硬引用着所有皮肤的 sprite。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 13 节。
+⚠️ 零脚本模式下拆贴图**不会**让运行时少加载 —— prefab 硬引用着所有皮肤的 sprite。要按需加载用
+`--skins script`:根节点挂 `AnimatorGoSkins`(`tools/unity/runtime/`,CLI 拷到输出目录 `AnimatorGoRuntime/` 一次),
+换装件软引用,`SetSkin("Pirate")` 切到才加载;游戏启动时接一次 `AnimatorGoSkins.LoadAsset`。
+**默认零脚本是用户定的。** 详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 13 节。
 
 产出**可以直接拖进 Assets 就播**的一整套:烘焙后的图集 PNG + `.meta`
 (含骨骼、网格、权重)、prefab(骨骼层级 + SpriteRenderer + SpriteSkin + Animator)、
@@ -128,6 +131,11 @@ cp tools/unity/AnimatorGoVerify.cs UnityAnimationGo/Assets/Editor/
 Defaults,最接近运行时);`_FOCUS=<物体名>` 放大看局部;`_HIDE=a,b` 关掉某些渲染器对比;`_DEBUG=1` 顺带写
 每帧亮着的渲染器占图上哪块、颜色是什么。输出到工程目录下 `Renders/`。编辑器占着 UnityAnimationGo 时,
 把 `Packages/` `ProjectSettings/` `Assets/Settings/` 拷到临时目录另起一个工程跑。
+
+⚠️ **batchmode 传给 Unity 的工程路径不能含 8.3 短名(`ZHE~1.HUA` 这种带 `~` 的)。** 实测同一个工程,
+短路径下用户脚本(Assembly-CSharp)的 MonoScript 全部挂不上类:prefab 里的组件变成 missing script,
+连 `SaveAsPrefabAsset` 都写出 `m_Script: {fileID: 0}`,日志里只有一条 named pipe 的 warning。
+换成长路径(`C:/Users/zhe.huang/...`)一切正常。scratchpad 目录默认就是短名,要自己展开。
 
 ⚠️ **验产物一律要 Play 起来看,setup 姿势的静态对比不算数。** 皮肤全导出、挂图节点初始全亮、
 逐帧绘制顺序、预乘 alpha —— 四个 bug 全是「场景里看着好的,一播就露馅」。

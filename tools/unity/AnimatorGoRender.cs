@@ -79,6 +79,13 @@ public static class AnimatorGoRender
                 var root = (GameObject)PrefabUtility.InstantiatePrefab(prefab);
                 try
                 {
+                    // 带脚本模式:皮肤由 AnimatorGoSkins 管,按名字发消息切,免得渲染脚本依赖运行时脚本。
+                    // 编辑器里它没接加载器时走 AssetDatabase,所以这里能直接看到换装件装上 sprite
+                    Component skinsComponent = root.GetComponent("AnimatorGoSkins");
+                    if (skinsComponent != null && !string.IsNullOrEmpty(skinState))
+                    {
+                        skinsComponent.SendMessage("SetSkin", skinState, SendMessageOptions.RequireReceiver);
+                    }
                     Animator animator = root.GetComponent<Animator>();
                     if (viaAnimator && animator != null)
                     {

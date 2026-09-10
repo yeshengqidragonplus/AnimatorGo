@@ -11,7 +11,14 @@ import {
   type UnityKeyframe,
 } from '../../unity/curve.ts'
 import { writeAnim, type FloatCurve, type Vector3Curve } from '../../unity/writeAnim.ts'
-import { writePrefab, type PrefabNode, type RenderPipeline, type RendererSpec, type SkinSpec } from '../../unity/writePrefab.ts'
+import {
+  writePrefab,
+  type PrefabNode,
+  type RenderPipeline,
+  type RendererSpec,
+  type SkinSpec,
+  type SkinsComponentSpec,
+} from '../../unity/writePrefab.ts'
 import { writeController, CLIP_FILE_ID } from '../../unity/writeController.ts'
 import { writeNativeMeta, writePrefabMeta, writeTextureMeta, type MetaBone, type MetaSprite, type MetaWeight } from '../../unity/writeMeta.ts'
 import { unityGuid, internalId, uniqueIds } from '../../unity/ids.ts'
@@ -98,6 +105,17 @@ export interface UnityExportOptions {
    * `animator.Play("皮肤名", 1)` 切;不给时初始是默认皮肤(默认皮肤空着就取第一套具名皮肤)。
    */
   readonly skin?: string
+  /**
+   * 皮肤怎么切。`animator`(默认):零脚本,Animator 皮肤层,所有皮肤的 sprite 硬引用在 prefab 里,
+   * 实例化即全部加载。`script`:根节点挂 `AnimatorGoSkins` 组件,换装件的 sprite / 材质是软引用
+   * (资产路径 + GUID),切到哪套才加载哪套 —— 代价是产物依赖那一个脚本(`tools/unity/runtime/`)。
+   */
+  readonly skins?: 'animator' | 'script'
+  /**
+   * 产物在 Unity 工程里的文件夹(`Assets/AnimatorGo/blackrichwoman` 这种),带脚本模式写进软引用的
+   * 资产路径里。不给就只写文件名,编辑器里靠 GUID 也找得到。
+   */
+  readonly assetFolder?: string
 }
 
 export interface UnityFile {
@@ -405,12 +423,16 @@ export function exportToUnity(
   }
   /** 皮肤层的 state:默认皮肤 + 每套有东西的具名皮肤;只有一套皮肤就不需要这一层 */
   const skinStates: Skin[] = namedSkins.length > 0 ? [defaultSkin, ...namedSkins].filter((s): s is Skin => s !== undefined) : []
+  /** 带脚本模式:皮肤由 AnimatorGoSkins 组件管,换装件软引用、按需加载 */
+  const scriptMode = options.skins === 'script' && skinStates.length > 0
   if (skinStates.length > 0) {
     issues.add(
       'info',
       'skin',
       `${skinStates.length} 套皮肤全部导进一个 prefab(${skinStates.map((s) => `"${s.name}"`).join('、')}),初始 "${initialSkin?.name}";` +
-        '运行时切换:animator.Play("皮肤名", 1)',
+        (scriptMode
+          ? '带脚本模式:GetComponent<AnimatorGoSkins>().SetSkin("皮肤名"),换装件切到时才加载(要接 AnimatorGoSkins.LoadAsset)'
+          : '运行时切换:animator.Play("皮肤名", 1)'),
     )
   }
   const isDefaultSkin = (skinName: string) => skinName === defaultSkin?.name
@@ -899,7 +921,8 @@ export function exportToUnity(
         active: visibleUnderSkin(item, initialSkin),
         skinnedMesh: {
           mesh: { fileID: MESH_FILE_ID, guid: meshGuidOf(item.spriteName) },
-          material: { fileID: MATERIAL_FILE_ID, guid: materialGuids[info.page]! },
+          // 带脚本模式下换装件不硬引用材质(材质引用着贴图),由 AnimatorGoSkins 切到时装上
+          material: scriptMode && !isDefaultSkin(item.skin) ? null : { fileID: MATERIAL_FILE_ID, guid: materialGuids[info.page]! },
           // 换图那一维:setup pose 只亮 attachmentName 那一个
           enabled: item.key === slot.attachmentName,
           bones: geo.subset.map((b) => boneNode[b]!),
@@ -914,7 +937,8 @@ export function exportToUnity(
 
     const color = unpackColor(slot.color)
     const renderer: RendererSpec = {
-      sprite: { fileID: info.internalID, guid: textureGuids[info.page]! },
+      // 带脚本模式下换装件不硬引用 sprite,由 AnimatorGoSkins 切到时装上
+      sprite: scriptMode && !isDefaultSkin(item.skin) ? null : { fileID: info.internalID, guid: textureGuids[info.page]! },
       // Spine 的 slots 数组顺序就是绘制顺序,先画的在下层
       sortingOrder: item.slot,
       color,
@@ -1518,7 +1542,7 @@ export function exportToUnity(
   // ── 皮肤层:每套皮肤一条静态 clip,只写挂图节点的 m_IsActive ──
   // 剪辑名 <骨架>@skin@<皮肤>,和动画剪辑区分开(AnimatorGoRender 靠这个跳过它们)
   const skinClips: { name: string; guid: string }[] = []
-  for (const skin of skinStates) {
+  for (const skin of scriptMode ? [] : skinStates) {
     const clipName = sanitize(`${name}@skin@${skin.name}`)
     const guid = unityGuid(`${name}/skin/${skin.name}`)
     const skinFloats: FloatCurve[] = []
@@ -1545,6 +1569,39 @@ export function exportToUnity(
     skinClips.push({ name: skin.name, guid })
   }
 
+  // ── 带脚本模式:AnimatorGoSkins 组件的数据 —— 换装件的软引用,以及每套皮肤要灭掉的默认皮肤件 ──
+  let skinsComponent: SkinsComponentSpec | null = null
+  if (scriptMode) {
+    const folder = options.assetFolder === undefined || options.assetFolder === '' ? '' : `${options.assetFolder.replace(/\/+$/, '')}/`
+    const componentNodes: SkinsComponentSpec['nodes'][number][] = []
+    for (const item of used) {
+      if (item.node < 0 || isDefaultSkin(item.skin)) continue
+      const info = sprites.get(item.spriteName)
+      if (info === undefined) continue
+      const page = pageNames[info.page]!
+      componentNodes.push({
+        node: item.node,
+        skin: item.skin,
+        spriteAsset: `${folder}${page}.png`,
+        spriteGuid: textureGuids[info.page]!,
+        spriteName: info.skinned ? '' : item.spriteName,
+        materialAsset: info.skinned ? `${folder}${page}.mat` : '',
+        materialGuid: info.skinned ? materialGuids[info.page]! : '',
+      })
+    }
+    skinsComponent = {
+      defaultSkin: defaultSkin?.name ?? 'default',
+      initialSkin: initialSkin?.name ?? defaultSkin?.name ?? 'default',
+      nodes: componentNodes,
+      skins: skinStates
+        .filter((s) => s !== defaultSkin)
+        .map((skin) => ({
+          name: skin.name,
+          hidden: used.filter((item) => item.node >= 0 && isDefaultSkin(item.skin) && !visibleUnderSkin(item, skin)).map((item) => item.node),
+        })),
+    }
+  }
+
   const controllerGuid = unityGuid(`${name}/controller`)
   const prefabGuid = unityGuid(`${name}/prefab`)
   const needsController = part.animations.length > 0 || skinClips.length > 0
@@ -1555,6 +1612,7 @@ export function exportToUnity(
       seed: name,
       controller: needsController ? { fileID: 9100000, guid: controllerGuid } : null,
       renderPipeline: options.renderPipeline,
+      skins: skinsComponent,
     }),
   })
   files.push({ path: `${name}.prefab.meta`, content: writePrefabMeta(prefabGuid) })

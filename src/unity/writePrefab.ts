@@ -29,6 +29,14 @@ export const CLASS_SKINNED_MESH_RENDERER = 137
 export const SPRITE_SKIN_SCRIPT_GUID = '57c008f954fe54a8bb972de1018a2cb8'
 
 /**
+ * 我们自己的运行时换肤组件 `AnimatorGoSkins` 的 GUID(带脚本模式才用)。
+ *
+ * 脚本在 `tools/unity/runtime/AnimatorGoSkins.cs`,随产物拷进工程一次;`.cs.meta` 里写死这个 GUID,
+ * prefab 才能认得它 —— 改了这里就得同步改那个 meta。
+ */
+export const SKINS_SCRIPT_GUID = '4f1a4e2b9c3d4a5e8b7c6d5e4f3a2b10'
+
+/**
  * 默认 sprite 材质。**两套渲染管线不是同一个**,给错了整个角色是粉红的。
  *
  * - 内置管线:`Sprites-Default`,在 Unity 的内置资源里(guid 全零)
@@ -77,8 +85,8 @@ export interface SkinSpec {
 export interface SkinnedMeshSpec {
   /** Mesh 资产,fileID 取 MESH_FILE_ID */
   readonly mesh: AssetRef
-  /** 带纹理的材质,fileID 取 MATERIAL_FILE_ID */
-  readonly material: AssetRef
+  /** 带纹理的材质,fileID 取 MATERIAL_FILE_ID;null = 不引用(带脚本模式的换装件,材质由 AnimatorGoSkins 运行时装上) */
+  readonly material: AssetRef | null
   /** 骨骼下标指向 nodes 数组,顺序必须与 Mesh 的 bindposes 一致 */
   readonly bones: readonly number[]
   readonly rootBone: number
@@ -114,12 +122,37 @@ export interface PrefabNode {
   readonly active?: boolean
 }
 
+/**
+ * 带脚本模式的换肤组件(`AnimatorGoSkins`,挂在根节点)。字段名必须与 C# 的序列化字段一致。
+ */
+export interface SkinsComponentSpec {
+  readonly defaultSkin: string
+  readonly initialSkin: string
+  readonly nodes: readonly {
+    /** nodes 数组下标 */
+    readonly node: number
+    readonly skin: string
+    readonly spriteAsset: string
+    readonly spriteGuid: string
+    readonly spriteName: string
+    readonly materialAsset: string
+    readonly materialGuid: string
+  }[]
+  readonly skins: readonly {
+    readonly name: string
+    /** 这套皮肤生效时要灭掉的默认皮肤节点(nodes 数组下标) */
+    readonly hidden: readonly number[]
+  }[]
+}
+
 export interface PrefabOptions {
   /** 用来给 fileID 加盐,保证不同骨架之间不撞 */
   readonly seed: string
   /** 挂在根节点上的 AnimatorController;不需要就传 null */
   readonly controller: AssetRef | null
   readonly renderPipeline: RenderPipeline
+  /** 带脚本模式:根节点上挂 AnimatorGoSkins */
+  readonly skins?: SkinsComponentSpec | null
 }
 
 const v3 = (v: { x: number; y: number; z: number }) =>
@@ -139,6 +172,7 @@ interface Ids {
   readonly skin: number
   readonly skinnedMesh: number
   readonly animator: number
+  readonly skins: number
 }
 
 const COMMON_HEADER = [
@@ -167,6 +201,7 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
       skin: fileId(`${key}/sk`),
       skinnedMesh: fileId(`${key}/smr`),
       animator: fileId(`${key}/an`),
+      skins: fileId(`${key}/skins`),
     }
   })
 
@@ -184,6 +219,7 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
     if (node.skin !== null) components.push(`  - component: {fileID: ${id.skin}}`)
     if (node.skinnedMesh) components.push(`  - component: {fileID: ${id.skinnedMesh}}`)
     if (i === 0 && options.controller !== null) components.push(`  - component: {fileID: ${id.animator}}`)
+    if (i === 0 && options.skins) components.push(`  - component: {fileID: ${id.skins}}`)
 
     docs.push(
       [
@@ -334,8 +370,7 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
           '  m_MeshLodSelectionBias: 0',
           '  m_RenderingLayerMask: 1',
           '  m_RendererPriority: 0',
-          '  m_Materials:',
-          `  - ${ref(m.material, 2)}`,
+          m.material === null ? '  m_Materials: []' : `  m_Materials:\n  - ${ref(m.material, 2)}`,
           '  m_StaticBatchInfo:',
           '    firstSubMesh: 0',
           '    subMeshCount: 0',
@@ -374,6 +409,51 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
           '    m_Center: {x: 0, y: 0, z: 0}',
           '    m_Extent: {x: 0, y: 0, z: 0}',
           '  m_DirtyAABB: 1',
+        ].join('\n'),
+      )
+    }
+
+    if (i === 0 && options.skins) {
+      const s = options.skins
+      const str = (v: string) => (v === '' ? '' : v)
+      docs.push(
+        [
+          `--- !u!${CLASS_MONO_BEHAVIOUR} &${id.skins}`,
+          'MonoBehaviour:',
+          ...COMMON_HEADER,
+          `  m_GameObject: {fileID: ${id.go}}`,
+          '  m_Enabled: 1',
+          '  m_EditorHideFlags: 0',
+          `  m_Script: {fileID: 11500000, guid: ${SKINS_SCRIPT_GUID}, type: 3}`,
+          '  m_Name: ',
+          '  m_EditorClassIdentifier: ',
+          `  defaultSkin: ${s.defaultSkin}`,
+          `  initialSkin: ${s.initialSkin}`,
+          s.nodes.length === 0
+            ? '  nodes: []'
+            : `  nodes:\n${s.nodes
+                .map((n) =>
+                  [
+                    `  - go: {fileID: ${ids[n.node]!.go}}`,
+                    `    skin: ${n.skin}`,
+                    `    spriteAsset: ${str(n.spriteAsset)}`,
+                    `    spriteGuid: ${str(n.spriteGuid)}`,
+                    `    spriteName: ${str(n.spriteName)}`,
+                    `    materialAsset: ${str(n.materialAsset)}`,
+                    `    materialGuid: ${str(n.materialGuid)}`,
+                  ].join('\n'),
+                )
+                .join('\n')}`,
+          s.skins.length === 0
+            ? '  skins: []'
+            : `  skins:\n${s.skins
+                .map((sk) =>
+                  [
+                    `  - name: ${sk.name}`,
+                    sk.hidden.length === 0 ? '    hidden: []' : `    hidden:\n${sk.hidden.map((h) => `    - {fileID: ${ids[h]!.go}}`).join('\n')}`,
+                  ].join('\n'),
+                )
+                .join('\n')}`,
         ].join('\n'),
       )
     }

@@ -997,6 +997,48 @@ describe.skipIf(!existsSync(MC2_BRW))('皮肤:全部导进一个 prefab,皮肤�
     expect(result.files.some((f) => f.path === 'brw.prefab')).toBe(true)
   })
 
+  /**
+   * 带脚本模式:换装件的 sprite / 材质不硬引用,由 AnimatorGoSkins 组件按软引用(路径 + GUID)切到时加载。
+   * 没有皮肤层、没有皮肤 clip;本体的 sprite 照旧硬引用。
+   */
+  it('--skins script:根节点挂 AnimatorGoSkins,换装件的 sprite 与材质留空、写成软引用', () => {
+    const result = exportToUnity(part, atlas, sources, {
+      name: 'brw',
+      pixelsPerUnit: 100,
+      renderPipeline: 'urp',
+      skins: 'script',
+      assetFolder: 'Assets/AnimatorGo/brw',
+    })
+    expect(result.files.some((f) => f.path.includes('@skin@') && f.path.endsWith('.anim'))).toBe(false)
+    expect(textIn(result, '.controller')).not.toContain('m_Name: Skin')
+    // 贴图和材质照常产出(组件要加载它们),只是 prefab 不再引用换装件的那些
+    expect(result.files.some((f) => f.path === 'brw@skin@Pirate.png')).toBe(true)
+    expect(result.files.some((f) => f.path === 'brw@skin@Pirate.mat')).toBe(true)
+
+    const prefabText = textIn(result, '.prefab')
+    const docs = prefabText.split(/^--- /m)
+    const component = docs.find((d) => d.includes('guid: 4f1a4e2b9c3d4a5e8b7c6d5e4f3a2b10'))
+    expect(component).toBeDefined()
+    expect(component).toContain('  defaultSkin: default')
+    expect(component).toContain('  initialSkin: default')
+    expect(component).toContain('    spriteAsset: Assets/AnimatorGo/brw/brw@skin@WestCowboy.png')
+    expect(component).toContain('    spriteName: WestCowboy-hat')
+    expect(component).toContain('    materialAsset: Assets/AnimatorGo/brw/brw@skin@Pirate.mat')
+    expect(component).toContain('  - name: Pirate')
+
+    // 牛仔帽(region)的 SpriteRenderer 没有 sprite;海盗帽(SkinnedMesh)没有材质;本体的头发还硬引用着
+    const prefab = readPrefab(prefabText)
+    const goOf = (name: string) => docs.find((d) => d.startsWith('!u!1 ') && d.includes(`m_Name: ${name}\n`))!.match(/^!u!1 &(\d+)/)![1]
+    const rendererOf = (cls: string, goId: string) => docs.find((d) => d.startsWith(`!u!${cls}`) && d.includes(`m_GameObject: {fileID: ${goId}}`))!
+    expect(rendererOf('212', goOf('WestCowboy_hat@WestCowboy')!)).toContain('m_Sprite: {fileID: 0}')
+    expect(rendererOf('137', goOf(PIRATE_HAT)!)).toContain('m_Materials: []')
+    expect(rendererOf('212', goOf('hair-b')!)).toMatch(/m_Sprite: \{fileID: -?\d+, guid: [0-9a-f]+, type: 3\}/)
+    // 皮肤那一维的初始状态照旧:换装件灭、本体亮
+    expect(prefab.activeOf.get(prefab.byName.get(PIRATE_HAT)!)).toBe(false)
+    expect(prefab.activeOf.get(prefab.byName.get('hair-b')!)).toBe(true)
+    expect(result.issues.find((i) => i.path === 'skin')?.message).toContain('AnimatorGoSkins')
+  })
+
   it('不存在的皮肤名当场报错,并列出有哪些', () => {
     expect(() => exportToUnity(part, atlas, sources, { name: 'brw', pixelsPerUnit: 100, renderPipeline: 'urp', skin: 'Nope' })).toThrow(/Pirate/)
   })

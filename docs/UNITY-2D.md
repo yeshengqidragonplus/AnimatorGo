@@ -559,6 +559,43 @@ Unity 会把每张贴图都加载进来 —— 灭着的 GameObject 也一样。
 得把换装件的 sprite 换成软引用(Addressables)、切皮肤时再赋值,那是游戏侧的脚本,不在这条零脚本
 路线里。拆贴图的收益是归档清楚、按皮肤打包资源方便、本体那张不会被十套换装撑爆。
 
+### 13.4 带脚本模式(`--skins script`):换装件按需加载
+
+零脚本是默认。要「切到哪套才加载哪套」就得有软引用,软引用就得有代码 —— 这是一个转换选项,
+产物依赖**一个**脚本 `AnimatorGoSkins`(源码 `tools/unity/runtime/`,CLI 拷到输出目录下
+`AnimatorGoRuntime/` 一次,`.cs.meta` 带固定 GUID `4f1a4e2b9c3d4a5e8b7c6d5e4f3a2b10`,prefab 靠它认组件)。
+
+与零脚本模式的差别只在皮肤:
+
+| | 零脚本 | 带脚本 |
+|---|---|---|
+| 皮肤怎么切 | Animator 皮肤层 `animator.Play("Pirate", 1)` | 根节点的组件 `GetComponent<AnimatorGoSkins>().SetSkin("Pirate")` |
+| 换装件的 sprite / 材质 | 硬引用 | prefab 里留空(`m_Sprite: {fileID: 0}` / `m_Materials: []`),组件里存路径 + GUID + sprite 名 |
+| 贴图加载 | 实例化即全部加载 | 切到才加载,切走可卸(接了 `UnloadAsset` 才卸) |
+| 皮肤 clip / controller 第二层 | 有 | 没有 |
+| 换图时间轴、本体、初始亮灭 | 一样 | 一样 |
+
+组件的数据(`nodes[]`:物体、所属皮肤、`spriteAsset`/`spriteGuid`/`spriteName`、`materialAsset`/`materialGuid`;
+`skins[]`:每套皮肤要灭掉的默认皮肤件)由导出器算好写进 prefab,`SetSkin` 只是照表点亮、加载、灭掉。
+
+**加载走委托,对资源系统零假设**(用户定的:打包后走自家的资源系统,编辑器里走 Addressables):
+
+```csharp
+// 游戏启动时接一次
+AnimatorGoSkins.LoadAsset = (path, sub, type) => MyAssets.Load(path, sub, type);   // sub = sprite 名,贴图/材质为 null
+AnimatorGoSkins.UnloadAsset = obj => MyAssets.Release(obj);                         // 可不接
+// Addressables 一行:地址默认就是资产路径,子资产写成 路径[名字]
+AnimatorGoSkins.LoadAsset = (path, sub, type) =>
+    Addressables.LoadAssetAsync<UnityEngine.Object>(sub == null ? path : $"{path}[{sub}]").WaitForCompletion();
+```
+
+没接委托时:编辑器里走 `AssetDatabase`(按 GUID 找,文件夹挪了也不怕),预览与 Play 开箱能用;
+打包后报一条明确的错。**不在脚本里直接调 Addressables**:asmdef 引用一个没装的包会让整个程序集
+编译不出来,而这个脚本要在任何工程里都能进。
+
+`SpriteSkin` 在运行时换 sprite 时会按新 sprite 的绑定矩阵重新校验(`CacheCurrentSprite`,
+`autoRebind` 关着就沿用现有骨骼),骨骼顺序与导出时一致,所以直接赋 `sprite` 就行,实测正常。
+
 ## 14. 待确认
 
 - `.anim` 里驱动 `SpriteResolver` 的曲线具体形态(尚无样本)。

@@ -292,7 +292,16 @@ Animator 会把没写的分量当 0 写进去,把物体挪到原点。
 - `AnimatorGoRender` 跳过皮肤 clip,`ANIMATORGO_RENDER_SKIN=<皮肤>` 在 animator 模式下走
   `animator.Play(皮肤, 1)`,和游戏里那一行一模一样;`AnimatorGoVerify` 顺带校验皮肤 clip 的绑定
 - 贴图按皮肤拆(用户问的):默认皮肤 `<骨架>.png`,每套具名皮肤 `<骨架>@skin@<皮肤>.png`,共用的图归默认。
-  **不会让运行时少加载**(prefab 硬引用全部 sprite),收益是归档与按皮肤打包;按需加载要游戏侧走软引用
+  零脚本模式下**不会让运行时少加载**(prefab 硬引用全部 sprite),收益是归档与按皮肤打包
+- **带脚本模式 `--skins script`**(用户定:零脚本是默认,带脚本是选项):根节点挂 `AnimatorGoSkins`
+  (`tools/unity/runtime/`,CLI 拷到 `<out>/AnimatorGoRuntime/` 一次,`.cs.meta` 固定 GUID),换装件的
+  sprite / 材质在 prefab 里留空,组件存路径 + GUID + sprite 名,`SetSkin("Pirate")` 切到才加载、切走可卸。
+  加载走静态委托 `LoadAsset`(打包后接自家资源系统,编辑器里没接就走 AssetDatabase)。没有皮肤层与皮肤 clip。
+  `AnimatorGoVerify` 对组件管的空 sprite / 空材质不报错,并把运行时脚本的 GUID → 路径 → 类的解析链打出来;
+  `AnimatorGoRender` 用 `SendMessage("SetSkin")` 切,与运行时同一条路。Unity 里三套皮肤渲染确认(见下)
+- ⚠️ **验带脚本模式时踩的坑:batchmode 工程路径含 8.3 短名(`ZHE~1.HUA`)时,Assembly-CSharp 的 MonoScript
+  全部挂不上类**,组件成 missing script,连 Unity 自己 `SaveAsPrefabAsset` 都写出 `m_Script: {fileID: 0}`;
+  用最小工程做对照 + 换长路径重跑定位的(`class=Foo`)。已记进 CLAUDE.md
 
 验证:MX2_cat 单皮肤用例改查渲染器 `m_Enabled`、无皮肤层;blackrichwoman 本地用例查 6 套皮肤的节点、
 初始亮灭、皮肤 clip 的内容、controller 两层与默认 state、动画 clip 不碰 `m_IsActive`。
