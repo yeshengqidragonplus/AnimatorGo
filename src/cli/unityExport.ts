@@ -369,8 +369,18 @@ function main(): void {
       const dir = join(parsed.out, stem)
       if (!parsed.dryRun) {
         mkdirSync(dir, { recursive: true })
+        let rewritten = 0
         for (const out of result.files) {
-          writeFileSync(join(dir, out.path), typeof out.content === 'string' ? out.content : Buffer.from(out.content))
+          const target = join(dir, out.path)
+          const content = typeof out.content === 'string' ? Buffer.from(out.content, 'utf8') : Buffer.from(out.content)
+          // 内容没变就不碰文件 —— 输出目录常常就在别人正开着的 Unity 工程里,
+          // 每次重写都会触发一轮重新导入,Animator 窗口开着时还会在重载时报 NRE
+          if (existsSync(target) && readFileSync(target).equals(content)) continue
+          writeFileSync(target, content)
+          rewritten++
+        }
+        if (rewritten < result.files.length) {
+          console.log(`    → ${result.files.length} 个文件,${rewritten} 个有变化已写入,其余内容相同未动`)
         }
       }
 
