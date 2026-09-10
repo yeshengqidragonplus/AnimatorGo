@@ -5,6 +5,7 @@ import { parseAtlas } from '../../core/atlas.ts'
 import { decodePng, type Image } from '../../unity/png.ts'
 import { parseMesh } from '../../unity/writeMesh.ts'
 import { applyPoint, poseAt, type Affine as EvalAffine } from '../../spine-eval/pose.ts'
+import { drawOrderOf, layerOfSlot } from '../../spine-eval/drawOrder.ts'
 import { exportToUnity, type UnityFile } from './export.ts'
 
 /**
@@ -253,17 +254,22 @@ function worldOf(prefab: PrefabBack, id: string, cache: Map<string, Affine>): Af
   return out
 }
 
-/** `.anim` 里的单值曲线:属性、路径、关键帧(时间 → 值)。只取 blendShape 那些 */
-function readBlendShapeCurves(text: string): { shape: string; path: string; keys: { time: number; value: number }[] }[] {
-  const out: { shape: string; path: string; keys: { time: number; value: number }[] }[] = []
+/** `.anim` 里的单值曲线:属性、路径、classID、关键帧(时间 → 值)。只取属性名以 prefix 开头的 */
+function readFloatCurves(text: string, prefix: string): { attribute: string; path: string; classID: number; keys: { time: number; value: number }[] }[] {
+  const out: { attribute: string; path: string; classID: number; keys: { time: number; value: number }[] }[] = []
   for (const block of text.split('  - serializedVersion: 2\n    curve:').slice(1)) {
     const attribute = /^\s{4}attribute: (\S+)/m.exec(block)?.[1]
     const path = /^\s{4}path: (\S*)/m.exec(block)?.[1] ?? ''
-    if (attribute === undefined || !attribute.startsWith('blendShape.')) continue
+    const classID = Number(/^\s{4}classID: (\d+)/m.exec(block)?.[1] ?? 0)
+    if (attribute === undefined || !attribute.startsWith(prefix)) continue
     const keys = [...block.matchAll(/time: (\S+)\n\s+value: (\S+)/g)].map((m) => ({ time: Number(m[1]), value: Number(m[2]) }))
-    out.push({ shape: attribute.slice('blendShape.'.length), path, keys })
+    out.push({ attribute, path, classID, keys })
   }
   return out
+}
+
+function readBlendShapeCurves(text: string): { shape: string; path: string; keys: { time: number; value: number }[] }[] {
+  return readFloatCurves(text, 'blendShape.').map((c) => ({ shape: c.attribute.slice('blendShape.'.length), path: c.path, keys: c.keys }))
 }
 
 /** prefab 里的 SkinnedMeshRenderer:挂在哪个物体、引用哪个 Mesh、骨骼 Transform 的 fileID 顺序 */
@@ -732,12 +738,59 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
     expect(inactiveFound).toBe(inactiveExpected)
   })
 
+  /**
+   * 逐帧绘制顺序 → 每个挪过位的 slot 一条 m_SortingOrder 阶梯曲线。
+   * 关键帧时刻的值 = 按 Spine 规则铺出的完整顺序里该 slot 的层号;没有 drawOrder 的动画写 setup 值。
+   */
+  it('⭐ 逐帧绘制顺序:m_SortingOrder 曲线在每个关键帧上等于 Spine 铺出的层号', () => {
+    const affected = new Set<number>()
+    for (const anim of part.animations) {
+      for (const t of anim.timelines) {
+        if (t.kind !== 'drawOrder') continue
+        for (const f of t.frames) {
+          layerOfSlot(drawOrderOf(part.slots.length, f['offsets'] as { slot: number; offset: number }[])).forEach((l, s) => {
+            if (l !== s) affected.add(s)
+          })
+        }
+      }
+    }
+    expect(affected.size).toBeGreaterThan(0) // MX2_cat 的 swim 有 drawOrder
+
+    let checked = 0
+    for (const anim of part.animations) {
+      const curves = readFloatCurves(textOf(`@${anim.name}.anim`), 'm_SortingOrder')
+      const timeline = anim.timelines.find((t) => t.kind === 'drawOrder')
+      for (const slot of affected) {
+        const slotName = part.slots[slot]!.name
+        const mine = curves.filter((c) => c.path.split('/').pop()!.startsWith(slotName))
+        expect(mine.length).toBeGreaterThan(0)
+        for (const c of mine) {
+          expect([212, 137]).toContain(c.classID)
+          // 0 处一定有键:setup 顺序
+          expect(c.keys[0]!.time).toBe(0)
+          if (timeline === undefined) {
+            expect(c.keys).toEqual([{ time: 0, value: slot }])
+            continue
+          }
+          for (const f of timeline.frames) {
+            const time = f['time'] as number
+            const expected = layerOfSlot(drawOrderOf(part.slots.length, f['offsets'] as { slot: number; offset: number }[]))[slot]!
+            const k = c.keys.find((kk) => Math.abs(kk.time - time) < 1e-6)
+            expect(k?.value).toBe(expected)
+            checked++
+          }
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(0)
+  })
+
   it('有损的地方都报出来了,不静默', () => {
     const kinds = result.issues.map((i) => `${i.level}:${i.path}`)
-    // deform 现在转成 Blend Shape,不再是 loss;逐帧绘制顺序还没做,必须报
+    // deform 转成 Blend Shape、逐帧绘制顺序转成 m_SortingOrder 曲线,都不再是 loss
     expect(kinds.some((k) => k.startsWith('loss:') && k.includes('deform'))).toBe(false)
     expect(kinds).toContain('info:skinnedMesh')
-    expect(kinds.some((k) => k.startsWith('loss:') && k.includes('drawOrder'))).toBe(true)
+    expect(kinds.some((k) => k.startsWith('loss:') && k.includes('drawOrder'))).toBe(false)
     // 网格绑定姿势现在是逐骨骼解出来的,不该再有「对不齐」这类近似
     expect(result.issues.filter((i) => i.level === 'approximated').length).toBeLessThan(3)
   })

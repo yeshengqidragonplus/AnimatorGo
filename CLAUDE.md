@@ -112,6 +112,11 @@ cp tools/unity/AnimatorGoVerify.cs UnityAnimationGo/Assets/Editor/
 ```
 
 然后在 Unity 里:`Tools ▸ AnimatorGo ▸ 检查转换产物`,或 `▸ 摆一个对比场景`。
+
+**自己看效果不用等人截图**:`tools/unity/AnimatorGoRender.cs` 把产物的动画在编辑器里逐帧渲成 PNG
+(batchmode 可跑,不能加 `-nographics`;环境变量 `ANIMATORGO_RENDER_PREFABS` / `_CLIPS` / `_STEPS` /
+`_DEBUG=1` 选范围,输出到工程目录下 `Renders/`),然后用 Read 直接看图。编辑器占着 UnityAnimationGo 时,
+把 `Packages/` `ProjectSettings/` `Assets/Settings/` 拷到临时目录另起一个工程跑。
 它盯的是**两类只有 Unity 自己知道、而且都不报错**的问题:
 
 1. **动画曲线的 `path` 指不到真实物体** —— Unity 直接忽略这条曲线,

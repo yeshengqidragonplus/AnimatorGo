@@ -116,7 +116,7 @@ Unity.exe -batchmode -quit -nographics -projectPath <工程>           -executeM
 | ~~29~~ | ~~加权网格之间缩放不一致~~ | ✅ **已解**:同上,Mesh 的顶点与 UV 各自独立 |
 | 22 | clipping 遮罩 | 无对应物 |
 | 20 | 贝塞尔控制点贴端点 | 退化为线性 |
-| 16 | 逐帧绘制顺序 | ~~`sortingOrder` 是静态的~~ 排查证实 `m_SortingOrder` **可以打关键帧,能做、未做** |
+| ~~16~~ | ~~逐帧绘制顺序~~ | ✅ **已解**(2026-09-10):挪过位的 slot 每条动画一条 `m_SortingOrder` 阶梯曲线,见 [UNITY-2D.md](UNITY-2D.md) 第 12 节 |
 | 9 | `transformMode` 非默认继承 | 无对应物 |
 | **7** | **linkedmesh(共享网格)** | 纯功能缺口,做得了 |
 | 3 | IK / transform / path 约束 | 无对应物,**也没有烘进曲线**(之前「已烘进曲线」的说法不对,代码里没有求解器)—— 受约束驱动的骨骼停在自己的关键帧上 |
@@ -219,8 +219,18 @@ SpriteSkin 41 个全部 Ready;SkinnedMeshRenderer 59 个、形变目标 373 个,
 | 海盗帽上叠着生日帽和圣诞围巾 | **所有皮肤的 attachment 全部导出**。Spine 一次只有一套皮肤生效,Unity 没有皮肤概念 | 一次只导一套:默认皮肤 + `--skin` 选的那套(默认皮肤空着就自动选第一套);产物名带 `@皮肤名`;未导出的皮肤报 info |
 | `stand` 里五套眼睛、四张嘴叠在一起 | 所有挂图节点 `m_IsActive: 1`,只靠 attachment 时间轴关;没有该时间轴的动画里就全亮 | 初始显隐按 setup pose:同一 slot 只亮 `attachmentName` 那一个 |
 
-同时确认了 blackrichwoman 的 6 条动画都用 drawOrder 把右手提到脸前面(+28 层),
-现在是静态顺序,手会被脸挡住 —— 就是「逐帧绘制顺序」那条待办,下一个做。
+同时确认了 blackrichwoman 的 6 条动画都用 drawOrder 把右手提到脸前面(+28 层),静态顺序下
+手会被脸挡住、`angry` 里手表消失 —— **这就是用户说的「场景里好的,运行起来不对」**:setup 姿势
+手臂不交叉,一动就交叉、层级就错。当天做掉:`src/spine-eval/drawOrder.ts` 按 Spine 规则铺出完整
+顺序,挪过位的 slot 在**每条**动画里都写 `m_SortingOrder` 阶梯曲线(没挪的动画写 setup 值,
+不依赖 Write Defaults 还原)。SpriteRenderer(212)与 SkinnedMeshRenderer(137)都能被驱动(排查过)。
+
+**新工具 `tools/unity/AnimatorGoRender.cs`**:把产物的动画在编辑器里逐帧渲成 PNG(`SampleAnimation`
++ 手动推 SpriteSkin 蒙皮 + 相机渲到 RenderTexture),我自己能看,不用等人截图。
+环境变量选 prefab / 动画 / 采样数;`ANIMATORGO_RENDER_DEBUG=1` 顺带写每帧亮着的渲染器占图上哪块,
+用来认「图上这块是谁」。⚠️ 每条动画要换一个干净的实例 —— `SampleAnimation` 不会把上一条动画动过、
+这一条没动的属性还原(Animator 的 Write Defaults 会),复用实例会把上一条的表情带进来,
+第一版就这么误判了一次「多出一只手」。
 
 另一个边界:跨度 < 64px 的加权网格不参与缩放分流,`Valentines_flower1/2`、`WestCowboy-sign`
 这几个小件缩放差 50% 却留在 SpriteSkin 路径(该骨架默认皮肤看不到它们)。待修。
@@ -239,7 +249,7 @@ VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
 1. **deform 的 Unity 肉眼确认** —— 六个样本已在 `UnityAnimationGo/Assets/AnimatorGo/`,等用户看
 2. **linkedmesh** —— 7 个骨架 / 138 处
-3. **逐帧绘制顺序 → `m_SortingOrder` 阶梯曲线** —— 16 个骨架,排查证实能做
+3. **跨度 < 64px 的加权网格不参与缩放分流**的边界(`Valentines_flower1/2`、`WestCowboy-sign` 缩放差 50% 留在 SpriteSkin)
 4. **Unity → Spine**(反方向)
 5. **Godot / Cocos 导出**
 6. `.skel` 里没有样本覆盖的区域:path 约束的字段顺序、音频事件的 `volume` / `balance`
@@ -253,7 +263,7 @@ VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
 - ~~deform 顶点关键帧~~ —— 已转成 SkinnedMeshRenderer 的 Blend Shape;打在 `path` 上的 deform 不参与渲染,跳过
 - **走 SkinnedMeshRenderer 的网格上的 slot 颜色动画** —— 没有 `m_Color`,静态颜色烘进顶点色,动画部分丢弃
-- **逐帧绘制顺序** —— 尚未转换(排查证实 `m_SortingOrder` 可以打关键帧,待实现)
+- ~~逐帧绘制顺序~~ —— 已转成 `m_SortingOrder` 阶梯曲线
 - **path / transform 约束** —— 没有对应物
 - **两色染色(dark color)** —— 没有对应物
 - **IK** —— 没有对应物,也没有烘进曲线;受 IK 驱动的骨骼会停在自己的关键帧上

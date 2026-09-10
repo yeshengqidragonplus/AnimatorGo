@@ -30,6 +30,7 @@ import {
   IDENTITY,
   type Affine,
 } from '../../spine-eval/pose.ts'
+import { drawOrderOf, layerOfSlot, type DrawOrderOffset } from '../../spine-eval/drawOrder.ts'
 import { bakeAtlas, type BakedRect } from './bakeAtlas.ts'
 import { attachmentScale, bindMesh, estimateAtlasScale, uvToRect, type SpineVertices } from './mesh.ts'
 
@@ -64,8 +65,10 @@ import { attachmentScale, bindMesh, estimateAtlasScale, uvToRect, type SpineVert
  *
  * - path / transform 约束、IK(也没有烘进曲线)
  * - 两色染色(dark color)
- * - 逐帧改变绘制顺序(drawOrder)—— 能做,未做
  * - clipping 遮罩
+ * - 皮肤:一次只导一套(默认 + `skin` 选的),Unity 没有运行时切皮肤的对应物
+ *
+ * 逐帧绘制顺序(drawOrder)→ 挪过位的 slot 每条动画一条 `m_SortingOrder` 阶梯曲线。
  */
 
 export interface UnityExportOptions {
@@ -1127,6 +1130,27 @@ export function exportToUnity(
   /** slot 颜色动画落在 SkinnedMeshRenderer 上的 sprite —— 没有对应属性,汇总后报一次 */
   const skinnedColorLoss = new Set<string>()
 
+  // ── 逐帧绘制顺序 → m_SortingOrder 阶梯曲线 ──
+  //
+  // Spine 的 drawOrder 一帧只存「谁挪了几位」,铺成完整顺序后,每个 slot 的层号就是它的 sortingOrder
+  // (静态时 sortingOrder = slot 下标,同一套刻度)。实测 blackrichwoman 六条动画都把右手提到脸前 +28 层 ——
+  // 手摸脸的动作,静态顺序下手会被脸挡住。
+  //
+  // 有哪些 slot 在任何动画里挪过位,就给它们在**每条**动画里都写曲线(没挪的动画写一个 setup 值):
+  // 这样切动画时不依赖 Animator 的 Write Defaults 去还原,行为和 Spine「换动画回 setup」一致。
+  const drawOrderSlots = new Set<number>()
+  for (const anim of part.animations) {
+    for (const t of anim.timelines) {
+      if (t.kind !== 'drawOrder') continue
+      for (const f of t.frames) {
+        const layer = layerOfSlot(drawOrderOf(part.slots.length, (f['offsets'] as DrawOrderOffset[] | undefined) ?? []))
+        layer.forEach((l, slot) => {
+          if (l !== slot) drawOrderSlots.add(slot)
+        })
+      }
+    }
+  }
+
   // ── 5. 动画 ──
   const clipGuids = new Map<string, string>()
   const files: UnityFile[] = []
@@ -1304,13 +1328,39 @@ export function exportToUnity(
         }
 
         if (t.kind === 'drawOrder') {
-          issues.loss('drawOrder', '逐帧绘制顺序尚未转换,该时间轴已丢弃(排查证实 m_SortingOrder 可以打关键帧,能做、未做)')
+          continue // 时间轴循环之后统一转成 m_SortingOrder 曲线
         } else if (t.kind === 'transform' || t.kind.startsWith('path')) {
           issues.loss(t.kind, 'Unity 没有 transform / path 约束的对应物,该时间轴已丢弃')
         } else if (t.kind === 'ik') {
           issues.loss('ik', 'Unity 没有 IK 约束的对应物,也没有把 IK 的结果烘进曲线 —— 受 IK 驱动的骨骼会停在自己的关键帧上,外观会不一致')
         } else if (t.kind === 'event') {
           issues.add('info', 'event', 'Spine 事件没有转成 Unity 的 AnimationEvent(没有对应的回调函数名)')
+        }
+      }
+
+      // 逐帧绘制顺序:挪过位的 slot 每条动画都写 m_SortingOrder 阶梯曲线
+      if (drawOrderSlots.size > 0) {
+        const timeline = anim.timelines.find((t) => t.kind === 'drawOrder')
+        const frames = [...(timeline?.frames ?? [])].sort((a, b) => (a['time'] as number) - (b['time'] as number))
+        const layers = frames.map((f) => ({
+          time: f['time'] as number,
+          layer: layerOfSlot(drawOrderOf(part.slots.length, (f['offsets'] as DrawOrderOffset[] | undefined) ?? [])),
+        }))
+        for (const slot of drawOrderSlots) {
+          const list = slotNodes.get(slot)
+          if (list === undefined) continue
+          const keys: UnityKeyframe[] = []
+          // 第一帧之前是 setup 顺序 —— 0 处补一个 setup 值(帧正好在 0 就不用)
+          if (layers.length === 0 || layers[0]!.time > 0) keys.push(key(0, slot, true))
+          for (const l of layers) keys.push(key(l.time, l.layer[slot]!, true))
+          for (const item of list) {
+            floats.push({
+              path: paths[item.node]!,
+              attribute: 'm_SortingOrder',
+              classID: skinnedByItem.has(item) ? 137 : 212,
+              keys,
+            })
+          }
         }
       }
     })

@@ -129,7 +129,7 @@ Spine 的 deform 顶点动画在 MergeCooking2 里占 **32% 的骨架**,且数�
   骨架只有 10 个,真·自由形变有 137 个。覆盖面不够,不做
 
 **已知仍然做不到的:** clipping 遮罩。逐帧绘制顺序此前判定为做不到 —— 排查证实
-`m_SortingOrder` 可以打关键帧(SpriteRenderer 与 SkinnedMeshRenderer 都行),能做、未做。
+`m_SortingOrder` 可以打关键帧(SpriteRenderer 与 SkinnedMeshRenderer 都行),2026-09-10 已做。
 排查结论全文见 [PROGRESS.md](PROGRESS.md)「Blend Shape 路线的排查结论」。
 
 ## 架构

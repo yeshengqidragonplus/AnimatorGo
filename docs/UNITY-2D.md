@@ -20,7 +20,7 @@
 | 骨骼 TRS 动画 | `.anim` 的 Position / Euler / Scale 曲线 | ✅ 可映射 |
 | IK | 包内 `IK/` 模块 | ⚠️ 有,但**未转换也未烘进曲线**,受 IK 驱动的骨骼停在自己的关键帧上 |
 | **deform 顶点关键帧** | 2D 包里没有;用 **`SkinnedMeshRenderer` 的 Blend Shape** | ✅ **走另一条网格路径**,见第 11 节 |
-| 逐帧绘制顺序 | `m_SortingOrder` 可以打关键帧(实测) | ⚠️ 能做,未做 |
+| 逐帧绘制顺序 | 挪过位的 slot 每条动画一条 `m_SortingOrder` 阶梯曲线 | ✅ 可映射,见第 12 节 |
 | **path / transform 约束** | —— | ❌ 没有 |
 | **两色染色(dark)** | —— | ❌ 没有 |
 | **clipping 遮罩** | —— | ❌ 没有 |
@@ -476,7 +476,27 @@ approximated —— MC2 的 458 条里 431 条 < 0.5px,最大 20px。
 没有的话 Unity 同样一声不响。6 个样本(MX2_cat、customer_1、blackrichwoman、wave、17701、13901)
 共 59 个 SkinnedMeshRenderer、373 个形变目标,batchmode 全部通过。
 
-## 12. 待确认
+## 12. 逐帧绘制顺序 → `m_SortingOrder` 阶梯曲线
+
+Spine 的 drawOrder 一帧只存「哪些 slot 挪了几位」(`offsets: [{slot, offset}]`,按 slot 升序),
+完整顺序按它的规则铺:挪了的放到 `原下标 + offset`,没挪的按原顺序依次填空位(从后往前填)。
+实现在 `src/spine-eval/drawOrder.ts`。空 offsets = 回到 setup 顺序。
+
+层号就是 `sortingOrder`(静态时 = slot 下标,同一套刻度)。曲线怎么写:
+
+- **只给在任何动画里挪过位的 slot 写**,但要在**每条**动画里都写 —— 没挪的动画写一个 setup 值。
+  否则 A 动画把手提到脸前,切到没有 drawOrder 的 B 动画时手留在前面。Spine 换动画时会把
+  上一条动画动过的属性还原回 setup,这样做才和它一致,也不依赖 Animator 的 Write Defaults
+- 阶梯曲线,0 处一定有键(setup 顺序),每个 drawOrder 帧一个键
+- SpriteRenderer(classID 212)和 SkinnedMeshRenderer(classID 137)的 `m_SortingOrder` 都能被
+  曲线驱动(`AnimatorGoProbe.cs` 实测);float → int 的取整是四舍五入,阶梯整数不受影响
+- 同一 slot 下的多个 attachment 节点共用同一条曲线
+
+实测 blackrichwoman:6 条动画把右手、右前臂提 28 层到脸前(摸脸),左前臂左手提 10 层。
+静态顺序下 `angry` 的手表整个消失在左臂后面 —— setup 姿势手臂不交叉所以场景里看不出,
+一播就错。这是用户第一个撞上的播放问题。
+
+## 13. 待确认
 
 - `.anim` 里驱动 `SpriteResolver` 的曲线具体形态(尚无样本)。
   目前换 attachment 走的是**一个 attachment 一个物体 + `m_IsActive` 阶梯曲线**,
