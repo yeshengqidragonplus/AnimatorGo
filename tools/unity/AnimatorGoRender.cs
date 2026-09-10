@@ -34,6 +34,9 @@ public static class AnimatorGoRender
         string[] clipFilter = Split(Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_CLIPS"));
         int steps = int.TryParse(Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_STEPS"), out int parsed) ? parsed : 4;
         bool debug = Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_DEBUG") == "1";
+        // sample = AnimationClip.SampleAnimation 直接写属性(默认);
+        // animator = 走真正的 Animator 状态机(Play + Update(0)),连 Write Defaults 一起,更接近运行时
+        bool viaAnimator = Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_MODE") == "animator";
         string outDir = Path.Combine(Directory.GetCurrentDirectory(), "Renders");
         Directory.CreateDirectory(outDir);
 
@@ -69,10 +72,24 @@ public static class AnimatorGoRender
                 var root = (GameObject)PrefabUtility.InstantiatePrefab(prefab);
                 try
                 {
+                    Animator animator = root.GetComponent<Animator>();
+                    if (viaAnimator && animator != null)
+                    {
+                        animator.Rebind(); // 记下默认值(Write Defaults 用的就是这一份)
+                    }
                     for (int i = 0; i < steps; i++)
                     {
                         float t = clip.length * i / steps;
-                        clip.SampleAnimation(root, t);
+                        if (viaAnimator && animator != null)
+                        {
+                            // 状态名 = 剪辑名。Play 到指定进度后 Update(0) 求值,不推进时间
+                            animator.Play(clip.name, 0, clip.length > 0 ? t / clip.length : 0f);
+                            animator.Update(0f);
+                        }
+                        else
+                        {
+                            clip.SampleAnimation(root, t);
+                        }
                         // SpriteSkin 的蒙皮在 LateUpdate 里做,批处理没有帧循环 —— 手动推一下。
                         // 公开的 OnPreviewUpdate 只在 GUI 事件循环里才干活(Event.current != null),
                         // 批处理里拿不到事件,所以直接调它里面那个私有的 DeformForPreviewUpdate。
@@ -84,7 +101,7 @@ public static class AnimatorGoRender
                         }
                         Frame(cam, root);
                         cam.Render();
-                        string stem = Path.Combine(outDir, $"{prefabName}_{clipName}_{i}_{t:0.00}s");
+                        string stem = Path.Combine(outDir, $"{prefabName}_{clipName}_{i}_{t:0.00}s{(viaAnimator ? "_animator" : "")}");
                         File.WriteAllBytes(stem + ".png", ReadPng(rt));
                         if (debug) File.WriteAllText(stem + ".txt", Describe(cam, root));
                         written++;
