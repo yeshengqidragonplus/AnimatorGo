@@ -235,6 +235,32 @@ SpriteSkin 41 个全部 Ready;SkinnedMeshRenderer 59 个、形变目标 373 个,
 另一个边界:跨度 < 64px 的加权网格不参与缩放分流,`Valentines_flower1/2`、`WestCowboy-sign`
 这几个小件缩放差 50% 却留在 SpriteSkin 路径(该骨架默认皮肤看不到它们)。待修。
 
+### 运行时换皮肤:方案已在 Unity 里验过,未实现(2026-09-10)
+
+现在是「一套皮肤一份 prefab」,换皮肤 = 换 prefab 实例。同一个实例运行时切皮肤需要另一种结构,
+难点是 Spine 的皮肤是运行时查表(键名 → 当前皮肤 → 默认皮肤),Unity 没有这张表,
+一个节点要同时满足「换图时间轴说这个键名亮着」和「属于当前皮肤」两个条件。
+
+方案:**两个互相独立的显隐开关 + Animator 分层,零运行时脚本**
+
+| 开关 | 谁控制 | 对应 Spine |
+|---|---|---|
+| 渲染器 `m_Enabled` | 基础层:换图时间轴的阶梯曲线(从现在的 `m_IsActive` 挪过去) | 时间轴按键名亮灭 |
+| GameObject `m_IsActive` | 皮肤层(override,权重 1):每套皮肤一个状态,一条静态 clip 把所有皮肤节点设好 | `SetSkin()` |
+
+切皮肤 = `animator.Play("皮肤名", 1)`。被新皮肤覆盖的默认皮肤节点由皮肤 clip 一并关掉。
+
+探针 `tools/unity/AnimatorGoProbeSkin.cs`(Unity 6000.3,渲染到 RenderTexture 读像素)8 项全过:
+SpriteRenderer / SkinnedMeshRenderer 的 `m_Enabled` 都能被曲线驱动且 Animation 窗口里选得到;
+皮肤层只管 `m_IsActive`,切状态立即生效、切回也对、不干扰基础层;被皮肤层灭掉的物体,
+基础层对它渲染器的曲线在重新点亮后仍生效;两个开关确实是 AND。
+
+⚠️ 探针里踩的坑:**别用 Transform 的单分量曲线**(如 `m_LocalPosition.z`)撑 clip 长度 ——
+Animator 会把没写的分量当 0 写进去,把物体挪到原点。
+
+产物形态会变:一个 prefab 装全部皮肤(节点名带 `@皮肤名`),一张图集含所有皮肤的图,动画一套,
+controller 两层。**只对多皮肤骨架启用**,单皮肤骨架产物不变。等确认游戏里真有运行时切皮肤的需求再做。
+
 顺带解掉的:绑定姿势非刚性(38 个骨架)、加权网格缩放不一致(29 个)—— 同样的网格路径。
 顺带发现的:`wave` 的 deform 打在 `path` attachment 上(路径约束用),不参与渲染,报 info 跳过。
 
