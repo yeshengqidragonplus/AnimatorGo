@@ -95,6 +95,13 @@ export interface PrefabNode {
   readonly renderer: RendererSpec | null
   readonly skin: SkinSpec | null
   readonly skinnedMesh?: SkinnedMeshSpec | null
+  /**
+   * 物体初始是否激活(`m_IsActive`)。不给就是激活。
+   *
+   * 挂图节点要按 Spine 的 setup pose 来:一个 slot 下只有 `attachmentName` 那一个亮着,
+   * 其余(表情变体、换装件)必须是灭的 —— 否则没有 attachment 时间轴的动画里它们会全部叠在一起。
+   */
+  readonly active?: boolean
 }
 
 export interface PrefabOptions {
@@ -182,7 +189,7 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
         '  m_Icon: {fileID: 0}',
         '  m_NavMeshLayer: 0',
         '  m_StaticEditorFlags: 0',
-        '  m_IsActive: 1',
+        `  m_IsActive: ${node.active === false ? 0 : 1}`,
       ].join('\n'),
     )
 

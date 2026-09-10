@@ -15,7 +15,8 @@
 |---|---|---|
 | 骨骼层级 | `bones[]`(在 sprite 的 `.meta` 里)+ 场景 Transform | ✅ 可映射 |
 | 网格 + 顶点权重 | `vertices` / `indices` / `weights` | ⚠️ **每顶点最多 4 根骨骼** |
-| slot 换图 / 皮肤 | 一个 attachment 一个物体 + `m_IsActive` 曲线 | ✅ 可映射(不必用 SpriteLibrary) |
+| slot 换图 | 一个 attachment 一个物体 + `m_IsActive` 曲线;初始显隐按 setup pose(同一 slot 只亮 `attachmentName` 那个) | ✅ 可映射(不必用 SpriteLibrary) |
+| 皮肤 | —— | ⚠️ Unity 没有;**一次导出一套**(默认 + `--skin` 选的),产物名带 `@皮肤名` |
 | 骨骼 TRS 动画 | `.anim` 的 Position / Euler / Scale 曲线 | ✅ 可映射 |
 | IK | 包内 `IK/` 模块 | ⚠️ 有,但**未转换也未烘进曲线**,受 IK 驱动的骨骼停在自己的关键帧上 |
 | **deform 顶点关键帧** | 2D 包里没有;用 **`SkinnedMeshRenderer` 的 Blend Shape** | ✅ **走另一条网格路径**,见第 11 节 |

@@ -35,6 +35,8 @@ interface Options {
   readonly renderPipeline: RenderPipeline | null
   /** SkinnedMeshRenderer 的蒙皮根数:bone4 写死 4 根(默认),auto 跟随工程 Quality */
   readonly skinQuality: 'bone4' | 'auto'
+  /** 导出哪套皮肤(与默认皮肤一起);null = 只导默认皮肤 */
+  readonly skin: string | null
 }
 
 function parseArgs(argv: readonly string[]): Options | string {
@@ -84,6 +86,7 @@ function parseArgs(argv: readonly string[]): Options | string {
     atlas: atlas === null ? null : resolve(atlas),
     renderPipeline: rp as RenderPipeline | null,
     skinQuality,
+    skin: flags.get('skin') ?? null,
   }
 }
 
@@ -268,7 +271,7 @@ function summarize(tallies: ReadonlyMap<string, Tally>, title: string): string[]
 function main(): void {
   const parsed = parseArgs(process.argv.slice(2))
   if (typeof parsed === 'string') {
-    console.error(`✗ ${parsed}\n\n用法:pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--dry-run]`)
+    console.error(`✗ ${parsed}\n\n用法:pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--skin 皮肤名] [--skin-quality bone4|auto] [--dry-run]`)
     process.exitCode = 1
     return
   }
@@ -325,8 +328,10 @@ function main(): void {
   }
 
   for (const file of files) {
-    const stem = stemOf(file)
-    console.log(`  ${basename(file)}`)
+    const base = stemOf(file)
+    // 带皮肤时产物名加后缀,同一个骨架的不同皮肤才能并存在一个输出目录里
+    const stem = parsed.skin === null ? base : `${base}@${parsed.skin}`
+    console.log(`  ${basename(file)}${parsed.skin === null ? '' : `(皮肤 ${parsed.skin})`}`)
 
     try {
       const part = readSkeleton(file)
@@ -337,7 +342,7 @@ function main(): void {
       const found = parsed.atlas === null ? findAtlas(file) : { path: parsed.atlas, guessed: false }
       if (found === null) {
         throw new Error(
-          `找不到图集(试过 ${stem}.atlas / .atlas.txt,以及去掉版本后缀)—— 用 --atlas 指定`,
+          `找不到图集(试过 ${base}.atlas / .atlas.txt,以及去掉版本后缀)—— 用 --atlas 指定`,
         )
       }
       if (found.guessed) console.log(`    ℹ 图集不同名,用了 ${basename(found.path)}`)
@@ -356,6 +361,7 @@ function main(): void {
         pixelsPerUnit: parsed.pixelsPerUnit,
         renderPipeline: pipeline,
         skinQuality: parsed.skinQuality,
+        ...(parsed.skin === null ? {} : { skin: parsed.skin }),
         // 试运行不写文件,那就别费时间编码 PNG
         skipImages: parsed.dryRun,
       })

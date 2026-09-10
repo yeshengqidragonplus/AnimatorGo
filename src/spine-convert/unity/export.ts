@@ -1,5 +1,5 @@
 import type { SkeletonPart } from '../../spine-format/binary/readSkeleton.ts'
-import type { Attachment } from '../../spine-format/binary/readSkins.ts'
+import type { Attachment, Skin } from '../../spine-format/binary/readSkins.ts'
 import type { AnimationData, Timeline } from '../../spine-format/binary/readAnimations.ts'
 import type { Atlas } from '../../core/atlas.ts'
 import { IssueCollector, type ConversionIssue } from '../types.ts'
@@ -89,6 +89,12 @@ export interface UnityExportOptions {
    * 只是不把像素压成 PNG。
    */
   readonly skipImages?: boolean
+  /**
+   * 导出哪套皮肤(与默认皮肤一起)。Spine 一次只有一套皮肤生效,Unity 没有皮肤的概念,
+   * 所以**一次导出一套**;不给时只导默认皮肤(默认皮肤空着就自动选第一套)。
+   * 全部导出会让所有换装件同时出现 —— 实测 blackrichwoman:海盗帽上叠着生日帽和圣诞围巾。
+   */
+  readonly skin?: string
 }
 
 export interface UnityFile {
@@ -371,11 +377,39 @@ export function exportToUnity(
     }
   }
 
+  // ── 皮肤:一次只导一套 ──
+  const isRenderable = (a: Attachment) => a.type === 'region' || a.type === 'mesh'
+  const renderCount = (s: Skin) => s.slots.reduce((n, e) => n + e.attachments.filter(isRenderable).length, 0)
+  const defaultSkin = part.skins.find((s) => s.name === 'default') ?? part.skins[0]
+  const otherSkins = part.skins.filter((s) => s !== defaultSkin)
+  let chosenSkin: Skin | null = null
+  if (options.skin !== undefined) {
+    const found = part.skins.find((s) => s.name === options.skin)
+    if (found === undefined) {
+      throw new Error(`骨架里没有皮肤 "${options.skin}",有:${part.skins.map((s) => s.name).join('、')}`)
+    }
+    if (found !== defaultSkin) chosenSkin = found
+  } else if (defaultSkin !== undefined && renderCount(defaultSkin) === 0 && otherSkins.length > 0) {
+    // 不少骨架把所有东西都放在具名皮肤里,默认皮肤是空的 —— 只导默认就是一个空角色
+    chosenSkin = otherSkins[0]!
+    issues.add('info', 'skin', `默认皮肤没有可渲染的 attachment,自动选了皮肤 "${chosenSkin.name}"(用 --skin 指定别的)`)
+  }
+  const selectedSkins = [defaultSkin, chosenSkin].filter((s): s is Skin => s !== undefined && s !== null)
+  const skippedSkins = otherSkins.filter((s) => s !== chosenSkin)
+  if (skippedSkins.length > 0) {
+    issues.add(
+      'info',
+      'skin',
+      `Spine 一次只有一套皮肤生效,本次导出 ${selectedSkins.map((s) => `"${s.name}"`).join(' + ')};` +
+        `未导出 ${skippedSkins.map((s) => `"${s.name}"(${renderCount(s)} 件)`).join('、')} —— 用 --skin 选`,
+    )
+  }
+
   // ── 1. 收集 attachment ──
   const used: SlotAttachment[] = []
   const spriteNames = new Set<string>()
 
-  for (const skin of part.skins) {
+  for (const skin of selectedSkins) {
     for (const entry of skin.slots) {
       for (const attachment of entry.attachments) {
         if (attachment.type === 'region' || attachment.type === 'mesh') {
@@ -790,6 +824,7 @@ export function exportToUnity(
         scale: { x: 1, y: 1, z: 1 },
         renderer: null,
         skin: null,
+        active: item.key === slot.attachmentName,
         skinnedMesh: {
           mesh: { fileID: MESH_FILE_ID, guid: meshGuidOf(item.spriteName) },
           material: { fileID: MATERIAL_FILE_ID, guid: materialGuids[info.page]! },
@@ -868,6 +903,8 @@ export function exportToUnity(
       scale: nodeScale,
       renderer,
       skin,
+      // setup pose:一个 slot 只亮 attachmentName 那一个;表情变体、换装件初始是灭的
+      active: item.key === slot.attachmentName,
     })
   }
 
@@ -1240,8 +1277,12 @@ export function exportToUnity(
           const d = t.frames[0] as unknown as DeformRecord
           const geo = skinnedByKey.get(`${skinNameOf(d.skin)}/${t.owner}/${d.attachment}`)
           if (geo === undefined || geo.nodeIndex < 0) {
-            const type = attachmentTypeOf(skinNameOf(d.skin), t.owner, d.attachment)
-            if (type !== null && type !== 'mesh' && type !== 'linkedmesh') {
+            const skinName = skinNameOf(d.skin)
+            const type = attachmentTypeOf(skinName, t.owner, d.attachment)
+            if (!selectedSkins.some((s) => s.name === skinName)) {
+              // 这条 deform 属于没导出的皮肤,连它的网格都不在产物里 —— 不是丢失,是本次不导
+              issues.add('info', `deform[${t.owner}]`, `deform 指向皮肤 "${skinName}" 的 "${d.attachment}",该皮肤本次未导出,已跳过`)
+            } else if (type !== null && type !== 'mesh' && type !== 'linkedmesh') {
               // 实测 MergeCooking2 的 wave:deform 打在 path 上(路径约束用),没有可渲染的东西
               issues.add('info', `deform[${t.owner}]`, `deform 指向的 "${d.attachment}" 是 ${type},不参与渲染,已跳过`)
             } else {

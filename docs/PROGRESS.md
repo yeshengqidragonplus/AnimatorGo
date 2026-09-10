@@ -210,7 +210,20 @@ SpriteSkin 41 个全部 Ready;SkinnedMeshRenderer 59 个、形变目标 373 个,
 所有曲线都指到物体;AnimatorGo 自检:全部通过 ✅
 ```
 
-这六个也已转进 `UnityAnimationGo/Assets/AnimatorGo/`,**肉眼确认待用户**。
+这六个也已转进 `UnityAnimationGo/Assets/AnimatorGo/`。
+
+**用户肉眼对比 blackrichwoman(2026-09-10)抓出两个与 deform 无关的老 bug,已修:**
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| 海盗帽上叠着生日帽和圣诞围巾 | **所有皮肤的 attachment 全部导出**。Spine 一次只有一套皮肤生效,Unity 没有皮肤概念 | 一次只导一套:默认皮肤 + `--skin` 选的那套(默认皮肤空着就自动选第一套);产物名带 `@皮肤名`;未导出的皮肤报 info |
+| `stand` 里五套眼睛、四张嘴叠在一起 | 所有挂图节点 `m_IsActive: 1`,只靠 attachment 时间轴关;没有该时间轴的动画里就全亮 | 初始显隐按 setup pose:同一 slot 只亮 `attachmentName` 那一个 |
+
+同时确认了 blackrichwoman 的 6 条动画都用 drawOrder 把右手提到脸前面(+28 层),
+现在是静态顺序,手会被脸挡住 —— 就是「逐帧绘制顺序」那条待办,下一个做。
+
+另一个边界:跨度 < 64px 的加权网格不参与缩放分流,`Valentines_flower1/2`、`WestCowboy-sign`
+这几个小件缩放差 50% 却留在 SpriteSkin 路径(该骨架默认皮肤看不到它们)。待修。
 
 顺带解掉的:绑定姿势非刚性(38 个骨架)、加权网格缩放不一致(29 个)—— 同样的网格路径。
 顺带发现的:`wave` 的 deform 打在 `path` attachment 上(路径约束用),不参与渲染,报 info 跳过。

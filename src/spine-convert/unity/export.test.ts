@@ -158,6 +158,8 @@ interface PrefabBack {
   /** Transform 的 fileID → 物体名。挂图节点常和骨骼同名,只能靠父节点区分 */
   nameOf: Map<string, string>
   transforms: Map<string, { father: string; x: number; y: number; rotation: number; sx: number; sy: number }>
+  /** Transform 的 fileID → 物体的 m_IsActive */
+  activeOf: Map<string, boolean>
   skinCount: number
 }
 
@@ -179,6 +181,7 @@ function childNamed(prefab: PrefabBack, father: string, name: string): string {
 function readPrefab(text: string): PrefabBack {
   const transforms = new Map<string, { father: string; x: number; y: number; rotation: number; sx: number; sy: number }>()
   const goName = new Map<string, string>()
+  const goActive = new Map<string, boolean>()
   const goOfTransform = new Map<string, string>()
   let skinCount = 0
 
@@ -188,8 +191,10 @@ function readPrefab(text: string): PrefabBack {
     const [, cls, id] = head
     const go = /m_GameObject: \{fileID: (\d+)}/.exec(doc)?.[1]
 
-    if (cls === '1') goName.set(id!, /m_Name: (.*)/.exec(doc)![1]!.trim())
-    else if (cls === '4') {
+    if (cls === '1') {
+      goName.set(id!, /m_Name: (.*)/.exec(doc)![1]!.trim())
+      goActive.set(id!, /m_IsActive: (\d)/.exec(doc)![1] === '1')
+    } else if (cls === '4') {
       const rot = pair(/m_LocalRotation: .*/.exec(doc)![0], 'z', 'w')
       const pos = pair(/m_LocalPosition: .*/.exec(doc)![0], 'x', 'y')
       const scl = pair(/m_LocalScale: .*/.exec(doc)![0], 'x', 'y')
@@ -207,12 +212,15 @@ function readPrefab(text: string): PrefabBack {
 
   const byName = new Map<string, string>()
   const nameOf = new Map<string, string>()
+  const activeOf = new Map<string, boolean>()
   for (const id of transforms.keys()) {
-    const name = goName.get(goOfTransform.get(id)!)!
+    const go = goOfTransform.get(id)!
+    const name = goName.get(go)!
     nameOf.set(id, name)
+    activeOf.set(id, goActive.get(go) ?? true)
     if (!byName.has(name)) byName.set(name, id)
   }
-  return { byName, nameOf, transforms, skinCount }
+  return { byName, nameOf, transforms, activeOf, skinCount }
 }
 
 function worldOf(prefab: PrefabBack, id: string, cache: Map<string, Affine>): Affine {
@@ -691,6 +699,39 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
     expect(mesh.blendShapes.length).toBe(keysWithShape)
   })
 
+  /**
+   * setup pose 的显隐:一个 slot 下只有 `attachmentName` 那一个亮着,其余灭。
+   *
+   * 之前所有挂图节点都是 `m_IsActive: 1` —— 没有 attachment 时间轴的动画里,
+   * 表情变体会全部叠在一起(blackrichwoman 的 `stand` 里五套眼睛同时出现)。
+   */
+  it('⭐ 挂图节点的初始显隐按 setup pose:同一 slot 只亮一个', () => {
+    const prefab = readPrefab(textOf('.prefab'))
+    // 期望:默认皮肤里每个可渲染 attachment 一个节点,key ≠ slot.attachmentName 的必须是灭的
+    const expected = new Map<string, boolean>()
+    for (const skin of part.skins) {
+      for (const entry of skin.slots) {
+        const slot = part.slots[entry.slot]!
+        for (const a of entry.attachments) {
+          if (a.type !== 'region' && a.type !== 'mesh') continue
+          expected.set(attachmentNodeName(slot.name, a.key), a.key === slot.attachmentName)
+        }
+      }
+    }
+    const inactiveExpected = [...expected.values()].filter((v) => !v).length
+    expect(inactiveExpected).toBeGreaterThan(0) // MX2_cat 有表情变体,否则这条用例没意义
+
+    let inactiveFound = 0
+    for (const [id, active] of prefab.activeOf) {
+      const name = prefab.nameOf.get(id)!
+      if (!active) {
+        inactiveFound++
+        expect(expected.get(name)).toBe(false)
+      }
+    }
+    expect(inactiveFound).toBe(inactiveExpected)
+  })
+
   it('有损的地方都报出来了,不静默', () => {
     const kinds = result.issues.map((i) => `${i.level}:${i.path}`)
     // deform 现在转成 Blend Shape,不再是 loss;逐帧绘制顺序还没做,必须报
@@ -735,6 +776,54 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
       if (typeof file.content === 'string') expect(file.content).toBe(first.content)
       else expect([...file.content]).toEqual([...(first.content as Uint8Array)])
     })
+  })
+})
+
+// ─── 皮肤:MergeCooking2 的本地样本(不在库里,存在才跑)─────────────────────────
+
+const MC2_BRW = 'E:/UnityProject/MergeCooking2/MergeCooking2/Assets/Export/Spine/NewSpine/Customer11/blackrichwoman.skel.bytes'
+
+/**
+ * blackrichwoman 有 default + 5 套换装皮肤(3rd_anniversary / Christmas_day / Pirate / Valentines_day / WestCowboy)。
+ * Spine 一次只有一套生效;之前全部导出,海盗帽上叠着生日帽和圣诞围巾。
+ */
+describe.skipIf(!existsSync(MC2_BRW))('皮肤:一次只导一套(MergeCooking2 本地样本)', () => {
+  const dir = MC2_BRW.slice(0, MC2_BRW.lastIndexOf('/'))
+  const part = readSkeletonPart(new Uint8Array(readFileSync(MC2_BRW)))
+  const atlas = parseAtlas(readFileSync(`${dir}/blackrichwoman.atlas.txt`, 'utf8'))
+  const sources = new Map<string, Image>()
+  for (const page of atlas.pages) sources.set(page.name, decodePng(new Uint8Array(readFileSync(`${dir}/${page.name}`))))
+  const names = (result: ReturnType<typeof exportToUnity>) => {
+    const prefab = readPrefab((result.files.find((f) => f.path.endsWith('.prefab'))!.content as string))
+    return prefab
+  }
+
+  it('不给 --skin:只有默认皮肤,换装件一个都不出现,表情变体初始是灭的', () => {
+    const prefab = names(exportToUnity(part, atlas, sources, { name: 'brw', pixelsPerUnit: 100, renderPipeline: 'urp' }))
+    const all = [...prefab.nameOf.values()]
+    for (const costume of ['Pirate_hat', '3rd_anniversary_mz1', 'WestCowboy_scarf', 'flower', 'Valentines_flower1']) {
+      expect(all).not.toContain(costume)
+    }
+    expect(all).toContain('eye')
+    expect(all).toContain('eye__eye4')
+    expect(prefab.activeOf.get(prefab.byName.get('eye__eye4')!)).toBe(false)
+    expect(prefab.activeOf.get(prefab.byName.get('mouth__mouth1')!)).toBe(true) // slot mouth 的 setup 是 mouth1
+    expect(prefab.activeOf.get(prefab.byName.get('mouth__mouth2')!)).toBe(false)
+  })
+
+  it('--skin Pirate:只多出海盗那三件,生日帽和圣诞围巾不来', () => {
+    const result = exportToUnity(part, atlas, sources, { name: 'brw', pixelsPerUnit: 100, renderPipeline: 'urp', skin: 'Pirate' })
+    const all = [...names(result).nameOf.values()]
+    expect(all).toContain('Pirate_hat')
+    expect(all).toContain('Pirate_waistband')
+    expect(all).not.toContain('3rd_anniversary_mz1')
+    expect(all).not.toContain('WestCowboy_scarf')
+    const skinInfo = result.issues.find((i) => i.path === 'skin')
+    expect(skinInfo?.message).toContain('"default" + "Pirate"')
+  })
+
+  it('不存在的皮肤名当场报错,并列出有哪些', () => {
+    expect(() => exportToUnity(part, atlas, sources, { name: 'brw', pixelsPerUnit: 100, renderPipeline: 'urp', skin: 'Nope' })).toThrow(/Pirate/)
   })
 })
 

@@ -71,8 +71,11 @@ pnpm convert <输入路径> --to 4.1 [--out 目录] [--format skel|json] [--dry-
 导出到 Unity 2D Animation:
 
 ```bash
-pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--skin-quality bone4|auto] [--dry-run]
+pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--skin 皮肤名] [--skin-quality bone4|auto] [--dry-run]
 ```
+
+**皮肤一次只导一套**(默认皮肤 + `--skin` 选的那套;默认皮肤空着就自动选第一套)。Spine 一次只有
+一套皮肤生效,Unity 没有皮肤的概念,全导出来所有换装件会同时出现。带 `--skin` 时产物名带 `@皮肤名` 后缀。
 
 产出**可以直接拖进 Assets 就播**的一整套:烘焙后的图集 PNG + `.meta`
 (含骨骼、网格、权重)、prefab(骨骼层级 + SpriteRenderer + SpriteSkin + Animator)、

@@ -92,7 +92,13 @@ public static class AnimatorGoVerify
 
         foreach (SpriteSkin skin in skins)
         {
+            // 表情变体、换装件按 setup pose 初始是灭的(m_IsActive 0)。灭着的物体 Awake 没跑过,
+            // SpriteSkin 还没拿到自己的 SpriteRenderer,校验会一律报 SpriteNotFound —— 那不是产物的问题。
+            // 这是 LoadPrefabContents 出来的临时实例,临时点亮再校验,不影响资产。
+            bool wasActive = skin.gameObject.activeSelf;
+            if (!wasActive) skin.gameObject.SetActive(true);
             SpriteSkinState state = skin.SetBoneTransforms(skin.boneTransforms);
+            if (!wasActive) skin.gameObject.SetActive(false);
             if (state != SpriteSkinState.Ready) bad.Add($"{skin.name} → {state}");
         }
 
