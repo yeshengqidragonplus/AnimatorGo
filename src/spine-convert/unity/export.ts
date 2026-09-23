@@ -42,6 +42,7 @@ import { bakeAtlas, type BakedRect } from './bakeAtlas.ts'
 import { detectPremultiplied, unpremultiply } from './alpha.ts'
 import { attachmentScale, bindMesh, estimateAtlasScale, uvToRect, type SpineVertices } from './mesh.ts'
 import { resolveLinkedMeshes } from './linkedMesh.ts'
+import { describeTimeline, DUPLICATE_TIMELINE_MESSAGE, lastPerProperty } from '../../spine-format/duplicateTimelines.ts'
 import { sequenceCycle, sequenceFrameAt, sequenceRegionName, sequenceSteps, type SequenceKey } from '../../spine-eval/sequence.ts'
 
 /**
@@ -799,6 +800,10 @@ export function exportToUnity(
     if (mesh.residual > Math.max(1, extent * 0.02)) {
       reasons.push(`绑定姿势非刚性(残差 ${mesh.residual.toFixed(1)} 像素,占跨度 ${((mesh.residual / extent) * 100).toFixed(1)}%)`)
     }
+    // 缩放只在跨度 ≥ 64px 时判:小图的比值被整数裁剪框量化主导(11px 的图差 1px 就是 9%)。
+    // 小图真有缩放差时,上面的残差判据就会露出来 —— MC2 全部 31 个缩放差 > 2% 的小网格,
+    // 24 个残差超标已分流(含 Valentines_flower 这几个差 50% 的),剩下 7 个缩放差 × 跨度都 < 1px,是量化噪声。
+    // 全盘留在 SpriteSkin 的小网格,与姿势无关的误差上界最大 1.4px(见 PROGRESS.md)
     const own = attachmentScale(item.attachment, region)
     if (own !== null && own.extent >= 64 && Math.abs(own.scale / k - 1) > 0.02) {
       reasons.push(`图集缩放 ${own.scale.toFixed(3)} 与全局 ${k.toFixed(3)} 不一致`)
@@ -1319,7 +1324,7 @@ export function exportToUnity(
     }
     return v
   }
-  const writeSequenceCurves = (anim: AnimationData, floats: FloatCurve[]) => {
+  const writeSequenceCurves = (anim: AnimationData, timelines: readonly Timeline[], floats: FloatCurve[]) => {
     const animEnd = durationOf(anim)
     for (const items of frameGroups.values()) {
       const first = items[0]!
@@ -1327,12 +1332,12 @@ export function exportToUnity(
       const seq = first.frame!.sequence
       // 时间轴按「皮肤/slot/键名」找目标,展开后的 linkedmesh 也认父网格的(与 deform 同一套键)
       const targets = new Set(deformKeysOf(first))
-      const seqTimeline = anim.timelines.find((t) => {
+      const seqTimeline = timelines.find((t) => {
         if (t.kind !== 'sequence' || t.owner !== first.slot) return false
         const d = t.frames[0] as unknown as DeformRecord
         return targets.has(`${skinNameOf(d.skin)}/${t.owner}/${d.attachment}`)
       })
-      const attTimeline = anim.timelines.find((t) => t.kind === 'attachment' && t.owner === first.slot)
+      const attTimeline = timelines.find((t) => t.kind === 'attachment' && t.owner === first.slot)
       if (seqTimeline === undefined && attTimeline === undefined) continue
 
       const keys = seqTimeline === undefined ? undefined : (seqTimeline.frames[0] as unknown as { frames: SequenceKey[] }).frames
@@ -1377,8 +1382,14 @@ export function exportToUnity(
     const euler: Vector3Curve[] = []
     const scaleCurves: Vector3Curve[] = []
     const floats: FloatCurve[] = []
+    // 同一属性的重复时间轴只取最后一条(Spine 实际播出来的那条)。两条都写的话,deform 的
+    // Blend Shape 会叠加成两倍(实测 Juicer 的 work),换图 / 颜色则是一个属性两条曲线、谁生效没保证
+    const { kept: timelines, dropped } = lastPerProperty(anim.timelines)
 
     issues.scoped(anim.name, () => {
+      for (const d of dropped) {
+        if (!d.identical) issues.add('approximated', describeTimeline(part, d.timeline), DUPLICATE_TIMELINE_MESSAGE)
+      }
       let approximated = false
       const noteApprox = (t: Timeline) => {
         if (!approximated) return
@@ -1390,7 +1401,7 @@ export function exportToUnity(
         )
       }
 
-      for (const t of anim.timelines) {
+      for (const t of timelines) {
         const bone = part.bones[t.owner]
         const path = paths[boneNode[t.owner] ?? -1]
 
@@ -1559,7 +1570,7 @@ export function exportToUnity(
 
       // 逐帧绘制顺序:挪过位的 slot 每条动画都写 m_SortingOrder 阶梯曲线
       if (drawOrderSlots.size > 0) {
-        const timeline = anim.timelines.find((t) => t.kind === 'drawOrder')
+        const timeline = timelines.find((t) => t.kind === 'drawOrder')
         const frames = [...(timeline?.frames ?? [])].sort((a, b) => (a['time'] as number) - (b['time'] as number))
         const layers = frames.map((f) => ({
           time: f['time'] as number,
@@ -1583,7 +1594,7 @@ export function exportToUnity(
         }
       }
 
-      writeSequenceCurves(anim, floats)
+      writeSequenceCurves(anim, timelines, floats)
     })
 
     const guid = unityGuid(`${name}/clip/${anim.name}`)

@@ -3,6 +3,7 @@ import type { AnimationData, Timeline } from '../../spine-format/binary/readAnim
 import { IssueCollector, type ConversionIssue } from '../types.ts'
 import { curveValuesOf, toAbsoluteBezier, toNormalizedBezier } from '../../spine-format/bezier.ts'
 import { sequenceFrameAt, sequenceRegionName } from '../../spine-eval/sequence.ts'
+import { describeTimeline, DUPLICATE_TIMELINE_MESSAGE, lastPerProperty } from '../../spine-format/duplicateTimelines.ts'
 
 /**
  * `.skel` 的版本转换。
@@ -377,4 +378,20 @@ export function convertSkeleton(
       : part.skins
 
   return { part: { ...part, header, strings, skins, animations }, issues: issues.all }
+}
+
+/**
+ * 写成 JSON 才会丢的东西:同一属性的重复时间轴(JSON 一个键只能有一个值,`toJson` 留最后一条)。
+ *
+ * 和版本无关 —— 同版本的 `skel → json` 也会丢,所以不放进 `convertSkeleton`,由写 JSON 的地方另外调。
+ * 前后两条内容相同的不报(丢了也无损,全盘约 4500 处都是这种)。
+ */
+export function jsonIssues(part: SkeletonPart): ConversionIssue[] {
+  const issues = new IssueCollector()
+  for (const anim of part.animations) {
+    for (const d of lastPerProperty(anim.timelines).dropped) {
+      if (!d.identical) issues.add('approximated', `${anim.name}.${describeTimeline(part, d.timeline)}`, DUPLICATE_TIMELINE_MESSAGE)
+    }
+  }
+  return [...issues.all]
 }

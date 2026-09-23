@@ -2,7 +2,7 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSyn
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
 import { readSkeletonPart, type SpineMajor } from '../spine-format/binary/readSkeleton.ts'
 import { writeSkeleton } from '../spine-format/binary/writeSkeleton.ts'
-import { convertSkeleton } from '../spine-convert/skel/convert.ts'
+import { convertSkeleton, jsonIssues } from '../spine-convert/skel/convert.ts'
 import { toJsonText } from '../spine-format/json/toJson.ts'
 import { fromJsonText } from '../spine-format/json/fromJson.ts'
 import type { ConversionIssue } from '../spine-convert/types.ts'
@@ -161,7 +161,10 @@ function convertFile(file: string, options: Options, baseDir: string): FileResul
     }
   }
 
-  const { part: converted, issues } = convertSkeleton(part, options.to, options.targetVersion)
+  const result = convertSkeleton(part, options.to, options.targetVersion)
+  const converted = result.part
+  // 写成 JSON 另有 JSON 表达不了的东西(重复时间轴),与版本转换无关,同版本转格式也要报
+  const issues = asJson ? [...result.issues, ...jsonIssues(converted)] : result.issues
 
   // 立刻回读一遍 —— 与其产出一个坏文件,不如当场失败
   let output: Uint8Array | string

@@ -19,6 +19,7 @@ const bone = (name: string, parent: number): BoneRecord => ({
 const EVENTS: EventDef[] = [
   { name: 'sfx', nameIndex: 1, int: 0, float: 0, string: null, audioPath: 'cut.mp3', volume: 0.5, balance: -0.25 },
   { name: 'plain', nameIndex: 2, int: 0, float: 0, string: null, audioPath: null, volume: 1, balance: 0 },
+  { name: 'valued', nameIndex: 3, int: 5, float: 2.5, string: 'hit', audioPath: null, volume: 1, balance: 0 },
 ]
 
 const anim = (timelines: Timeline[], extra: Partial<AnimationData> = {}): AnimationData => ({
@@ -30,7 +31,7 @@ const skeleton = (animations: AnimationData[]): SkeletonPart => ({
     hash: '0011223344556677', version: '4.1.23', major: '4.x', x: 0, y: 0, width: 0, height: 0,
     nonessential: false, fps: null, imagesPath: null, audioPath: null,
   },
-  strings: ['sfx', 'plain'],
+  strings: ['sfx', 'plain', 'valued'],
   bones: [bone('root', -1), bone('a', 0), bone('b', 0)],
   slots: [], ik: [], transform: [], path: [], skins: [],
   events: EVENTS,
@@ -83,6 +84,43 @@ describe('事件关键帧的 volume / balance', () => {
     const frames = fromJson(json).animations[0]!.timelines.find((t) => t.kind === 'event')!.frames
     expect(frames[0]).toMatchObject({ volume: 0.5, balance: -0.25 })
     expect(frames[1]).toMatchObject({ volume: 0.9, balance: -0.25 })
+  })
+})
+
+/**
+ * Spine JSON 规范对事件帧的 int / float / string 写的是 "Assume the setup pose value if omitted" ——
+ * 缺省取**事件定义**的值,不是 0。全盘真实 JSON 里没有一帧引用了非 0 定义,所以只能拿规范钉住。
+ */
+describe('事件关键帧的 int / float 缺省取事件定义的值', () => {
+  type Events = { animations: { a: { events: Record<string, unknown>[] } } }
+  const eventsOf = (part: SkeletonPart) => (toJson(part) as Events).animations.a.events
+
+  it('JSON 读:帧里省略的 int / float 取定义的值', () => {
+    const json = toJson(skeleton([])) as Record<string, unknown>
+    json['animations'] = { a: { events: [{ time: 0, name: 'valued' }, { time: 1, name: 'plain' }] } }
+    const [valued, plain] = fromJson(json).animations[0]!.timelines[0]!.frames
+    expect(valued).toMatchObject({ int: 5, float: 2.5, string: null })
+    expect(plain).toMatchObject({ int: 0, float: 0 })
+  })
+
+  it('JSON 写:等于定义的值才省略 —— 定义非 0 时帧里的 0 必须照写,否则读回来变成定义的值', () => {
+    const part = skeleton([anim([eventTimeline([
+      key(2, { int: 5, float: 2.5 }),
+      key(2, { time: 1, int: 0, float: 0 }),
+    ])])])
+    const [same, zero] = eventsOf(part)
+    expect(same).toEqual({ name: 'valued' })
+    expect(zero).toEqual({ time: 1, name: 'valued', int: 0, float: 0 })
+
+    const back = fromJson(toJson(part)).animations[0]!.timelines[0]!.frames
+    expect(back[0]).toMatchObject({ int: 5, float: 2.5 })
+    expect(back[1]).toMatchObject({ int: 0, float: 0 })
+  })
+
+  it('.skel → JSON → .skel:事件帧的值不变', () => {
+    const part = skeleton([anim([eventTimeline([key(2, { int: 5 }), key(2, { time: 1, float: 2.5 }), key(1, { time: 2, int: 3 })])])])
+    const back = fromJson(toJson(part))
+    expect(back.animations[0]!.timelines[0]!.frames.map((f) => [f['int'], f['float']])).toEqual([[5, 0], [0, 2.5], [3, 0]])
   })
 })
 

@@ -405,6 +405,10 @@ Unity 自带的 sprite 材质按直通 alpha 混合,拿 PMA 图喂它等于 rgb 
 判据与 `export.ts` 一致:有 deform 时间轴指向它;或绑定残差 > max(1px, 跨度 2%);
 或(真正混合的加权网格)自己反推的图集缩放与全局中位数差 > 2% 且跨度 ≥ 64px。
 
+跨度 < 64px 不看缩放 —— 小图的比值被整数裁剪框量化主导(11px 差 1px 就是 9%)。这不是漏洞:小图真有
+缩放差时残差判据会露出来(blackrichwoman 缩放差 50% 的 `Valentines_flower` 残差 10~14px,早已分流),
+全盘留在 SpriteSkin 的小网格与姿势无关的误差上界最大 1.4px。数据见 PROGRESS.md。
+
 ### 11.1 Mesh `.asset` 的 YAML(classID 43,fileID 4300000)
 
 结构取自 Unity 6000.3 自己 `CreateAsset` 出来的网格(`tools/unity/AnimatorGoProbe.cs`,
@@ -454,6 +458,11 @@ Unity 自带的 sprite 材质按直通 alpha 混合,拿 PMA 图喂它等于 rgb 
 目标 k 的 100(1−y) 和目标 k+1 的 100y;3.8 的归一化控制点先按第 5 节换成绝对值)。
 第一帧之前 Spine 没有形变,所以 0 处补 0 并阶梯过去(与骨骼曲线的 `withSetup` 同理)。
 没有偏移的「零帧」不成为目标,只贡献相邻目标权重归零的时刻。
+
+⚠️ **同一 attachment 的 deform 时间轴可以有两条**(3.8 常见,`.skel` 里同一组出现两次)。Spine 按顺序套用,
+后一条整条盖掉前一条;而 **Blend Shape 是叠加的** —— 两条都转的话形变翻倍(实测 MC2 的 Juicer:`work`
+里 5 个网格各有 `work_0` + `work_0_2` 同时满权重)。所以每条动画先按属性去重、只取最后一条
+(`spine-format/duplicateTimelines.ts`,换图 / 颜色同理),前后内容不同时报 approximated。
 
 ### 11.4 ⚠️ 增量怎么算:按关键帧时刻的姿势反解,不要抄 Spine 的逐影响偏移
 

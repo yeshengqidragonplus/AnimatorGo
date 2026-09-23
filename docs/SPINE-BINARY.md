@@ -311,7 +311,11 @@ slot / 骨骼 / path 三段是「组数 → 每组:owner 下标 + 组内条数 +
 📌 **组内重复**在 3.8 里很常见:99 个文件、共 4800 处(attachment 1557、color 2930、deform 313),
 都是同一个 slot 的同类时间轴在同一组里出现两次。二进制往返原样保留;**JSON 表达不了**(同一个键只能有一个值),
 `toJson` 留最后一条 —— 运行时按顺序套用,满权重时后一条整条盖掉前一条(它首帧之前的时段也会被拉回 setup),
-所以正常播放看不出区别;动画间混合过渡时可能有细微差异。这是 `skel → json` 方向的已知损失,目前没报 issue。
+所以正常播放看不出区别;动画间混合过渡时可能有细微差异。
+
+全盘约 4500 处前后两条内容完全相同(丢了无损);内容不同的 297 处、52 个文件,`skel → json` 与 Unity 导出
+各报一条 approximated。逻辑在 `src/spine-format/duplicateTimelines.ts`,两处共用。
+⚠️ Unity 那边不去重是**看得见的** bug:两条 deform 各变成一组 Blend Shape,而 Blend Shape 是叠加的,形变翻倍。
 
 ### 7.7 deform 帧序
 

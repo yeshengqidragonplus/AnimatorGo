@@ -1,6 +1,7 @@
 ﻿import { DEFAULT_BONE_COLOR, type SkeletonPart, type SpineMajor } from '../binary/readSkeleton.ts'
 import type { Attachment, Vertices } from '../binary/readSkins.ts'
-import type { Timeline } from '../binary/readAnimations.ts'
+import type { EventDef, Timeline } from '../binary/readAnimations.ts'
+import { lastPerProperty } from '../duplicateTimelines.ts'
 
 /**
  * 模型 → Spine JSON。
@@ -290,6 +291,7 @@ function animationToJson(
   transformNames: readonly string[],
   pathNames: readonly string[],
   skinNames: readonly string[],
+  events: readonly EventDef[],
 ): Json {
   const out: Json = {}
   const group = (holder: Json, name: string, key: string, value: unknown) => {
@@ -304,7 +306,9 @@ function animationToJson(
   const path: Json = {}
   const deform: Json = {}
 
-  for (const t of timelines) {
+  // 同一属性的重复时间轴(3.8 常见)JSON 表达不了,只留 Spine 实际播出来的最后一条;
+  // 内容不同的由调用方报告,见 duplicateTimelines.ts
+  for (const t of lastPerProperty(timelines).kept) {
     if (t.kind === 'attachment' || t.kind === 'color' || t.kind === 'twoColor' || t.kind.startsWith('slotColor')) {
       const { key, value } = slotTimelineToJson(t, is38)
       group(slots, slotNames[t.owner] ?? String(t.owner), key, value)
@@ -426,13 +430,21 @@ function animationToJson(
     }
 
     if (t.kind === 'event') {
+      // 帧里省略的 int / float / string / volume / balance 取**事件定义**的值,不是 0
+      // (Spine JSON 规范原文:"Assume the setup pose value if omitted")。省略的判断要和读取端一致
       out['events'] = t.frames.map((f) => {
+        const def = events[f['event'] as number]
         const frame: Json = {}
         put(frame, 'time', f['time'], 0)
-        frame['name'] = f['event']
-        put(frame, 'int', f['int'], 0)
-        put(frame, 'float', f['float'], 0)
+        frame['name'] = def?.name ?? f['event']
+        put(frame, 'int', f['int'], def?.int ?? 0)
+        put(frame, 'float', f['float'], def?.float ?? 0)
+        // string 为 null 表示「用定义的值」(二进制里是一个 false 标志),本来就省略
         put(frame, 'string', f['string'])
+        if (def !== undefined && def.audioPath !== null) {
+          put(frame, 'volume', f['volume'], def.volume)
+          put(frame, 'balance', f['balance'], def.balance)
+        }
         return frame
       })
     }
@@ -602,25 +614,9 @@ export function toJson(part: SkeletonPart): Json {
 
   const animations: Json = {}
   for (const anim of part.animations) {
-    const j = animationToJson(
-      anim.timelines, is38, slotNames, boneNames, ikNames, transformNames, pathNames, skinNames,
+    animations[anim.name] = animationToJson(
+      anim.timelines, is38, slotNames, boneNames, ikNames, transformNames, pathNames, skinNames, part.events,
     )
-    // 事件时间轴里存的是事件下标,JSON 用名字
-    const evts = j['events'] as Json[] | undefined
-    if (evts !== undefined) {
-      const frames = anim.timelines.find((t) => t.kind === 'event')!.frames
-      evts.forEach((e, i) => {
-        const def = part.events[e['name'] as number]
-        if (def === undefined) return
-        e['name'] = def.name
-        // 带音频的事件:volume / balance 缺省取事件定义的值(Spine 读 JSON 就是这么补的),不是 1 / 0
-        if (def.audioPath !== null) {
-          put(e, 'volume', frames[i]!['volume'], def.volume)
-          put(e, 'balance', frames[i]!['balance'], def.balance)
-        }
-      })
-    }
-    animations[anim.name] = j
   }
   out['animations'] = animations
 

@@ -901,6 +901,39 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
       else expect([...file.content]).toEqual([...(first.content as Uint8Array)])
     })
   })
+
+  /**
+   * 同一属性的重复时间轴(3.8 很常见)只取最后一条 —— Spine 播放时后一条本来就整条盖掉前一条。
+   * 两条都写的话 deform 的 Blend Shape 会叠成两倍:实测 MergeCooking2 的 Juicer,`work` 里
+   * 5 个网格各有 `work_0` 与 `work_0_2` 两个目标同时满权重。
+   */
+  it('⭐ 重复的 deform 时间轴不会叠成两倍 Blend Shape:产物与没有重复时逐字节相同,并报 approximated', () => {
+    let inserted = 0
+    const withDuplicates = {
+      ...part,
+      animations: part.animations.map((a) => {
+        const d = a.timelines.find((t) => t.kind === 'deform')
+        if (d === undefined) return a
+        // 前面插一条同属性、内容不同(顶点偏移 ×3)的时间轴
+        const wrapper = d.frames[0] as { frames: Record<string, unknown>[] }
+        const frames = wrapper.frames.map((f) => ({ ...f, vertices: (f['vertices'] as number[]).map((v) => v * 3) }))
+        inserted++
+        return { ...a, timelines: [{ ...d, frames: [{ ...wrapper, frames }] }, ...a.timelines] }
+      }),
+    }
+    expect(inserted).toBeGreaterThan(0)
+
+    const out = exportToUnity(withDuplicates, atlas, sources, { name: 'MX2_cat', pixelsPerUnit: 100, renderPipeline: 'urp' })
+    expect(out.files.map((f) => f.path)).toEqual(result.files.map((f) => f.path))
+    out.files.forEach((file, i) => {
+      const first = result.files[i]!
+      if (typeof file.content === 'string') expect(file.content, file.path).toBe(first.content)
+      else expect([...file.content], file.path).toEqual([...(first.content as Uint8Array)])
+    })
+    const reported = out.issues.filter((i) => i.level === 'approximated' && i.message.includes('只保留最后一条'))
+    expect(reported).toHaveLength(inserted)
+    expect(reported[0]!.path).toMatch(/deform\[eyelid\//)
+  })
 })
 
 // ─── 皮肤:MergeCooking2 的本地样本(不在库里,存在才跑)─────────────────────────
@@ -1043,6 +1076,18 @@ describe.skipIf(!existsSync(MC2_BRW))('皮肤:全部导进一个 prefab,皮肤�
 
   it('不存在的皮肤名当场报错,并列出有哪些', () => {
     expect(() => exportToUnity(part, atlas, sources, { name: 'brw', pixelsPerUnit: 100, renderPipeline: 'urp', skin: 'Nope' })).toThrow(/Pirate/)
+  })
+
+  /**
+   * 跨度 < 64px 的网格不看「缩放」判据 —— 小图的比值被整数裁剪框量化主导。之前担心这几个缩放差 50% 的
+   * 换装小件因此留在 SpriteSkin;实测它们的绑定残差 5~19 像素,一直是被「非刚性」判据分流的。
+   */
+  it('跨度 < 64px、缩放差 50% 的换装小件照样走 SkinnedMeshRenderer(由绑定残差判据分流)', () => {
+    const result = exportToUnity(part, atlas, sources, { name: 'brw', pixelsPerUnit: 100, renderPipeline: 'urp' })
+    for (const n of ['Valentines_flower1', 'Valentines_flower2', 'WestCowboy-sign', 'Christmas_bg_flower']) {
+      expect(result.files.some((f) => f.path === `brw@${n}.asset`), n).toBe(true)
+      expect(result.issues.some((i) => i.path === `mesh.${n}` && i.message.includes('绑定姿势非刚性')), n).toBe(true)
+    }
   })
 })
 

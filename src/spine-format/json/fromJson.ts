@@ -493,15 +493,17 @@ function animationFromJson(
       bezierCount: -1,
       frames: events.map((f) => {
         const event = at(names.events, str(f['name']) ?? '')
+        // 帧里省略的值一律取**事件定义**的(Spine JSON 规范:"Assume the setup pose value if omitted"),
+        // 不是 0。string 缺省记 null —— 二进制里也是「没写就用定义的」
+        const def = names.eventDefs[event]
         const frame: Record<string, unknown> = {
           time: num(f['time'], 0),
           event,
-          int: num(f['int'], 0),
-          float: num(f['float'], 0),
+          int: num(f['int'], def?.int ?? 0),
+          float: num(f['float'], def?.float ?? 0),
           string: str(f['string']),
         }
-        // 带音频的事件每帧有 volume / balance(.skel 里是两个 float),缺省沿用事件定义
-        const def = names.eventDefs[event]
+        // 带音频的事件每帧有 volume / balance(.skel 里是两个 float)
         if (def !== undefined && def.audioPath !== null) {
           frame['volume'] = num(f['volume'], def.volume)
           frame['balance'] = num(f['balance'], def.balance)
