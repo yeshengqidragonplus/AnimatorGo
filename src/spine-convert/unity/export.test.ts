@@ -6,6 +6,7 @@ import { decodePng, type Image } from '../../unity/png.ts'
 import { parseMesh } from '../../unity/writeMesh.ts'
 import { applyPoint, poseAt, type Affine as EvalAffine } from '../../spine-eval/pose.ts'
 import { drawOrderOf, layerOfSlot } from '../../spine-eval/drawOrder.ts'
+import { sequenceFrameAt, sequenceRegionName, type SequenceKey } from '../../spine-eval/sequence.ts'
 import { exportToUnity, type UnityFile } from './export.ts'
 
 /**
@@ -286,7 +287,8 @@ function readFloatCurves(text: string, prefix: string): { attribute: string; pat
   const out: { attribute: string; path: string; classID: number; keys: { time: number; value: number }[] }[] = []
   for (const block of text.split('  - serializedVersion: 2\n    curve:').slice(1)) {
     const attribute = /^\s{4}attribute: (\S+)/m.exec(block)?.[1]
-    const path = /^\s{4}path: (\S*)/m.exec(block)?.[1] ?? ''
+    // 节点名可以带空格(Female staff 的 `head_take offence`),取整行
+    const path = /^\s{4}path: (.*)$/m.exec(block)?.[1]?.trim() ?? ''
     const classID = Number(/^\s{4}classID: (\d+)/m.exec(block)?.[1] ?? 0)
     if (attribute === undefined || !attribute.startsWith(prefix)) continue
     const keys = [...block.matchAll(/time: (\S+)\n\s+value: (\S+)/g)].map((m) => ({ time: Number(m[1]), value: Number(m[2]) }))
@@ -1165,3 +1167,247 @@ describe.skipIf(!existsSync(MC2_CUSTOMER))('加权网格的 deform → Blend Sha
     expect(worst).toBeLessThan(0.5)
   })
 })
+
+// ─── linkedmesh:MergeCooking2 的本地样本(不在库里,存在才跑)─────────────────────
+//
+// Female staff 的 `head_ordinary` 是挂在 `head_take offence` 上的 linkedmesh(inheritTimelines),
+// 父网格有 deform —— 同一条时间轴要同时驱动父网格和它。
+
+const MC2_FEMALE = 'E:/UnityProject/MergeCooking2/MergeCooking2/Assets/Export/Spine/NewSpine/Customer12/Female staff.skel.bytes'
+
+describe.skipIf(!existsSync(MC2_FEMALE))('linkedmesh 展开(MergeCooking2 本地样本)', () => {
+  const dir = MC2_FEMALE.slice(0, MC2_FEMALE.lastIndexOf('/'))
+  const part = readSkeletonPart(new Uint8Array(readFileSync(MC2_FEMALE)))
+  const atlas = parseAtlas(readFileSync(`${dir}/Female staff.atlas.txt`, 'utf8'))
+  const sources = new Map<string, Image>()
+  for (const page of atlas.pages) sources.set(page.name, decodePng(new Uint8Array(readFileSync(`${dir}/${page.name}`))))
+  const result = exportToUnity(part, atlas, sources, { name: 'female', pixelsPerUnit: 100, renderPipeline: 'urp' })
+  const textOf = (path: string) => result.files.find((f) => f.path === path)!.content as string
+
+  const slot = part.slots.findIndex((s) => s.name === 'head_take offence')
+  const defaultSkin = part.skins.find((s) => s.name === 'default')!
+  const inSlot = defaultSkin.slots.find((e) => e.slot === slot)!.attachments
+  const parentAttachment = inSlot.find((a) => a.key === 'head_take offence')!
+  const linkedAttachment = inSlot.find((a) => a.key === 'head_ordinary')!
+
+  it('样本的形状符合预期:父网格有 deform,linkedmesh 继承时间轴', () => {
+    expect(parentAttachment.type).toBe('mesh')
+    expect(linkedAttachment.type).toBe('linkedmesh')
+    expect(linkedAttachment.data['parent']).toBe('head_take offence')
+    expect(linkedAttachment.data['inheritTimelines']).toBe(true)
+    expect(result.issues.some((i) => i.level === 'loss' && i.path.includes('head_ordinary'))).toBe(false)
+  })
+
+  it('几何与父网格相同,UV 换成自己的图', () => {
+    const linked = parseMesh(textOf('female@head_ordinary.asset'))
+    const meshes = result.files
+      .filter((f) => f.path.endsWith('.asset') && f.path !== 'female@head_ordinary.asset')
+      .map((f) => parseMesh(f.content as string))
+    // 父网格:同样的三角形、同样的顶点位置
+    const parent = meshes.find(
+      (m) =>
+        m.vertexCount === linked.vertexCount &&
+        m.triangles.every((t, i) => t === linked.triangles[i]) &&
+        m.positions.every((p, i) => Math.hypot(p.x - linked.positions[i]!.x, p.y - linked.positions[i]!.y) < 1e-6),
+    )
+    expect(parent).toBeDefined()
+    const uvDiff = linked.uvs.reduce((n, uv, i) => Math.max(n, Math.hypot(uv.u - parent!.uvs[i]!.u, uv.v - parent!.uvs[i]!.v)), 0)
+    expect(uvDiff).toBeGreaterThan(1e-3)
+  })
+
+  it('⭐ 继承的 deform:按 Unity 的规则算出的顶点,关键帧时刻与 Spine 一致', () => {
+    const prefab = readPrefab(textOf('female.prefab'))
+    const meta = result.files.find((f) => f.path === 'female@head_ordinary.asset.meta')!.content as string
+    const renderer = readSkinnedRenderers(textOf('female.prefab')).find((r) => meta.includes(`guid: ${r.meshGuid}`))!
+    expect(renderer).toBeDefined()
+    const mesh = parseMesh(textOf('female@head_ordinary.asset'))
+    const boneIdx = renderer.bones.map((id) => part.bones.findIndex((b) => b.name === prefab.nameOf.get(id)))
+    expect(boneIdx.every((i) => i >= 0)).toBe(true)
+
+    // Spine 那边:linkedmesh 用父网格的顶点,吃打在父网格上的 deform
+    const verts = parentAttachment.data['vertices'] as {
+      weighted: boolean
+      positions: number[]
+      weights: { bone: number; x: number; y: number; weight: number }[][]
+    }
+    const flatLength = verts.weighted ? verts.weights.reduce((n, w) => n + w.length * 2, 0) : verts.positions.length
+    const slotBone = part.slots[slot]!.bone
+
+    let checked = 0
+    let deformedKeys = 0
+    let worst = 0
+    for (const anim of part.animations) {
+      const curves = readBlendShapeCurves(textOf(`female@${anim.name}.anim`)).filter((c) => c.path === renderer.name)
+      for (const t of anim.timelines) {
+        if (t.kind !== 'deform' || t.owner !== slot) continue
+        const d = t.frames[0] as unknown as { attachment: string; frames: Record<string, unknown>[] }
+        if (d.attachment !== 'head_take offence') continue
+        expect(curves.length).toBeGreaterThan(0)
+
+        for (const frame of d.frames) {
+          const time = frame['time'] as number
+          const flat = new Array<number>(flatLength).fill(0)
+          const vs = (frame['vertices'] as number[] | undefined) ?? []
+          const start = Number(frame['start'] ?? 0)
+          vs.forEach((v, i) => (flat[start + i] = v))
+          if (flat.some((v) => Math.abs(v) > 1e-9)) deformedKeys++
+          const weights = new Map<string, number>()
+          for (const c of curves) {
+            const k = c.keys.find((kk) => Math.abs(kk.time - time) < 1e-6)
+            if (k !== undefined) weights.set(c.shape, k.value)
+          }
+
+          const poseS = poseAt(part, anim, time)
+          const poseU = poseAt(part, anim, time, { unityCompatible: true }).map(toUnits)
+          let idx = 0
+          for (let j = 0; j < mesh.vertexCount; j++) {
+            let sx = 0
+            let sy = 0
+            if (verts.weighted) {
+              for (const w of verts.weights[j]!) {
+                const p = applyPoint(poseS[w.bone]!, w.x + flat[idx]!, w.y + flat[idx + 1]!)
+                sx += w.weight * p.x
+                sy += w.weight * p.y
+                idx += 2
+              }
+            } else {
+              const p = applyPoint(poseS[slotBone]!, verts.positions[j * 2]! + flat[j * 2]!, verts.positions[j * 2 + 1]! + flat[j * 2 + 1]!)
+              sx = p.x
+              sy = p.y
+            }
+            let vx = mesh.positions[j]!.x
+            let vy = mesh.positions[j]!.y
+            for (const s of mesh.blendShapes) {
+              const w = (weights.get(s.name) ?? 0) / 100
+              const delta = w === 0 ? undefined : s.deltas.find((dd) => dd.index === j)
+              if (delta !== undefined) {
+                vx += w * delta.x
+                vy += w * delta.y
+              }
+            }
+            let ux = 0
+            let uy = 0
+            for (const w of mesh.streamWeights[j]!) {
+              const local = applyPoint(mesh.bindposes[w.bone]!, vx, vy)
+              const world = applyPoint(poseU[boneIdx[w.bone]!]!, local.x, local.y)
+              ux += w.weight * world.x
+              uy += w.weight * world.y
+            }
+            worst = Math.max(worst, Math.hypot(ux * 100 - sx, uy * 100 - sy))
+            checked++
+          }
+        }
+      }
+    }
+    expect(deformedKeys).toBeGreaterThan(0)
+    expect(checked).toBeGreaterThan(0)
+    expect(mesh.blendShapes.length).toBeGreaterThan(0)
+    expect(worst).toBeLessThan(0.5)
+  })
+})
+
+// ─── 4.1 序列帧:本地真实样本(不在库里,存在才跑)─────────────────────────────────
+//
+// 每帧一个节点,渲染器 m_Enabled =「换图时间轴说这个键名亮着」且「sequence 时间轴说是这一帧」。
+// 把导出的 prefab 和 .anim 读回来,照 Unity 的规则(阶梯曲线取最后一个 time ≤ t 的键;这条动画没这条
+// 曲线就是 prefab 初值 —— Write Defaults)在每个采样时刻算出哪一帧亮着,与 Spine 的规则比。
+
+const SEQUENCE_SAMPLES = [
+  // region 序列帧,loop(马车轮)
+  'E:/UnityProject/Cooking11/Cooking11/Assets/AssetsExports/CookingGame/Map/City11/spine/map11_damache.skel.bytes',
+  // 加权 mesh 序列帧,loopReverse,从 index 3 起
+  'E:/UnityProject/Cooking11/Cooking11/Assets/AssetsExports/CookingGame/Map/City8/spine/huache3.skel.bytes',
+  // setup 时不显示、换图时间轴点亮;先 hold 再 once
+  'E:/UnityProject/Cooking12/Cooking12/Assets/Export/Hospital/Effect/Spine/icon_clock.skel.bytes',
+  // 不加权 mesh 序列帧,6 套具名皮肤
+  'E:/UnityProject/FindTM1/Assets/Res/FindTM/Spines/Transportation/Boat_001/boat_1.skel.bytes',
+]
+
+for (const file of SEQUENCE_SAMPLES) {
+  const base = file.slice(file.lastIndexOf('/') + 1).replace(/\.skel\.bytes$/, '')
+  describe.skipIf(!existsSync(file))(`4.1 序列帧 → 每帧一个节点(本地样本 ${base})`, () => {
+    const dir = file.slice(0, file.lastIndexOf('/'))
+    const part = readSkeletonPart(new Uint8Array(readFileSync(file)))
+    const atlas = parseAtlas(readFileSync(`${dir}/${base}.atlas.txt`, 'utf8'))
+    const sources = new Map<string, Image>()
+    for (const page of atlas.pages) sources.set(page.name, decodePng(new Uint8Array(readFileSync(`${dir}/${page.name}`))))
+    const result = exportToUnity(part, atlas, sources, { name: base, pixelsPerUnit: 100, renderPipeline: 'urp', skipImages: true })
+    const textOf = (path: string) => result.files.find((f) => f.path === path)?.content as string | undefined
+    const prefab = readPrefab(textOf(`${base}.prefab`)!)
+    const defaultSkin = part.skins.find((s) => s.name === 'default') ?? part.skins[0]!
+
+    /** 每个序列帧 attachment:它的各帧节点(fileID)、帧号 */
+    const groups = part.skins.flatMap((skin) =>
+      skin.slots.flatMap((entry) =>
+        entry.attachments
+          .filter((a) => a.sequence !== null)
+          .map((a) => {
+            const slot = part.slots[entry.slot]!
+            const nodeOf = (i: number) => {
+              let name = `${attachmentNodeName(slot.name, a.key)}#${sequenceRegionName('', a.sequence!, i)}`
+              if (skin !== defaultSkin) name += `@${skin.name}`
+              return name
+            }
+            const nodes = Array.from({ length: a.sequence!.count }, (_, i) => {
+              const id = [...prefab.nameOf].find(([, n]) => n === nodeOf(i))?.[0]
+              return { index: i, name: nodeOf(i), id }
+            })
+            return { skin: skin.name, slot: entry.slot, key: a.key, seq: a.sequence!, nodes }
+          }),
+      ),
+    )
+
+    it('样本里确实有序列帧,每帧都有节点,且没有缺图', () => {
+      expect(groups.length).toBeGreaterThan(0)
+      for (const g of groups) for (const n of g.nodes) expect(n.id, n.name).toBeDefined()
+      expect(result.issues.filter((i) => i.level === 'loss' && i.message.includes('图集里没有'))).toEqual([])
+    })
+
+    it('setup:只有 setup 那一帧的渲染器亮(且该 attachment 本来就是 setup 显示的)', () => {
+      for (const g of groups) {
+        const shown = part.slots[g.slot]!.attachmentName === g.key
+        const setup = sequenceFrameAt(undefined, g.seq, 0)
+        for (const n of g.nodes) expect(prefab.enabledOf.get(n.id!), n.name).toBe(shown && n.index === setup)
+      }
+    })
+
+    it('⭐ 每个采样时刻,Unity 亮着的恰好是 Spine 在那一刻显示的那一帧', () => {
+      const stepAt = (keys: { time: number; value: number }[], t: number) => {
+        let v = keys[0]!.value
+        for (const k of keys) if (k.time <= t) v = k.value
+        return v
+      }
+      let checked = 0
+      for (const anim of part.animations) {
+        const clip = textOf(`${base}@${anim.name}.anim`)!
+        const curves = curveMap(clip, 'm_Enabled')
+        const curveOf = (name: string) => [...curves].find(([p]) => p === name || p.endsWith(`/${name}`))?.[1]
+        const duration = Math.max(0, ...[...curves.values()].flatMap((ks) => ks.map((k) => k.time)))
+        for (const g of groups) {
+          const seqT = anim.timelines.find((t) => {
+            const w = t.frames[0] as { skin?: number; attachment?: string } | undefined
+            return t.kind === 'sequence' && t.owner === g.slot && w?.attachment === g.key && part.skins[w.skin!]?.name === g.skin
+          })
+          const keys = seqT === undefined ? undefined : (seqT.frames[0] as unknown as { frames: SequenceKey[] }).frames
+          const attT = anim.timelines.find((t) => t.kind === 'attachment' && t.owner === g.slot)
+          for (let t = 0; t < duration; t += 0.0137) {
+            // Spine:换图时间轴决定亮不亮,sequence 时间轴决定哪一帧
+            let visible = part.slots[g.slot]!.attachmentName === g.key
+            for (const f of attT?.frames ?? []) if ((f['time'] as number) <= t) visible = f['name'] === g.key
+            const expected = visible ? [sequenceFrameAt(keys, g.seq, t)] : []
+            // Unity:每帧节点各自的 m_Enabled 曲线;这条动画没写就是 prefab 初值
+            const lit = g.nodes
+              .filter((n) => {
+                const c = curveOf(n.name)
+                return c === undefined ? prefab.enabledOf.get(n.id!) === true : stepAt(c, t) === 1
+              })
+              .map((n) => n.index)
+            expect(lit, `${anim.name} ${g.skin}/${g.key} @${t.toFixed(4)}s`).toEqual(expected)
+            checked++
+          }
+        }
+      }
+      expect(checked).toBeGreaterThan(50)
+    })
+  })
+}

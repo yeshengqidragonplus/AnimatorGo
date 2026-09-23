@@ -1,9 +1,9 @@
 import { SpineOutput } from './output.ts'
-import type { SkeletonPart } from './readSkeleton.ts'
+import { DEFAULT_BONE_COLOR, type SkeletonPart } from './readSkeleton.ts'
 import type { Attachment, Skin, Vertices } from './readSkins.ts'
 import { ATTACHMENT_TYPES } from './readSkins.ts'
-import type { AnimationData, EventDef, Timeline } from './readAnimations.ts'
-import { CURVE_BEZIER, CURVE_LINEAR, CURVE_STEPPED } from './readAnimations.ts'
+import type { AnimationData, EventDef, SequenceMode, Timeline } from './readAnimations.ts'
+import { ATTACHMENT_DEFORM, ATTACHMENT_SEQUENCE, CURVE_BEZIER, CURVE_LINEAR, CURVE_STEPPED, SEQUENCE_MODES } from './readAnimations.ts'
 
 /**
  * 把读出来的结构写回 `.skel`。
@@ -233,10 +233,23 @@ const BONE_VALUE_NAMES: Record<string, string[]> = {
 /** 4.x 的 slot 颜色时间轴通道数,与读取端一致 */
 const SLOT_CHANNELS: Record<number, number> = { 1: 4, 2: 3, 3: 7, 4: 6, 5: 1 }
 
-function writeTimelineHead(out: SpineOutput, t: Timeline, is38: boolean): void {
+/**
+ * 4.x 时间轴头里的贝塞尔总数 = 各帧曲线所占的分量数之和(与 Spine 自己写的一致,见 convert.test.ts)。
+ * 读 .skel 得到的时间轴带着原值;从 JSON 来的没有(记 -1),写的时候现算 —— 否则 4.x JSON 转不成 .skel。
+ */
+function bezierCountOf(t: Timeline, frames: readonly Record<string, unknown>[], components: number): number {
+  if (t.bezierCount >= 0) return t.bezierCount
+  let total = 0
+  for (let i = 0; i < frames.length - 1; i++) if (frames[i]!['curve'] === 'bezier') total += components
+  return total
+}
+
+/** components:该时间轴每帧的值分量数;不给表示这条时间轴没有曲线(attachment / drawOrder / event) */
+function writeTimelineHead(out: SpineOutput, t: Timeline, is38: boolean, components?: number): void {
   out.writeVarInt(t.frames.length)
-  // bezierCount 只在带曲线的时间轴上出现(读取时记为 -1 表示没有)
-  if (!is38 && t.bezierCount >= 0) out.writeVarInt(t.bezierCount)
+  if (is38) return
+  if (components !== undefined) out.writeVarInt(bezierCountOf(t, t.frames, components))
+  else if (t.bezierCount >= 0) out.writeVarInt(t.bezierCount)
 }
 
 function writeSlotTimeline(out: SpineOutput, t: Timeline, is38: boolean): void {
@@ -263,9 +276,9 @@ function writeSlotTimeline(out: SpineOutput, t: Timeline, is38: boolean): void {
 
   const type = Number(t.kind.replace('slotColor', ''))
   out.writeByte(type)
-  writeTimelineHead(out, t, is38)
-
   const channels = SLOT_CHANNELS[type]!
+  writeTimelineHead(out, t, is38, channels)
+
   const colorOf = (f: Record<string, unknown>) => {
     const c = f['color'] as number[]
     for (let i = 0; i < channels; i++) out.writeByte(c[i]!)
@@ -282,26 +295,32 @@ function writeSlotTimeline(out: SpineOutput, t: Timeline, is38: boolean): void {
   }
 }
 
-function writeAnimation(out: SpineOutput, anim: AnimationData, is38: boolean): void {
+function writeAnimation(out: SpineOutput, anim: AnimationData, is38: boolean, events: readonly EventDef[]): void {
   const by = (pred: (t: Timeline) => boolean) => anim.timelines.filter(pred)
-  const groupByOwner = (list: Timeline[]) => {
-    const map = new Map<number, Timeline[]>()
+  /**
+   * 按**连续段**分组,不按 owner 合并 —— 同一个 owner 在文件里可以出现在两个不相邻的组里
+   * (实测 man.skel 的 work_3_fear:骨骼 2 先有一组 rotate/translate/scale,隔了一根骨骼又来一组 rotate)。
+   * 读取端按文件顺序平铺,所以连续段正好还原原来的分组;JSON 来的时间轴本来就按 owner 连续。
+   */
+  const runs = (list: readonly Timeline[], keyOf: (t: Timeline) => number = (t) => t.owner) => {
+    const out: [number, Timeline[]][] = []
     for (const t of list) {
-      const arr = map.get(t.owner)
-      if (arr === undefined) map.set(t.owner, [t])
-      else arr.push(t)
+      const key = keyOf(t)
+      const last = out[out.length - 1]
+      if (last !== undefined && last[0] === key) last[1].push(t)
+      else out.push([key, [t]])
     }
-    return map
+    return out
   }
 
-  // ⚠️ 4.x 每条动画开头是时间轴总数
-  if (!is38) out.writeVarInt(anim.timelines.length)
+  // ⚠️ 4.x 每条动画开头是时间轴总数。读来的用原值 —— Spine 自己写的有时比实际多(见 SPINE-BINARY.md 7.2)
+  if (!is38) out.writeVarInt(anim.timelineCount ?? anim.timelines.length)
 
   // ── slot ──
   const slotKinds = (t: Timeline) =>
     t.kind === 'attachment' || t.kind === 'color' || t.kind === 'twoColor' || t.kind.startsWith('slotColor')
-  const slotGroups = groupByOwner(by(slotKinds))
-  out.writeVarInt(slotGroups.size)
+  const slotGroups = runs(by(slotKinds))
+  out.writeVarInt(slotGroups.length)
   for (const [slot, list] of slotGroups) {
     out.writeVarInt(slot)
     out.writeVarInt(list.length)
@@ -310,14 +329,14 @@ function writeAnimation(out: SpineOutput, anim: AnimationData, is38: boolean): v
 
   // ── 骨骼 ──
   const kinds = is38 ? BONE_KINDS_38 : BONE_KINDS_4X
-  const boneGroups = groupByOwner(by((t) => kinds.includes(t.kind)))
-  out.writeVarInt(boneGroups.size)
+  const boneGroups = runs(by((t) => kinds.includes(t.kind)))
+  out.writeVarInt(boneGroups.length)
   for (const [bone, list] of boneGroups) {
     out.writeVarInt(bone)
     out.writeVarInt(list.length)
     for (const t of list) {
       out.writeByte(kinds.indexOf(t.kind))
-      writeTimelineHead(out, t, is38)
+      writeTimelineHead(out, t, is38, BONE_VALUE_NAMES[t.kind]!.length)
       writeValueTimeline(out, is38, t.frames, BONE_VALUE_NAMES[t.kind]!)
     }
   }
@@ -327,7 +346,7 @@ function writeAnimation(out: SpineOutput, anim: AnimationData, is38: boolean): v
   out.writeVarInt(ik.length)
   for (const t of ik) {
     out.writeVarInt(t.owner)
-    writeTimelineHead(out, t, is38)
+    writeTimelineHead(out, t, is38, 2) // mix + softness 两条曲线
     const tail = (f: Record<string, unknown>) => {
       out.writeSByte(f['bendDirection'] as number)
       out.writeBoolean(f['compress'] as boolean)
@@ -364,55 +383,62 @@ function writeAnimation(out: SpineOutput, anim: AnimationData, is38: boolean): v
     : ['mixRotate', 'mixX', 'mixY', 'mixScaleX', 'mixScaleY', 'mixShearY']
   for (const t of transform) {
     out.writeVarInt(t.owner)
-    writeTimelineHead(out, t, is38)
+    writeTimelineHead(out, t, is38, transformNames.length)
     writeValueTimeline(out, is38, t.frames, transformNames)
   }
 
   // ── path ──
   const path = by((t) => t.kind.startsWith('path'))
-  const pathGroups = groupByOwner(path)
-  out.writeVarInt(pathGroups.size)
+  const pathGroups = runs(path)
+  out.writeVarInt(pathGroups.length)
   for (const [owner, list] of pathGroups) {
     out.writeVarInt(owner)
     out.writeVarInt(list.length)
     for (const t of list) {
       const type = Number(t.kind.replace('path', ''))
       out.writeByte(type)
-      writeTimelineHead(out, t, is38)
       const names =
         type === 2
           ? is38 ? ['mixRotate', 'mixTranslate'] : ['mixRotate', 'mixX', 'mixY']
           : ['value']
+      writeTimelineHead(out, t, is38, names.length)
       writeValueTimeline(out, is38, t.frames, names)
     }
   }
 
-  // ── deform ──
-  const deform = by((t) => t.kind === 'deform')
-  // 读取时每条 deform 单独成一条时间轴,写回时要按 skin → slot 重新分组
-  const bySkin = new Map<number, Timeline[]>()
-  for (const t of deform) {
-    const skin = (t.frames[0] as Record<string, unknown>)['skin'] as number
-    const arr = bySkin.get(skin)
-    if (arr === undefined) bySkin.set(skin, [t])
-    else arr.push(t)
-  }
+  // ── deform(4.x 叫 attachment 时间轴,deform 与 sequence 同在这一段)──
+  const deform = by((t) => t.kind === 'deform' || t.kind === 'sequence')
+  // 读取时每条单独成一条时间轴,写回时要按 skin → slot 重新分组(同样按连续段)
+  const bySkin = runs(deform, (t) => (t.frames[0] as Record<string, unknown>)['skin'] as number)
 
-  out.writeVarInt(bySkin.size)
+  out.writeVarInt(bySkin.length)
   for (const [skin, list] of bySkin) {
     out.writeVarInt(skin)
-    const bySlot = groupByOwner(list)
-    out.writeVarInt(bySlot.size)
+    const bySlot = runs(list)
+    out.writeVarInt(bySlot.length)
     for (const [slot, entries] of bySlot) {
       out.writeVarInt(slot)
       out.writeVarInt(entries.length)
       for (const t of entries) {
         const wrapper = t.frames[0] as Record<string, unknown>
         out.writeStringRefIndex(wrapper['attachmentIndex'] as number)
-        if (!is38) out.writeByte(0) // 子类型:0 = deform
         const inner = wrapper['frames'] as Record<string, unknown>[]
+
+        if (t.kind === 'sequence') {
+          if (is38) throw new Error('sequence 时间轴是 4.1 才有的,3.8 写不出来 —— 降级时应先丢弃')
+          out.writeByte(ATTACHMENT_SEQUENCE)
+          out.writeVarInt(inner.length)
+          for (const f of inner) {
+            out.writeFloat(f['time'] as number)
+            out.writeInt(((f['index'] as number) << 4) | SEQUENCE_MODES.indexOf(f['mode'] as SequenceMode))
+            out.writeFloat(f['delay'] as number)
+          }
+          continue
+        }
+
+        if (!is38) out.writeByte(ATTACHMENT_DEFORM)
         out.writeVarInt(inner.length)
-        if (!is38 && t.bezierCount >= 0) out.writeVarInt(t.bezierCount)
+        if (!is38) out.writeVarInt(bezierCountOf(t, inner, 1))
 
         const verts = (f: Record<string, unknown>) => {
           const v = f['vertices'] as number[]
@@ -469,6 +495,13 @@ function writeAnimation(out: SpineOutput, anim: AnimationData, is38: boolean): v
       const s = f['string'] as string | null
       out.writeBoolean(s !== null)
       if (s !== null) out.writeString(s)
+      // 带音频的事件每帧多 volume / balance;帧里没给(JSON 缺省)就沿用事件定义的值,与 Spine 读 JSON 一致
+      const def = events[f['event'] as number]
+      if (def === undefined) throw new Error(`事件下标 ${String(f['event'])} 超出事件定义表(共 ${events.length} 个)`)
+      if (def.audioPath !== null) {
+        out.writeFloat((f['volume'] as number | undefined) ?? def.volume)
+        out.writeFloat((f['balance'] as number | undefined) ?? def.balance)
+      }
     }
   }
 }
@@ -528,7 +561,7 @@ export function writeSkeleton(part: SkeletonPart): Uint8Array {
     out.writeFloat(b.length)
     out.writeVarInt(b.transformMode)
     out.writeBoolean(b.skinRequired)
-    if (h.nonessential) out.writeInt(0) // 骨骼颜色,读取时丢弃
+    if (h.nonessential) out.writeInt(b.color ?? DEFAULT_BONE_COLOR)
   })
 
   out.writeVarInt(part.slots.length)
@@ -614,7 +647,7 @@ export function writeSkeleton(part: SkeletonPart): Uint8Array {
   out.writeVarInt(part.animations.length)
   for (const anim of part.animations) {
     out.writeString(anim.name)
-    writeAnimation(out, anim, is38)
+    writeAnimation(out, anim, is38, part.events)
   }
 
   return out.toUint8Array()

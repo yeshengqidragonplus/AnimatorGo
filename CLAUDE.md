@@ -136,6 +136,8 @@ Defaults,最接近运行时);`_FOCUS=<物体名>` 放大看局部;`_HIDE=a,b` �
 短路径下用户脚本(Assembly-CSharp)的 MonoScript 全部挂不上类:prefab 里的组件变成 missing script,
 连 `SaveAsPrefabAsset` 都写出 `m_Script: {fileID: 0}`,日志里只有一条 named pipe 的 warning。
 换成长路径(`C:/Users/zhe.huang/...`)一切正常。scratchpad 目录默认就是短名,要自己展开。
+另外工程路径**别太深**:scratchpad 下的工程,`Library/PackageCache/` 里 inputsystem 的 uxml 会超过 260 字符,
+日志里一片 `DirectoryNotFoundException` / `Host type is not matching`。不影响自检和渲染,但会把真报错淹掉。
 
 ⚠️ **验产物一律要 Play 起来看,setup 姿势的静态对比不算数。** 皮肤全导出、挂图节点初始全亮、
 逐帧绘制顺序、预乘 alpha —— 四个 bug 全是「场景里看着好的,一播就露馅」。
@@ -278,6 +280,9 @@ render/   薄适配层。PixiJS / Godot / Unity / Cocos 各一个
 - **动画融合的三个坑** —— 「没有关键帧」≠「值为 0」、离散属性无法插值、旋转走最短路径。详见 [FORMAT.md](docs/FORMAT.md#5-动画融合)
 - **自动权重必须用测地距离**,不能用直线距离,否则两腿贴近时权重互相渗透
 - 真正吃时间的是**时间轴/曲线编辑器的交互**和**权重刷的手感**,不是骨骼数学
+- ⚠️ **JSON 读写一律拿真实导出比,不能只做「我们写 → 我们读」的自洽往返** —— 自洽往返让三处写法错误
+  (4.x 的 attachment 时间轴少一层 `deform`、两版的曲线写法)一直是绿的,读真实文件直接崩。
+  真实写法的片段在 `src/spine-format/json/realFormat.test.ts`;`.skel` 同理,验收拿全盘真实骨架跑逐字节往返
 - ⚠️ **贝塞尔控制点两版不是一个坐标系**:3.8 是归一化的百分比,4.x 是绝对时间/取值。
   弄混了不崩溃,只是所有缓动悄悄变形 —— 这是本项目最难自己发现的一类错。
   见 [SPINE-BINARY.md](docs/SPINE-BINARY.md) 7.4 与 `src/spine-format/bezier.ts`

@@ -2,6 +2,7 @@ import type { SkeletonPart, SpineMajor } from '../../spine-format/binary/readSke
 import type { AnimationData, Timeline } from '../../spine-format/binary/readAnimations.ts'
 import { IssueCollector, type ConversionIssue } from '../types.ts'
 import { curveValuesOf, toAbsoluteBezier, toNormalizedBezier } from '../../spine-format/bezier.ts'
+import { sequenceFrameAt, sequenceRegionName } from '../../spine-eval/sequence.ts'
 
 /**
  * `.skel` 的版本转换。
@@ -276,6 +277,12 @@ function downgradeTimeline(t: Timeline, issues: IssueCollector): Timeline | null
     return { ...t, bezierCount: -1 }
   }
 
+  if (t.kind === 'sequence') {
+    const wrapper = t.frames[0] as Record<string, unknown>
+    issues.loss(`sequence[${t.owner}].${String(wrapper['attachment'])}`, '3.8 没有序列帧时间轴,已丢弃 —— 该部件停在 setup 那一帧')
+    return null
+  }
+
   if (t.kind === 'deform') {
     const wrapper = t.frames[0] as Record<string, unknown>
     const inner = collapseCurves(t.kind, wrapper['frames'] as Record<string, unknown>[], collapsed)
@@ -295,7 +302,9 @@ function convertAnimation(
     const timelines = anim.timelines
       .map((t) => (toMajor === '4.x' ? upgradeTimeline(t) : downgradeTimeline(t, issues)))
       .filter((t): t is Timeline => t !== null)
-    return { ...anim, timelines }
+    // 时间轴重新生成过(降级会丢 sequence),原文件头里的总数不再对应 —— 丢掉,写 4.x 时现算
+    const { timelineCount: _stale, ...rest } = anim
+    return { ...rest, timelines }
   })
 }
 
@@ -328,7 +337,7 @@ export function convertSkeleton(
       s.slots.flatMap((e) => e.attachments.filter((a) => a.sequence !== null)),
     )
     for (const a of withSequence) {
-      issues.loss(`skin.${a.key}`, 'sequence 是 4.1 新增特性,3.8 没有对应物,已丢弃')
+      issues.loss(`skin.${a.key}`, 'sequence 是 4.1 新增特性,3.8 没有对应物 —— 改成只用 setup 那一帧的图')
     }
   }
 
@@ -341,17 +350,31 @@ export function convertSkeleton(
 
   const animations = part.animations.map((a) => convertAnimation(a, toMajor, issues))
 
-  // 降级时清掉 sequence(升级方向 3.8 本来就是 null)
+  // 降级时清掉 sequence(升级方向 3.8 本来就是 null)。
+  // ⚠️ 光清字段不够:4.1 的 path 是**基名**(`left-wing`),图集里只有 `left-wing01`…`left-wing09`,
+  // 3.8 运行时会因为找不到区域直接加载失败。所以 path 改成 setup 那一帧的区域名,3.8 里显示一张静态图。
+  const strings = [...part.strings]
+  const stringRef = (value: string): number => {
+    const found = strings.indexOf(value)
+    if (found >= 0) return found + 1 // 下标 0 表示 null,表项从 1 数起
+    strings.push(value)
+    return strings.length
+  }
   const skins =
     toMajor === '3.8'
       ? part.skins.map((s) => ({
           ...s,
           slots: s.slots.map((e) => ({
             ...e,
-            attachments: e.attachments.map((a) => ({ ...a, sequence: null })),
+            attachments: e.attachments.map((a) => {
+              if (a.sequence === null) return a
+              const base = (a.data['path'] as string | null | undefined) ?? a.name
+              const path = sequenceRegionName(base, a.sequence, sequenceFrameAt(undefined, a.sequence, 0))
+              return { ...a, sequence: null, data: { ...a.data, path, pathIndex: stringRef(path) } }
+            }),
           })),
         }))
       : part.skins
 
-  return { part: { ...part, header, skins, animations }, issues: issues.all }
+  return { part: { ...part, header, strings, skins, animations }, issues: issues.all }
 }

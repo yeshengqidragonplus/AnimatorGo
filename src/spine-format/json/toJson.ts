@@ -1,4 +1,4 @@
-import type { SkeletonPart, SpineMajor } from '../binary/readSkeleton.ts'
+﻿import { DEFAULT_BONE_COLOR, type SkeletonPart, type SpineMajor } from '../binary/readSkeleton.ts'
 import type { Attachment, Vertices } from '../binary/readSkins.ts'
 import type { Timeline } from '../binary/readAnimations.ts'
 
@@ -156,10 +156,10 @@ function attachmentToJson(a: Attachment, is38: boolean): Json {
 // ─── 曲线 ────────────────────────────────────────────────────────────────────
 
 /**
- * 曲线写进帧对象。
+ * 曲线写进帧对象。与 fromJson 的 curveFromJson 对称,两版写法都取自真实导出:
  *
- * 3.8:`"curve": [cx1, cy1, cx2, cy2]`,一条管所有分量。
- * 4.x:`"curve": "bezier"` 外加把各分量的控制点**平铺**成一个数组。
+ * 3.8:`"curve": cx1, "c2": cy1, "c3": cx2, "c4": cy2`,一条管所有分量,缺省 c2=0 c3=1 c4=1。
+ * 4.x:`"curve": [cx1, cy1, cx2, cy2, …]`,各分量的控制点**平铺**成一个数组。
  */
 function putCurve(frame: Json, f: Record<string, unknown>, is38: boolean): void {
   const curve = f['curve']
@@ -171,11 +171,14 @@ function putCurve(frame: Json, f: Record<string, unknown>, is38: boolean): void 
 
   const beziers = f['beziers'] as number[][]
   if (is38) {
-    frame['curve'] = [...beziers[0]!]
+    const [cx1, cy1, cx2, cy2] = beziers[0]!
+    frame['curve'] = cx1
+    put(frame, 'c2', cy1, 0)
+    put(frame, 'c3', cx2, 1)
+    put(frame, 'c4', cy2, 1)
     return
   }
-  frame['curve'] = 'bezier'
-  frame['bezier'] = beziers.flat()
+  frame['curve'] = beziers.flat()
 }
 
 // ─── 时间轴 ──────────────────────────────────────────────────────────────────
@@ -183,21 +186,24 @@ function putCurve(frame: Json, f: Record<string, unknown>, is38: boolean): void 
 /** 3.8 的 rotate 关键帧字段叫 angle,4.x 叫 value */
 const ROTATE_VALUE_KEY = { '3.8': 'angle', '4.x': 'value' } as const
 
+/**
+ * defaults 与 fromJson 的 framesFromJson 同一套:字符串表示「缺省等于同一帧里那个分量的值」
+ * (4.x 约束 mix 的连锁缺省)。省略的判断必须与读取端完全一致,否则读回来就是另一个值。
+ */
 function framesToJson(
   t: Timeline,
   is38: boolean,
   valueNames: readonly string[],
+  defaults: readonly (number | string)[],
   rename?: Record<string, string>,
 ): Json[] {
   return t.frames.map((f) => {
     const frame: Json = {}
     put(frame, 'time', f['time'], 0)
-    for (const name of valueNames) {
-      const key = rename?.[name] ?? name
-      // scale 的默认是 1,其余是 0
-      const fallback = t.kind.startsWith('scale') ? 1 : 0
-      put(frame, key, f[name], fallback)
-    }
+    valueNames.forEach((name, i) => {
+      const d = defaults[i] ?? 0
+      put(frame, rename?.[name] ?? name, f[name], typeof d === 'string' ? f[d] : d)
+    })
     putCurve(frame, f, is38)
     return frame
   })
@@ -222,7 +228,10 @@ function slotTimelineToJson(t: Timeline, is38: boolean): { key: string; value: u
       value: t.frames.map((f) => {
         const frame: Json = {}
         put(frame, 'time', f['time'], 0)
-        frame['name'] = f['name']
+        // 隐藏(name 为 null):4.x 省略这个键(缺省 null);3.8 的运行时是 `valueMap["name"]` 硬取,
+        // 缺了直接抛异常,所以 3.8 必须写 `"name": null`
+        if (is38) frame['name'] = f['name']
+        else put(frame, 'name', f['name'])
         return frame
       }),
     }
@@ -305,7 +314,9 @@ function animationToJson(
     const boneValues = BONE_VALUE_NAMES[t.kind]
     if (boneValues !== undefined) {
       const rename = t.kind === 'rotate' ? { value: ROTATE_VALUE_KEY[is38 ? '3.8' : '4.x'] } : undefined
-      group(bones, boneNames[t.owner] ?? String(t.owner), t.kind, framesToJson(t, is38, boneValues, rename))
+      // scale 的默认是 1,其余是 0
+      const defaults = boneValues.map(() => (t.kind.startsWith('scale') ? 1 : 0))
+      group(bones, boneNames[t.owner] ?? String(t.owner), t.kind, framesToJson(t, is38, boneValues, defaults, rename))
       continue
     }
 
@@ -325,34 +336,36 @@ function animationToJson(
     }
 
     if (t.kind === 'transform') {
+      // mix 缺省是 1(不是 0);4.x 另有 mixY 缺省 = mixX、mixScaleY 缺省 = mixScaleX,
+      // 所以 mixX 为 0 时要照写 `"mixX": 0`(spineboy-pro 的 aim)
       const names = is38
         ? ['mixRotate', 'mixTranslate', 'mixScale', 'mixShear']
         : ['mixRotate', 'mixX', 'mixY', 'mixScaleX', 'mixScaleY', 'mixShearY']
+      const defaults = is38 ? [1, 1, 1, 1] : [1, 1, 'mixX', 1, 'mixScaleX', 1]
       const rename = is38
         ? { mixRotate: 'rotateMix', mixTranslate: 'translateMix', mixScale: 'scaleMix', mixShear: 'shearMix' }
         : undefined
-      transform[transformNames[t.owner] ?? String(t.owner)] = framesToJson(t, is38, names, rename)
+      transform[transformNames[t.owner] ?? String(t.owner)] = framesToJson(t, is38, names, defaults, rename)
       continue
     }
 
     if (t.kind.startsWith('path')) {
       const type = Number(t.kind.replace('path', ''))
       const key = type === 0 ? 'position' : type === 1 ? 'spacing' : 'mix'
-      const names =
-        type === 2
-          ? is38 ? ['mixRotate', 'mixTranslate'] : ['mixRotate', 'mixX', 'mixY']
-          : ['value']
-      const rename =
-        type === 2 && is38
-          ? { mixRotate: 'rotateMix', mixTranslate: 'translateMix' }
-          : type !== 2
-            ? { value: key }
-            : undefined
-      group(path, pathNames[t.owner] ?? String(t.owner), key, framesToJson(t, is38, names, rename))
+      const owner = pathNames[t.owner] ?? String(t.owner)
+      if (type === 2) {
+        // 与 transform 同理:缺省 1,4.x 的 mixY 缺省 = mixX
+        group(path, owner, key, is38
+          ? framesToJson(t, true, ['mixRotate', 'mixTranslate'], [1, 1], { mixRotate: 'rotateMix', mixTranslate: 'translateMix' })
+          : framesToJson(t, false, ['mixRotate', 'mixX', 'mixY'], [1, 1, 'mixX']))
+        continue
+      }
+      // position / spacing 的值:3.8 的键名是时间轴名,4.x 叫 value
+      group(path, owner, key, framesToJson(t, is38, ['value'], [0], is38 ? { value: key } : undefined))
       continue
     }
 
-    if (t.kind === 'deform') {
+    if (t.kind === 'deform' || t.kind === 'sequence') {
       const wrapper = t.frames[0] as Record<string, unknown>
       const skin = skinNames[wrapper['skin'] as number] ?? 'default'
       const slot = slotNames[t.owner] ?? String(t.owner)
@@ -361,7 +374,25 @@ function animationToJson(
 
       const bySkin = (deform[skin] as Json) ?? (deform[skin] = {})
       const bySlot = (bySkin[slot] as Json) ?? (bySkin[slot] = {})
-      bySlot[attachment] = inner.map((f) => {
+
+      if (t.kind === 'sequence') {
+        if (is38) throw new Error('sequence 时间轴是 4.1 才有的,3.8 写不出来 —— 降级时应先丢弃')
+        let lastDelay = 0
+        const frames = inner.map((f) => {
+          const frame: Json = {}
+          put(frame, 'time', f['time'], 0)
+          put(frame, 'mode', f['mode'], 'hold')
+          put(frame, 'index', f['index'], 0)
+          // 与读取端对称:delay 缺省沿用上一帧的
+          put(frame, 'delay', f['delay'], lastDelay)
+          lastDelay = f['delay'] as number
+          return frame
+        })
+        ;((bySlot[attachment] as Json) ?? (bySlot[attachment] = {}))['sequence'] = frames
+        continue
+      }
+
+      const frames = inner.map((f) => {
         const frame: Json = {}
         put(frame, 'time', f['time'], 0)
         const verts = f['vertices'] as number[]
@@ -372,6 +403,9 @@ function animationToJson(
         putCurve(frame, f, is38)
         return frame
       })
+      // 3.8 直接是帧数组;4.x 多一层时间轴类型(与 sequence 并列)
+      if (is38) bySlot[attachment] = frames
+      else ((bySlot[attachment] as Json) ?? (bySlot[attachment] = {}))['deform'] = frames
       continue
     }
 
@@ -393,7 +427,8 @@ function animationToJson(
 
     if (t.kind === 'event') {
       out['events'] = t.frames.map((f) => {
-        const frame: Json = { time: f['time'] }
+        const frame: Json = {}
+        put(frame, 'time', f['time'], 0)
         frame['name'] = f['event']
         put(frame, 'int', f['int'], 0)
         put(frame, 'float', f['float'], 0)
@@ -451,6 +486,7 @@ export function toJson(part: SkeletonPart): Json {
     put(j, 'shearY', b.shearY, 0)
     put(j, 'transform', TRANSFORM_MODES[b.transformMode], 'normal')
     put(j, 'skin', b.skinRequired, false)
+    if (b.color !== undefined) put(j, 'color', hexRgba(b.color), hexRgba(DEFAULT_BONE_COLOR))
     return j
   })
 
@@ -497,11 +533,12 @@ export function toJson(part: SkeletonPart): Json {
         put(j, 'scaleMix', c.mixScaleX, 1)
         put(j, 'shearMix', c.mixShearY, 1)
       } else {
+        // 4.x:mixY 缺省 = mixX,mixScaleY 缺省 = mixScaleX(与动画里的 transform 时间轴一致)
         put(j, 'mixRotate', c.mixRotate, 1)
         put(j, 'mixX', c.mixX, 1)
-        put(j, 'mixY', c.mixY, 1)
+        put(j, 'mixY', c.mixY, c.mixX)
         put(j, 'mixScaleX', c.mixScaleX, 1)
-        put(j, 'mixScaleY', c.mixScaleY, 1)
+        put(j, 'mixScaleY', c.mixScaleY, c.mixScaleX)
         put(j, 'mixShearY', c.mixShearY, 1)
       }
       return j
@@ -525,7 +562,7 @@ export function toJson(part: SkeletonPart): Json {
       } else {
         put(j, 'mixRotate', c.mixRotate, 1)
         put(j, 'mixX', c.mixX, 1)
-        put(j, 'mixY', c.mixY, 1)
+        put(j, 'mixY', c.mixY, c.mixX)
       }
       return j
     })
@@ -564,7 +601,6 @@ export function toJson(part: SkeletonPart): Json {
   }
 
   const animations: Json = {}
-  const eventNames = part.events.map((e) => e.name)
   for (const anim of part.animations) {
     const j = animationToJson(
       anim.timelines, is38, slotNames, boneNames, ikNames, transformNames, pathNames, skinNames,
@@ -572,7 +608,17 @@ export function toJson(part: SkeletonPart): Json {
     // 事件时间轴里存的是事件下标,JSON 用名字
     const evts = j['events'] as Json[] | undefined
     if (evts !== undefined) {
-      for (const e of evts) e['name'] = eventNames[e['name'] as number] ?? e['name']
+      const frames = anim.timelines.find((t) => t.kind === 'event')!.frames
+      evts.forEach((e, i) => {
+        const def = part.events[e['name'] as number]
+        if (def === undefined) return
+        e['name'] = def.name
+        // 带音频的事件:volume / balance 缺省取事件定义的值(Spine 读 JSON 就是这么补的),不是 1 / 0
+        if (def.audioPath !== null) {
+          put(e, 'volume', frames[i]!['volume'], def.volume)
+          put(e, 'balance', frames[i]!['balance'], def.balance)
+        }
+      })
     }
     animations[anim.name] = j
   }

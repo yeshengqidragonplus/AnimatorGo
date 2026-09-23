@@ -38,7 +38,15 @@ export interface BoneRecord {
   readonly length: number
   readonly transformMode: number
   readonly skinRequired: boolean
+  /**
+   * 编辑器里显示用的骨骼颜色(RGBA8888),运行时不用。只在 nonessential 数据里有;
+   * 没有时写回用 Spine 的默认灰 9b9b9bff。
+   */
+  readonly color?: number
 }
+
+/** Spine 骨骼的默认显示颜色 9b9b9bff(按有符号 int32 存,与 readInt 一致) */
+export const DEFAULT_BONE_COLOR = 0x9b9b9bff | 0
 
 export interface SlotRecord {
   readonly name: string
@@ -171,8 +179,8 @@ function readBones(input: SpineInput, nonessential: boolean): BoneRecord[] {
       transformMode: input.readVarInt(),
       skinRequired: input.readBoolean(),
     }
-    if (nonessential) input.readInt() // 编辑器里显示用的骨骼颜色,运行时不用
-    bones.push(bone)
+    // 编辑器里显示用的骨骼颜色,运行时不用 —— 但要留着,不然写回不是逐字节相同
+    bones.push(nonessential ? { ...bone, color: input.readInt() } : bone)
   }
   return bones
 }
@@ -402,7 +410,7 @@ export function readSkeletonPart(bytes: Uint8Array, expectedMajor?: SpineMajor):
   const path = readPath(input, is38)
   const skins = readSkins(input, is38, nonessential)
   const events = readEvents(input)
-  const animationsResult = readAnimations(input, is38)
+  const animationsResult = readAnimations(input, is38, events)
 
   return {
     header: { hash, version, major, x, y, width, height, nonessential, fps, imagesPath, audioPath },

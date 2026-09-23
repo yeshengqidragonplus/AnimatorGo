@@ -21,6 +21,8 @@
 | IK | 包内 `IK/` 模块 | ⚠️ 有,但**未转换也未烘进曲线**,受 IK 驱动的骨骼停在自己的关键帧上 |
 | **deform 顶点关键帧** | 2D 包里没有;用 **`SkinnedMeshRenderer` 的 Blend Shape** | ✅ **走另一条网格路径**,见第 11 节 |
 | 逐帧绘制顺序 | 挪过位的 slot 每条动画一条 `m_SortingOrder` 阶梯曲线 | ✅ 可映射,见第 12 节 |
+| linkedmesh(共享网格) | 导出前展开成独立网格,继承的 deform 同一条时间轴驱动多个网格 | ✅ 可映射,见第 14 节 |
+| 4.1 序列帧(sequence) | 每帧一个节点,m_Enabled =「attachment 亮着」且「是这一帧」的阶梯曲线 | ✅ 可映射,见第 15 节 |
 | **path / transform 约束** | —— | ❌ 没有 |
 | **两色染色(dark)** | —— | ❌ 没有 |
 | **clipping 遮罩** | —— | ❌ 没有 |
@@ -596,7 +598,83 @@ AnimatorGoSkins.LoadAsset = (path, sub, type) =>
 `SpriteSkin` 在运行时换 sprite 时会按新 sprite 的绑定矩阵重新校验(`CacheCurrentSprite`,
 `autoRebind` 关着就沿用现有骨骼),骨骼顺序与导出时一致,所以直接赋 `sprite` 就行,实测正常。
 
-## 14. 待确认
+## 14. linkedmesh(共享网格):导出前展开
+
+Spine 运行时里 linkedmesh 就是「借父网格的顶点、三角形、UV、权重,用自己的图」—— 加载时
+`setParentMesh` 把这些拷过来,UV 再按自己的 region 重算。Unity 没有「共享几何」的概念,但也不需要:
+**导出前原地展开成普通 mesh**(`src/spine-convert/unity/linkedMesh.ts`),后面的 SpriteSkin /
+SkinnedMeshRenderer 分流、Blend Shape 一行都不用改。
+
+| 字段 | 取谁的 |
+|---|---|
+| `vertexCount` / `uvs` / `triangles` / `vertices` / `hullLength` / `edges` | 父网格 |
+| `path`(用哪张图)、`color`、名字、`width` / `height` | linkedmesh 自己 |
+
+UV 直接抄父网格没问题:Spine 的 mesh `uvs` 是**相对未裁剪原图归一化**的,烘焙时按各自的 region 映射。
+
+### 14.1 父网格怎么找
+
+与 Spine 一致:**同一个 slot**,在 linkedmesh 记的那套皮肤里(`skin` 为空 = 默认皮肤)按键名找。
+
+⚠️ **父网格可以在另一套皮肤里** —— MC2 的 `chopping_board` 皮肤 `5` 的件全挂在皮肤 `4` 的网格上,
+`Juicer` 皮肤 `6` / `7` 挂在 `5` 上。所以不能默认在同一套皮肤里找。
+
+父链上遇到 linkedmesh 就继续往上追到真正的 mesh;找不到父网格、成环都报 loss,不静默。
+
+### 14.2 继承的 deform
+
+`inheritTimelines`(3.8 叫 `inheritDeform`)为真时,**打在父网格上的 deform 时间轴也驱动它**
+(4.x 的 `timelineAttachment`、3.8 的 `applyDeform` 都只认**直接**父网格这一层)。展开后它就是个
+普通 mesh,认不出这层关系,所以 `resolveLinkedMeshes` 另外返回一张「谁继承谁」的表:
+
+- 分流时:父网格有 deform,linkedmesh 也走 SkinnedMeshRenderer(报「继承自父网格」)
+- 转 deform 时:一条时间轴查出**多个**网格(父网格 + 继承它的 linkedmesh),每个各出一套形变目标与权重曲线
+
+MC2 全量 118 处 linkedmesh(6 个骨架)都是 `inheritTimelines = true`、不带 sequence;
+只有 `Female staff` 的 `head_ordinary` 的父网格真有 deform,它是端到端用例的样本。
+
+## 15. 4.1 序列帧(sequence):每帧一个节点
+
+Spine 4.1 的 region / mesh 可以带 `sequence`:一组编号连续的图(`path` + 帧号),由 sequence 时间轴按
+`hold / once / loop / pingpong` 及三种倒放切换,每帧停 `delay` 秒。
+
+### 15.1 为什么不用 sprite 曲线(`m_Sprite` PPtr)
+
+Unity 原生的逐帧动画是给 SpriteRenderer 的 `m_Sprite` 打引用曲线。**没用它**,和第 1 节换图的理由一样:
+mesh 各帧的顶点、pivot、绑定都跟着图走,换 sprite 换不动网格;SkinnedMeshRenderer 的 UV 在 Mesh 里,
+换图得换 Mesh。换物体则什么都能表达,而且沿用的全是已验证的路径(SpriteSkin / SkinnedMeshRenderer /
+皮肤层 / 绘制顺序 / 颜色),没有引入「SpriteSkin 在动画里换 sprite 会不会重新绑定」这类新的未知。
+
+### 15.2 节点与曲线
+
+- 每帧一个挂图节点,名字 `slot__键名#帧号`(帧号与图集区域的编号一致,如 `left-wing#03`);具名皮肤照旧带 `@皮肤`
+- 初始只有 setup 那一帧的渲染器亮
+- 每条碰了该 slot 换图时间轴或该 attachment sequence 时间轴的动画,给每帧节点写一条 `m_Enabled` 阶梯曲线:
+  **亮 =「换图时间轴说这个键名亮着」且「sequence 时间轴说现在是这一帧」**。两者都是阶梯,合起来还是阶梯。
+  普通换图的曲线跳过这些节点,免得两条曲线打架
+- 两条都没碰的动画不写,和普通换图一样靠 Write Defaults 回到 setup
+
+### 15.3 求值细节(`src/spine-eval/sequence.ts`)
+
+- 第一个关键帧之前、以及没有时间轴时:setup 帧
+- 非 hold 模式从关键帧的 index 起,`index + (t − time) / delay + 0.0001` 取整。那个 0.0001 让换帧**比
+  time + j·delay 早 0.0001 个 delay**,阶梯的步点跟着它走 —— 否则正好采在步点上时和 Spine 差一帧
+- 最后一个关键帧之后一直播到动画结束(动画时长 = 所有时间轴最后一个关键帧的时刻);末尾补一个键把剪辑撑到这个长度
+- 动画时长为 0 时(Spine 里时间照走、序列帧一直播),按一个周期写出、让剪辑循环,报 info
+
+### 15.4 代价与验证
+
+- 节点数 × 帧数(icon_clock:9 个 attachment × 14 帧 = 126 个渲染器),同一时刻只亮一个
+- 各帧原图的宽高比与网格不一致时,那些帧的网格按「绑定姿势非刚性」走 SkinnedMeshRenderer(boat_1 的 64 帧)。
+  这是精确表达,不是近似
+- 本地样本端到端用例(`export.test.ts`,4 个样本):读回 prefab 与 `.anim`,照 Unity 的规则算每个采样时刻亮哪一帧,
+  与 Spine 逐点相等
+- Unity 6000.3 batchmode(2026-09-23,6 个样本:马车轮 / 火车轮倒放 / 时钟光效 / 船 / 火焰 / 官方 dragon):自检全过;
+  用 Animator 状态机渲染并读出每个采样时刻亮着的渲染器,**509 个采样里 507 个与 Spine 相等**。剩下 2 个正好采在
+  换图关键帧的那一刻 —— `.anim` 的时间写 7 位小数,0.53333336 写成了 0.5333334(晚 4×10⁻⁸ 秒),肉眼不可见。
+  ⚠️ 比对时采样时刻要按 C# 的 float 算(`clip.length * i / steps`),用 double 算会在关键帧边界上多出几个假的不一致
+
+## 16. 待确认
 
 - `.anim` 里驱动 `SpriteResolver` 的曲线具体形态(尚无样本)。
   目前换 attachment 走的是**一个 attachment 一个物体 + `m_IsActive` 阶梯曲线**,

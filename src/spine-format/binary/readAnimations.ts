@@ -22,6 +22,17 @@ export const CURVE_LINEAR = 0
 export const CURVE_STEPPED = 1
 export const CURVE_BEZIER = 2
 
+/** 4.x attachment 时间轴的子类型字节 */
+export const ATTACHMENT_DEFORM = 0
+export const ATTACHMENT_SEQUENCE = 1
+
+/**
+ * 4.1 序列帧时间轴的播放模式,下标即文件里「模式与帧号」的低 4 位。
+ * JSON 里直接写名字(`"mode": "loop"`)。
+ */
+export const SEQUENCE_MODES = ['hold', 'once', 'loop', 'pingpong', 'onceReverse', 'loopReverse', 'pingpongReverse'] as const
+export type SequenceMode = (typeof SEQUENCE_MODES)[number]
+
 export interface EventDef {
   readonly name: string
   readonly nameIndex: number
@@ -46,6 +57,8 @@ export interface Timeline {
 export interface AnimationData {
   readonly name: string
   readonly timelines: readonly Timeline[]
+  /** 4.x 动画开头的时间轴总数(原值)。3.8 与 JSON 来的没有,写 4.x 时现算。 */
+  readonly timelineCount?: number
   /** 读完这条动画后的字节偏移 —— 排查布局错位用 */
   readonly endOffset: number
   /** 每读完一段记一个偏移 —— 布局错位时用它定位是哪一段 */
@@ -258,13 +271,14 @@ function readAnimation(
   input: SpineInput,
   name: string,
   is38: boolean,
+  events: readonly EventDef[],
   sectionOffsets: { section: string; offset: number }[],
 ): AnimationData {
   const timelines: Timeline[] = []
   const mark = (section: string) => sectionOffsets.push({ section, offset: input.offset })
 
   // ⚠️ 4.x 每条动画开头多一个时间轴总数(3.8 没有)
-  if (!is38) input.readVarInt()
+  const timelineCount = is38 ? undefined : input.readVarInt()
   mark('start')
 
   // ── slot ──
@@ -398,7 +412,24 @@ function readAnimation(
         const attachmentAt = input.readStringRefAt()
         const attachment = attachmentAt.value
         // 4.x 把这段改名为 attachment 时间轴,并加了子类型(0=deform 1=sequence)
-        if (!is38) input.readByte()
+        const subtype = is38 ? ATTACHMENT_DEFORM : input.readByte()
+
+        if (subtype === ATTACHMENT_SEQUENCE) {
+          // 4.1 的序列帧:没有曲线(头里没有 bezierCount),每帧 时间 / 模式与帧号 / 帧间隔,都是定长 4 字节
+          const { frameCount } = readTimelineHead(input, is38, false)
+          const frames: Record<string, unknown>[] = []
+          for (let frame = 0; frame < frameCount; frame++) {
+            const time = input.readFloat()
+            const modeAndIndex = input.readInt()
+            const mode = SEQUENCE_MODES[modeAndIndex & 0xf]
+            if (mode === undefined) throw new Error(`未知的 sequence 模式 ${modeAndIndex & 0xf}(${attachment})`)
+            frames.push({ time, mode, index: modeAndIndex >> 4, delay: input.readFloat() })
+          }
+          timelines.push({ kind: 'sequence', owner: slot, frames: [{ skin, attachment, attachmentIndex: attachmentAt.index, frames }], bezierCount: -1 })
+          continue
+        }
+        if (subtype !== ATTACHMENT_DEFORM) throw new Error(`未知的 attachment 时间轴子类型 ${subtype}(${attachment})`)
+
         const { frameCount, bezierCount } = readTimelineHead(input, is38)
         const frames: Record<string, unknown>[] = []
 
@@ -462,20 +493,29 @@ function readAnimation(
   if (eventCount > 0) {
     const frames: Record<string, unknown>[] = []
     for (let i = 0; i < eventCount; i++) {
-      frames.push({
-        time: input.readFloat(),
-        event: input.readVarInt(),
+      const time = input.readFloat()
+      const event = input.readVarInt()
+      const def = events[event]
+      if (def === undefined) throw new Error(`事件下标 ${event} 超出事件定义表(共 ${events.length} 个)`)
+      const frame: Record<string, unknown> = {
+        time,
+        event,
         int: input.readVarInt(false),
         float: input.readFloat(),
         string: input.readBoolean() ? input.readString() : null,
-        // volume/balance 只在事件带音频时才有 —— 由调用方按事件定义补读
-      })
+      }
+      // ⚠️ 事件定义带音频时,每个关键帧后面多 volume / balance 两个 float —— 帧里没有标志位,只能查定义
+      if (def.audioPath !== null) {
+        frame['volume'] = input.readFloat()
+        frame['balance'] = input.readFloat()
+      }
+      frames.push(frame)
     }
     timelines.push({ kind: 'event', owner: -1, frames, bezierCount: -1 })
   }
 
   mark('结束')
-  return { name, timelines, endOffset: input.offset, sectionOffsets }
+  return { name, timelines, ...(timelineCount === undefined ? {} : { timelineCount }), endOffset: input.offset, sectionOffsets }
 }
 
 /** 事件定义表。带 audioPath 的事件后面多两个 float。 */
@@ -513,7 +553,8 @@ export interface AnimationsResult {
   } | null
 }
 
-export function readAnimations(input: SpineInput, is38: boolean): AnimationsResult {
+/** `events` 是前面读出的事件定义表 —— 事件关键帧要靠它判断后面有没有 volume / balance */
+export function readAnimations(input: SpineInput, is38: boolean, events: readonly EventDef[]): AnimationsResult {
   const count = input.readVarInt()
   const animations: AnimationData[] = []
 
@@ -521,7 +562,7 @@ export function readAnimations(input: SpineInput, is38: boolean): AnimationsResu
     const name = input.readString() ?? ''
     const trace: { section: string; offset: number }[] = []
     try {
-      animations.push(readAnimation(input, name, is38, trace))
+      animations.push(readAnimation(input, name, is38, events, trace))
     } catch (error) {
       return {
         animations,

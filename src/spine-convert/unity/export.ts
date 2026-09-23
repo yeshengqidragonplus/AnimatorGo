@@ -1,5 +1,5 @@
 import type { SkeletonPart } from '../../spine-format/binary/readSkeleton.ts'
-import type { Attachment, Skin } from '../../spine-format/binary/readSkins.ts'
+import type { Attachment, Sequence, Skin } from '../../spine-format/binary/readSkins.ts'
 import type { AnimationData, Timeline } from '../../spine-format/binary/readAnimations.ts'
 import type { Atlas } from '../../core/atlas.ts'
 import { IssueCollector, type ConversionIssue } from '../types.ts'
@@ -41,6 +41,8 @@ import { drawOrderOf, layerOfSlot, type DrawOrderOffset } from '../../spine-eval
 import { bakeAtlas, type BakedRect } from './bakeAtlas.ts'
 import { detectPremultiplied, unpremultiply } from './alpha.ts'
 import { attachmentScale, bindMesh, estimateAtlasScale, uvToRect, type SpineVertices } from './mesh.ts'
+import { resolveLinkedMeshes } from './linkedMesh.ts'
+import { sequenceCycle, sequenceFrameAt, sequenceRegionName, sequenceSteps, type SequenceKey } from '../../spine-eval/sequence.ts'
 
 /**
  * Spine → Unity 2D Animation。
@@ -74,9 +76,9 @@ import { attachmentScale, bindMesh, estimateAtlasScale, uvToRect, type SpineVert
  * - path / transform 约束、IK(也没有烘进曲线)
  * - 两色染色(dark color)
  * - clipping 遮罩
- * - 皮肤:一次只导一套(默认 + `skin` 选的),Unity 没有运行时切皮肤的对应物
  *
  * 逐帧绘制顺序(drawOrder)→ 挪过位的 slot 每条动画一条 `m_SortingOrder` 阶梯曲线。
+ * 皮肤 → 全部导进一个 prefab,Animator 皮肤层切。linkedmesh → 导出前展开成独立网格(linkedMesh.ts)。
  */
 
 export interface UnityExportOptions {
@@ -237,6 +239,11 @@ interface SlotAttachment {
   readonly regionName: string
   /** 该 attachment 对应的 sprite 名 */
   readonly spriteName: string
+  /**
+   * 4.1 序列帧 attachment 的第几帧。序列帧每帧一个节点(和换图同一个思路:换物体而不是换 sprite),
+   * 显示条件 =「attachment 亮着」且「当前是这一帧」,两者合成一条 m_Enabled 阶梯曲线
+   */
+  readonly frame?: { readonly index: number; readonly sequence: Sequence }
   /** prefab 里的节点下标 */
   node: number
 }
@@ -344,12 +351,14 @@ function boneSubset(influences: readonly (readonly { bone: number }[])[]): numbe
 // ─── 导出 ────────────────────────────────────────────────────────────────────
 
 export function exportToUnity(
-  part: SkeletonPart,
+  input: SkeletonPart,
   atlas: Atlas,
   sources: ReadonlyMap<string, Image>,
   options: UnityExportOptions,
 ): UnityExportResult {
   const issues = new IssueCollector()
+  // linkedmesh 先展开成普通 mesh,下游全部按 mesh 处理;继承关系只有 deform 要用
+  const { part, timelineParents } = resolveLinkedMeshes(input, issues)
   const scale = 1 / options.pixelsPerUnit
   const name = sanitize(options.name)
   // 3.8 的贝塞尔控制点是归一化的,4.x 是绝对的 —— segmentsOf 要靠这个区分
@@ -383,9 +392,20 @@ export function exportToUnity(
     }
   }
 
+  /**
+   * 能驱动这个挂图节点的 deform 时间轴目标(`皮肤/slot/键名`)。
+   * 一条时间轴可以驱动多个网格:展开后的 linkedmesh 继承父网格的时间轴。
+   */
+  const deformKeysOf = (item: SlotAttachment): string[] => {
+    const keys = [`${item.skin}/${item.slot}/${item.key}`, `${item.skin}/${item.slot}/${item.attachment.name}`]
+    const parent = timelineParents.get(item.attachment)
+    if (parent !== undefined) keys.push(`${parent.skin}/${item.slot}/${parent.key}`)
+    return keys
+  }
+
   const skinned: SkinnedGeometry[] = []
   const skinnedByItem = new Map<SlotAttachment, SkinnedGeometry>()
-  const skinnedByKey = new Map<string, SkinnedGeometry>()
+  const skinnedByKey = new Map<string, SkinnedGeometry[]>()
   const meshGuidOf = (spriteName: string) => unityGuid(`${name}/mesh/${spriteName}`)
 
   for (const bone of part.bones) {
@@ -444,11 +464,20 @@ export function exportToUnity(
     // 默认皮肤的件,被具名皮肤里同 slot 同键名的那件盖住(Spine 先查皮肤再查默认)
     return !skin.slots.some((e) => e.slot === item.slot && e.attachments.some((a) => a.key === item.key && isRenderable(a)))
   }
-  /** 挂图节点名:slot 名(键名与 slot 同名)或 slot__键名;具名皮肤的再带 @皮肤名,免得和别的皮肤同键名的撞 */
+  /**
+   * 挂图节点名:slot 名(键名与 slot 同名)或 slot__键名;序列帧再带 #帧号(与图集区域的编号一致);
+   * 具名皮肤的再带 @皮肤名,免得和别的皮肤同键名的撞
+   */
   const attachmentNodeName = (item: SlotAttachment, slotName: string): string => {
-    const base = item.key === slotName ? slotName : `${slotName}__${item.key}`
+    let base = item.key === slotName ? slotName : `${slotName}__${item.key}`
+    if (item.frame !== undefined) base += `#${sequenceRegionName('', item.frame.sequence, item.frame.index)}`
     return sanitize(isDefaultSkin(item.skin) ? base : `${base}@${item.skin}`)
   }
+  /** 序列帧里 setup 显示的那一帧 */
+  const setupFrameOf = (seq: Sequence) => sequenceFrameAt(undefined, seq, 0)
+  /** setup pose 下这个挂图节点的渲染器亮不亮(换图那一维 + 序列帧那一维) */
+  const enabledAtSetup = (item: SlotAttachment): boolean =>
+    item.key === part.slots[item.slot]!.attachmentName && (item.frame === undefined || item.frame.index === setupFrameOf(item.frame.sequence))
 
   // ── 1. 收集 attachment ──
   const used: SlotAttachment[] = []
@@ -458,27 +487,36 @@ export function exportToUnity(
     for (const entry of skin.slots) {
       for (const attachment of entry.attachments) {
         if (attachment.type === 'region' || attachment.type === 'mesh') {
-          const regionName = regionNameOf(attachment)
-          // region 的几何完全由图集决定,同名的可以共用一个 sprite;
-          // mesh 各有各的顶点和 pivot,必须一图一份
-          let spriteName =
-            attachment.type === 'region' ? sanitize(regionName) : sanitize(attachment.name)
-          if (attachment.type === 'mesh') {
-            let salt = 1
-            while (spriteNames.has(spriteName)) spriteName = `${sanitize(attachment.name)}_${++salt}`
+          // 4.1 序列帧:每帧一张图(path + 帧号),各出一个节点。几何相同,只有取的图不同
+          const seq = attachment.sequence
+          const frames = seq === null || seq.count <= 0 ? [undefined] : Array.from({ length: seq.count }, (_, index) => ({ index, sequence: seq }))
+          for (const frame of frames) {
+            const regionName = frame === undefined ? regionNameOf(attachment) : sequenceRegionName(regionNameOf(attachment), frame.sequence, frame.index)
+            // region 的几何完全由图集决定,同名的可以共用一个 sprite;
+            // mesh 各有各的顶点和 pivot,必须一图一份(序列帧的 mesh 按帧的图命名)
+            const meshBase = sanitize(frame === undefined ? attachment.name : regionName)
+            let spriteName = attachment.type === 'region' ? sanitize(regionName) : meshBase
+            if (attachment.type === 'mesh') {
+              let salt = 1
+              while (spriteNames.has(spriteName)) spriteName = `${meshBase}_${++salt}`
+            }
+            spriteNames.add(spriteName)
+            used.push({
+              slot: entry.slot,
+              skin: skin.name,
+              key: attachment.key,
+              attachment,
+              regionName,
+              spriteName,
+              ...(frame === undefined ? {} : { frame }),
+              node: -1,
+            })
           }
-          spriteNames.add(spriteName)
-          used.push({
-            slot: entry.slot,
-            skin: skin.name,
-            key: attachment.key,
-            attachment,
-            regionName,
-            spriteName,
-            node: -1,
-          })
+          if (seq !== null && seq.count > 0) {
+            issues.add('info', `attachment.${attachment.key}`, `序列帧 ${seq.count} 帧,每帧一个节点,按 sequence 时间轴互斥地亮`)
+          }
         } else if (attachment.type === 'linkedmesh') {
-          issues.loss(`attachment.${attachment.key}`, 'linkedmesh(共享网格)没有对应物,已丢弃')
+          // 能展开的都已变成 mesh;剩下的是父网格找不到的,resolveLinkedMeshes 已报过 loss
         } else if (attachment.type === 'clipping') {
           issues.loss(`attachment.${attachment.key}`, 'Unity 没有 clipping 遮罩的对应物,已丢弃')
         } else if (attachment.type === 'path' || attachment.type === 'boundingbox' || attachment.type === 'point') {
@@ -557,6 +595,8 @@ export function exportToUnity(
   // Spine 导出图集时可以带缩放,`.atlas` 里没记,只能从数据反推。
   // 它不改任何坐标,只决定纹理的 spritePixelsToUnits。
   const scaleSamples = used.flatMap((u) => {
+    // 序列帧只拿 setup 帧当样本 —— 各帧原图尺寸可以不同,Spine 会把每帧拉到 attachment 的宽高
+    if (u.frame !== undefined && u.frame.index !== setupFrameOf(u.frame.sequence)) return []
     const rect = baked.rects.get(u.regionName)
     return rect === undefined ? [] : [{ attachment: u.attachment, region: rect.region }]
   })
@@ -751,11 +791,8 @@ export function exportToUnity(
     // 走 SkinnedMeshRenderer 的三个理由 —— 都是 SpriteSkin 结构上表达不了的,
     // 其余网格一律留在 SpriteSkin 路径,已验证的效果不动
     const reasons: string[] = []
-    if (
-      deformTargets.has(`${item.skin}/${item.slot}/${item.key}`) ||
-      deformTargets.has(`${item.skin}/${item.slot}/${item.attachment.name}`)
-    ) {
-      reasons.push('有 deform 顶点动画')
+    if (deformKeysOf(item).some((k) => deformTargets.has(k))) {
+      reasons.push(timelineParents.has(item.attachment) ? '有 deform 顶点动画(继承自父网格)' : '有 deform 顶点动画')
     }
     // 残差按 sprite 跨度的相对值判 —— 500 像素的大图差 2 像素看不出来,
     // 40 像素的小图差 2 像素就很明显
@@ -770,8 +807,11 @@ export function exportToUnity(
       const geo = buildSkinnedGeometry(item, rect, slotBone, reasons)
       skinned.push(geo)
       skinnedByItem.set(item, geo)
-      skinnedByKey.set(`${item.skin}/${item.slot}/${item.key}`, geo)
-      skinnedByKey.set(`${item.skin}/${item.slot}/${item.attachment.name}`, geo)
+      for (const k of new Set(deformKeysOf(item))) {
+        const list = skinnedByKey.get(k)
+        if (list === undefined) skinnedByKey.set(k, [geo])
+        else list.push(geo)
+      }
       sprites.set(item.spriteName, {
         page: rect.page,
         internalID: internal,
@@ -923,8 +963,8 @@ export function exportToUnity(
           mesh: { fileID: MESH_FILE_ID, guid: meshGuidOf(item.spriteName) },
           // 带脚本模式下换装件不硬引用材质(材质引用着贴图),由 AnimatorGoSkins 切到时装上
           material: scriptMode && !isDefaultSkin(item.skin) ? null : { fileID: MATERIAL_FILE_ID, guid: materialGuids[info.page]! },
-          // 换图那一维:setup pose 只亮 attachmentName 那一个
-          enabled: item.key === slot.attachmentName,
+          // 换图那一维:setup pose 只亮 attachmentName 那一个(序列帧只亮 setup 帧)
+          enabled: enabledAtSetup(item),
           bones: geo.subset.map((b) => boneNode[b]!),
           rootBone: boneNode[geo.subset[0]!]!,
           blendShapeCount: 0, // 动画转完再补
@@ -942,8 +982,8 @@ export function exportToUnity(
       // Spine 的 slots 数组顺序就是绘制顺序,先画的在下层
       sortingOrder: item.slot,
       color,
-      // 换图那一维:setup pose 只亮 attachmentName 那一个;表情变体初始是灭的
-      enabled: item.key === slot.attachmentName,
+      // 换图那一维:setup pose 只亮 attachmentName 那一个;表情变体初始是灭的;序列帧只亮 setup 帧
+      enabled: enabledAtSetup(item),
     }
 
     let parent: number
@@ -1248,6 +1288,86 @@ export function exportToUnity(
     }
   }
 
+  // ── 4.1 序列帧 → 每帧节点的 m_Enabled 阶梯曲线 ──
+  //
+  // 渲染器亮 =「换图时间轴说这个键名亮着」且「sequence 时间轴说现在是这一帧」。两者都是阶梯函数,
+  // 合起来还是阶梯。只在这条动画碰了其中之一时写 —— 都没碰就和普通换图一样,靠 Write Defaults 回 setup。
+  /** 动画时长 = 所有时间轴最后一个关键帧的时刻(Spine 自己就是这么算的) */
+  const durationOf = (anim: AnimationData): number => {
+    let end = 0
+    for (const t of anim.timelines) {
+      const frames = t.kind === 'deform' || t.kind === 'sequence' ? (t.frames[0] as unknown as { frames: Record<string, unknown>[] }).frames : t.frames
+      for (const f of frames) end = Math.max(end, (f['time'] as number | undefined) ?? 0)
+    }
+    return end
+  }
+  /** 同一个序列帧 attachment 的各帧节点 */
+  const frameGroups = new Map<string, SlotAttachment[]>()
+  for (const item of used) {
+    if (item.frame === undefined || item.node < 0) continue
+    const k = `${item.skin}/${item.slot}/${item.key}`
+    const list = frameGroups.get(k)
+    if (list === undefined) frameGroups.set(k, [item])
+    else list.push(item)
+  }
+  /** 取阶梯函数在时刻 t 的值(steps 按时间升序,取最后一个 time ≤ t 的) */
+  const stepAt = <T>(steps: readonly { time: number; value: T }[], t: number): T => {
+    let v = steps[0]!.value
+    for (const s of steps) {
+      if (s.time > t + 1e-9) break
+      v = s.value
+    }
+    return v
+  }
+  const writeSequenceCurves = (anim: AnimationData, floats: FloatCurve[]) => {
+    const animEnd = durationOf(anim)
+    for (const items of frameGroups.values()) {
+      const first = items[0]!
+      const slot = part.slots[first.slot]!
+      const seq = first.frame!.sequence
+      // 时间轴按「皮肤/slot/键名」找目标,展开后的 linkedmesh 也认父网格的(与 deform 同一套键)
+      const targets = new Set(deformKeysOf(first))
+      const seqTimeline = anim.timelines.find((t) => {
+        if (t.kind !== 'sequence' || t.owner !== first.slot) return false
+        const d = t.frames[0] as unknown as DeformRecord
+        return targets.has(`${skinNameOf(d.skin)}/${t.owner}/${d.attachment}`)
+      })
+      const attTimeline = anim.timelines.find((t) => t.kind === 'attachment' && t.owner === first.slot)
+      if (seqTimeline === undefined && attTimeline === undefined) continue
+
+      const keys = seqTimeline === undefined ? undefined : (seqTimeline.frames[0] as unknown as { frames: SequenceKey[] }).frames
+      let end = animEnd
+      if (end <= 0 && keys !== undefined) {
+        // 时长为 0 的动画在 Spine 里时间照走、序列帧一直播;Unity 的剪辑要有长度才循环 —— 取一个周期
+        const cycle = Math.max(0, ...keys.map((k) => sequenceCycle(k, seq.count)))
+        if (cycle > 0) {
+          end = cycle
+          issues.add('info', `sequence[${slot.name}]`, `动画时长为 0,序列帧按一个周期(${cycle.toFixed(3)}s)写出并循环`)
+        }
+      }
+      const frameSteps = sequenceSteps(keys, seq, end).map((s) => ({ time: s.time, value: s.frame }))
+      // 换图那一维:没有换图时间轴就一直是 setup 的显隐
+      const visSteps = [{ time: 0, value: slot.attachmentName === first.key }]
+      for (const f of attTimeline?.frames ?? []) visSteps.push({ time: f['time'] as number, value: f['name'] === first.key })
+      const changes = [...new Set([...frameSteps, ...visSteps].map((s) => s.time))].sort((a, b) => a - b)
+
+      for (const item of items) {
+        const out: UnityKeyframe[] = []
+        let prev = -1
+        for (const t of changes) {
+          const on = stepAt(visSteps, t) && stepAt(frameSteps, t) === item.frame!.index ? 1 : 0
+          if (on !== prev) {
+            out.push(key(t, on, true))
+            prev = on
+          }
+        }
+        // 剪辑不能比 Spine 的动画短:末尾补一个同值的键把长度撑到 end
+        if (end > out[out.length - 1]!.time + 1e-9) out.push(key(end, prev, true))
+        floats.push({ path: paths[item.node]!, attribute: 'm_Enabled', classID: skinnedByItem.has(item) ? 137 : 212, keys: out })
+      }
+    }
+  }
+
   // ── 5. 动画 ──
   const clipGuids = new Map<string, string>()
   const files: UnityFile[] = []
@@ -1354,6 +1474,8 @@ export function exportToUnity(
           const names = t.frames.map((f) => f['name'] as string | null)
 
           for (const item of list) {
+            // 序列帧的节点要和帧号合成,在时间轴循环之后统一写
+            if (item.frame !== undefined) continue
             const keys: UnityKeyframe[] = []
             if (times[0]! > 0) keys.push(key(0, slot.attachmentName === item.key ? 1 : 0, true))
             times.forEach((time, i) => keys.push(key(time, names[i] === item.key ? 1 : 0, true)))
@@ -1399,8 +1521,9 @@ export function exportToUnity(
 
         if (t.kind === 'deform') {
           const d = t.frames[0] as unknown as DeformRecord
-          const geo = skinnedByKey.get(`${skinNameOf(d.skin)}/${t.owner}/${d.attachment}`)
-          if (geo === undefined || geo.nodeIndex < 0) {
+          // 一条时间轴可以驱动多个网格:父网格本身 + 继承它时间轴的 linkedmesh
+          const geos = (skinnedByKey.get(`${skinNameOf(d.skin)}/${t.owner}/${d.attachment}`) ?? []).filter((g) => g.nodeIndex >= 0)
+          if (geos.length === 0) {
             const type = attachmentTypeOf(skinNameOf(d.skin), t.owner, d.attachment)
             if (type !== null && type !== 'mesh' && type !== 'linkedmesh') {
               // 实测 MergeCooking2 的 wave:deform 打在 path 上(路径约束用),没有可渲染的东西
@@ -1408,12 +1531,12 @@ export function exportToUnity(
             } else {
               issues.loss(
                 `deform[${t.owner}]`,
-                `找不到 deform 指向的网格 "${d.attachment}"(${type === 'linkedmesh' ? 'linkedmesh 尚未支持' : '多半是图集里没有这张图'}),该时间轴已丢弃`,
+                `找不到 deform 指向的网格 "${d.attachment}"(多半是图集里没有这张图),该时间轴已丢弃`,
               )
             }
             continue
           }
-          approximated ||= convertDeform(geo, anim, d, floats)
+          for (const geo of geos) approximated = convertDeform(geo, anim, d, floats) || approximated
           noteApprox(t)
           continue
         }
@@ -1423,8 +1546,8 @@ export function exportToUnity(
           continue
         }
 
-        if (t.kind === 'drawOrder') {
-          continue // 时间轴循环之后统一转成 m_SortingOrder 曲线
+        if (t.kind === 'drawOrder' || t.kind === 'sequence') {
+          continue // 时间轴循环之后统一转成 m_SortingOrder / m_Enabled 曲线
         } else if (t.kind === 'transform' || t.kind.startsWith('path')) {
           issues.loss(t.kind, 'Unity 没有 transform / path 约束的对应物,该时间轴已丢弃')
         } else if (t.kind === 'ik') {
@@ -1459,6 +1582,8 @@ export function exportToUnity(
           }
         }
       }
+
+      writeSequenceCurves(anim, floats)
     })
 
     const guid = unityGuid(`${name}/clip/${anim.name}`)

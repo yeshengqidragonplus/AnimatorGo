@@ -1,5 +1,6 @@
-import type {
-  BoneRecord, IkRecord, PathRecord, SkeletonPart, SlotRecord, SpineMajor, TransformRecord,
+﻿import {
+  DEFAULT_BONE_COLOR,
+  type BoneRecord, type IkRecord, type PathRecord, type SkeletonPart, type SlotRecord, type SpineMajor, type TransformRecord,
 } from '../binary/readSkeleton.ts'
 import type { Attachment, AttachmentType, Skin, SkinSlotEntry, Vertices } from '../binary/readSkins.ts'
 import type { AnimationData, EventDef, Timeline } from '../binary/readAnimations.ts'
@@ -88,34 +89,48 @@ function verticesFromJson(raw: readonly number[], vertexCount: number): Vertices
 
 // ─── 曲线 ────────────────────────────────────────────────────────────────────
 
-/** components 是该时间轴的值分量数 —— 4.x 的 bezier 数组按它切分 */
+/**
+ * 曲线的 JSON 写法两版不同(都取自真实导出,只看文档会写错):
+ *
+ * - 3.8:`"curve": cx1, "c2": cy1, "c3": cx2, "c4": cy2`,缺省 c2=0 c3=1 c4=1(BloomMatch1 的 3.8 导出)
+ * - 4.x:`"curve": [cx1, cy1, cx2, cy2, …]`,每个值分量 4 个,平铺(Spine 官方示例 goblins.json)
+ *
+ * components 是该时间轴的值分量数 —— 4.x 的数组按它切分。
+ */
 function curveFromJson(j: Json, is38: boolean, components: number): Json {
   const curve = j['curve']
   if (curve === undefined) return { curve: 'linear' }
   if (curve === 'stepped') return { curve: 'stepped' }
 
   if (is38) {
-    return { curve: 'bezier', beziers: [[...(curve as number[])]] }
+    // 3.7 及更早是数组写法,顺带兼容
+    if (Array.isArray(curve)) return { curve: 'bezier', beziers: [[...(curve as number[])]] }
+    return { curve: 'bezier', beziers: [[num(curve, 0), num(j['c2'], 0), num(j['c3'], 1), num(j['c4'], 1)]] }
   }
 
-  // 4.x:curve 恒为 "bezier",控制点平铺在 bezier 数组里,每 4 个一组
-  const flat = (j['bezier'] as number[]) ?? []
+  // 本工具早期写出过 `"curve": "bezier"` + `"bezier": [...]` 这种错误形式,读的时候仍认
+  const flat = (Array.isArray(curve) ? curve : (j['bezier'] as number[] | undefined) ?? []) as number[]
   const beziers: number[][] = []
   for (let i = 0; i < components; i++) beziers.push(flat.slice(i * 4, i * 4 + 4))
   return { curve: 'bezier', beziers }
 }
 
+/**
+ * defaults 里写字符串表示「缺省等于同一帧里那个分量的值」—— 4.x 的约束 mix 是连锁缺省的
+ * (mixY 缺省 = mixX,mixScaleY 缺省 = mixScaleX),被引用的分量必须排在前面。
+ */
 function framesFromJson(
   raw: readonly Json[],
   is38: boolean,
   valueNames: readonly string[],
-  defaults: readonly number[],
+  defaults: readonly (number | string)[],
   rename?: Record<string, string>,
 ): Record<string, unknown>[] {
   return raw.map((j) => {
     const f: Record<string, unknown> = { time: num(j['time'], 0) }
     valueNames.forEach((name, i) => {
-      f[name] = num(j[rename?.[name] ?? name], defaults[i] ?? 0)
+      const d = defaults[i] ?? 0
+      f[name] = num(j[rename?.[name] ?? name], typeof d === 'string' ? (f[d] as number) : d)
     })
     return { ...f, ...curveFromJson(j, is38, valueNames.length) }
   })
@@ -251,6 +266,8 @@ interface NameLookup {
   readonly path: readonly string[]
   readonly skins: readonly string[]
   readonly events: readonly string[]
+  /** 事件关键帧的 volume / balance 缺省要取定义里的值 */
+  readonly eventDefs: readonly EventDef[]
 }
 
 function animationFromJson(
@@ -353,10 +370,13 @@ function animationFromJson(
   }
 
   // ── transform ──
+  // mix 缺省都是 1;4.x 另有连锁:mixY 缺省 = mixX,mixScaleY 缺省 = mixScaleX。
+  // 所以 spineboy-pro 的 aim 写 `"mixX": 0` 而不写 mixY —— 按 1 补 mixY 就错了。3.8 没有连锁
   for (const [tName, raw] of Object.entries((j['transform'] as Json) ?? {})) {
     const valueNames = is38
       ? ['mixRotate', 'mixTranslate', 'mixScale', 'mixShear']
       : ['mixRotate', 'mixX', 'mixY', 'mixScaleX', 'mixScaleY', 'mixShearY']
+    const defaults = is38 ? [1, 1, 1, 1] : [1, 1, 'mixX', 1, 'mixScaleX', 1]
     const rename = is38
       ? { mixRotate: 'rotateMix', mixTranslate: 'translateMix', mixScale: 'scaleMix', mixShear: 'shearMix' }
       : undefined
@@ -364,7 +384,7 @@ function animationFromJson(
       kind: 'transform',
       owner: at(names.transform, tName),
       bezierCount: -1,
-      frames: framesFromJson(raw as Json[], is38, valueNames, valueNames.map(() => 1), rename),
+      frames: framesFromJson(raw as Json[], is38, valueNames, defaults, rename),
     })
   }
 
@@ -373,48 +393,76 @@ function animationFromJson(
     const owner = at(names.path, pName)
     for (const [kind, raw] of Object.entries(byKind as Json)) {
       const type = kind === 'position' ? 0 : kind === 'spacing' ? 1 : 2
-      const valueNames =
-        type === 2 ? (is38 ? ['mixRotate', 'mixTranslate'] : ['mixRotate', 'mixX', 'mixY']) : ['value']
-      const rename =
-        type === 2
-          ? is38 ? { mixRotate: 'rotateMix', mixTranslate: 'translateMix' } : undefined
-          : { value: kind }
+      if (type === 2) {
+        // mix 与 transform 同理:缺省 1,4.x 的 mixY 缺省 = mixX
+        timelines.push({
+          kind: 'path2',
+          owner,
+          bezierCount: -1,
+          frames: is38
+            ? framesFromJson(raw as Json[], true, ['mixRotate', 'mixTranslate'], [1, 1], { mixRotate: 'rotateMix', mixTranslate: 'translateMix' })
+            : framesFromJson(raw as Json[], false, ['mixRotate', 'mixX', 'mixY'], [1, 1, 'mixX']),
+        })
+        continue
+      }
+      // position / spacing 的值:3.8 的键名就是时间轴名,4.x 统一叫 value(spineboy-unity 的 gun toss)。
+      // 本工具早期给 4.x 也写过时间轴名当键,读的时候仍认
+      const frames = is38
+        ? (raw as Json[])
+        : (raw as Json[]).map((f) => (f['value'] === undefined && f[kind] !== undefined ? { ...f, value: f[kind] } : f))
       timelines.push({
         kind: `path${type}`,
         owner,
         bezierCount: -1,
-        frames: framesFromJson(raw as Json[], is38, valueNames, valueNames.map(() => (type === 2 ? 1 : 0)), rename),
+        frames: framesFromJson(frames, is38, ['value'], [0], is38 ? { value: kind } : undefined),
       })
     }
   }
 
   // ── deform / attachments ──
+  // 3.8:deform[皮肤][slot][attachment] = [帧]
+  // 4.x:attachments[皮肤][slot][attachment] = { deform: [帧], sequence: [帧] } —— 多一层时间轴类型
+  //      (取自 Spine 官方示例 goblins.json / dragon.json;只看文档会漏掉这一层)
   const deformRoot = (j[is38 ? 'deform' : 'attachments'] as Json) ?? {}
   for (const [skinName, bySlot] of Object.entries(deformRoot)) {
     const skin = at(names.skins, skinName)
     for (const [slotName, byAttachment] of Object.entries(bySlot as Json)) {
       const owner = at(names.slots, slotName)
       for (const [attachmentName, raw] of Object.entries(byAttachment as Json)) {
-        const inner = (raw as Json[]).map((f) => {
-          const verts = (f['vertices'] as number[]) ?? []
-          return {
-            time: num(f['time'], 0),
-            start: verts.length === 0 ? 0 : num(f['offset'], 0),
-            vertices: verts,
-            ...curveFromJson(f, is38, 1),
+        const wrap = (frames: Record<string, unknown>[]) => [{
+          skin,
+          attachment: attachmentName,
+          attachmentIndex: table.ref(attachmentName),
+          frames,
+        }]
+        const byType: [string, unknown][] = is38 ? [['deform', raw]] : Object.entries(raw as Json)
+        for (const [type, list] of byType) {
+          const keys = (list as Json[] | undefined) ?? []
+          if (keys.length === 0) continue
+          if (type === 'deform') {
+            const inner = keys.map((f) => {
+              const verts = (f['vertices'] as number[]) ?? []
+              return {
+                time: num(f['time'], 0),
+                start: verts.length === 0 ? 0 : num(f['offset'], 0),
+                vertices: verts,
+                ...curveFromJson(f, is38, 1),
+              }
+            })
+            timelines.push({ kind: 'deform', owner, bezierCount: -1, frames: wrap(inner) })
+          } else if (type === 'sequence') {
+            // ⚠️ delay 缺省是**上一帧的** delay,不是 0(dragon.json 的 {"time":0.6} 沿用 0.0667)
+            let lastDelay = 0
+            const inner = keys.map((f) => {
+              const delay = num(f['delay'], lastDelay)
+              lastDelay = delay
+              return { time: num(f['time'], 0), mode: str(f['mode']) ?? 'hold', index: num(f['index'], 0), delay }
+            })
+            timelines.push({ kind: 'sequence', owner, bezierCount: -1, frames: wrap(inner) })
+          } else {
+            throw new Error(`未知的 attachment 时间轴类型 "${type}"(${slotName}/${attachmentName})`)
           }
-        })
-        timelines.push({
-          kind: 'deform',
-          owner,
-          bezierCount: -1,
-          frames: [{
-            skin,
-            attachment: attachmentName,
-            attachmentIndex: table.ref(attachmentName),
-            frames: inner,
-          }],
-        })
+        }
       }
     }
   }
@@ -443,13 +491,23 @@ function animationFromJson(
       kind: 'event',
       owner: -1,
       bezierCount: -1,
-      frames: events.map((f) => ({
-        time: num(f['time'], 0),
-        event: at(names.events, str(f['name']) ?? ''),
-        int: num(f['int'], 0),
-        float: num(f['float'], 0),
-        string: str(f['string']),
-      })),
+      frames: events.map((f) => {
+        const event = at(names.events, str(f['name']) ?? '')
+        const frame: Record<string, unknown> = {
+          time: num(f['time'], 0),
+          event,
+          int: num(f['int'], 0),
+          float: num(f['float'], 0),
+          string: str(f['string']),
+        }
+        // 带音频的事件每帧有 volume / balance(.skel 里是两个 float),缺省沿用事件定义
+        const def = names.eventDefs[event]
+        if (def !== undefined && def.audioPath !== null) {
+          frame['volume'] = num(f['volume'], def.volume)
+          frame['balance'] = num(f['balance'], def.balance)
+        }
+        return frame
+      }),
     })
   }
 
@@ -488,6 +546,8 @@ export function fromJson(root: Json, major?: SpineMajor): SkeletonPart {
     length: num(b['length'], 0),
     transformMode: indexOfMode(TRANSFORM_MODES, b['transform'], 'normal'),
     skinRequired: bool(b['skin'], false),
+    // 编辑器显示用的骨骼颜色,写 .skel(nonessential)时要用
+    ...(b['color'] === undefined ? {} : { color: parseRgba(b['color'], DEFAULT_BONE_COLOR) }),
   }))
 
   const rawSlots = (root['slots'] as Json[]) ?? []
@@ -520,46 +580,54 @@ export function fromJson(root: Json, major?: SpineMajor): SkeletonPart {
     uniform: bool(c['uniform'], false),
   }))
 
+  // 约束本身的 mix 与时间轴一样:4.x 的 mixY 缺省 = mixX,mixScaleY 缺省 = mixScaleX
   const rawTransform = (root['transform'] as Json[]) ?? []
-  const transform: TransformRecord[] = rawTransform.map((c) => ({
-    name: str(c['name']) ?? '',
-    order: num(c['order'], 0),
-    skinRequired: bool(c['skin'], false),
-    bones: ((c['bones'] as string[]) ?? []).map((b) => boneNames.indexOf(b)),
-    target: boneNames.indexOf(str(c['target']) ?? ''),
-    local: bool(c['local'], false),
-    relative: bool(c['relative'], false),
-    offsetRotation: num(c['rotation'], 0),
-    offsetX: num(c['x'], 0),
-    offsetY: num(c['y'], 0),
-    offsetScaleX: num(c['scaleX'], 0),
-    offsetScaleY: num(c['scaleY'], 0),
-    offsetShearY: num(c['shearY'], 0),
-    mixRotate: num(is38 ? c['rotateMix'] : c['mixRotate'], 1),
-    mixX: num(is38 ? c['translateMix'] : c['mixX'], 1),
-    mixY: num(is38 ? c['translateMix'] : c['mixY'], 1),
-    mixScaleX: num(is38 ? c['scaleMix'] : c['mixScaleX'], 1),
-    mixScaleY: num(is38 ? c['scaleMix'] : c['mixScaleY'], 1),
-    mixShearY: num(is38 ? c['shearMix'] : c['mixShearY'], 1),
-  }))
+  const transform: TransformRecord[] = rawTransform.map((c) => {
+    const mixX = num(is38 ? c['translateMix'] : c['mixX'], 1)
+    const mixScaleX = num(is38 ? c['scaleMix'] : c['mixScaleX'], 1)
+    return {
+      name: str(c['name']) ?? '',
+      order: num(c['order'], 0),
+      skinRequired: bool(c['skin'], false),
+      bones: ((c['bones'] as string[]) ?? []).map((b) => boneNames.indexOf(b)),
+      target: boneNames.indexOf(str(c['target']) ?? ''),
+      local: bool(c['local'], false),
+      relative: bool(c['relative'], false),
+      offsetRotation: num(c['rotation'], 0),
+      offsetX: num(c['x'], 0),
+      offsetY: num(c['y'], 0),
+      offsetScaleX: num(c['scaleX'], 0),
+      offsetScaleY: num(c['scaleY'], 0),
+      offsetShearY: num(c['shearY'], 0),
+      mixRotate: num(is38 ? c['rotateMix'] : c['mixRotate'], 1),
+      mixX,
+      mixY: is38 ? mixX : num(c['mixY'], mixX),
+      mixScaleX,
+      mixScaleY: is38 ? mixScaleX : num(c['mixScaleY'], mixScaleX),
+      mixShearY: num(is38 ? c['shearMix'] : c['mixShearY'], 1),
+    }
+  })
 
   const rawPath = (root['path'] as Json[]) ?? []
-  const path: PathRecord[] = rawPath.map((c) => ({
-    name: str(c['name']) ?? '',
-    order: num(c['order'], 0),
-    skinRequired: bool(c['skin'], false),
-    bones: ((c['bones'] as string[]) ?? []).map((b) => boneNames.indexOf(b)),
-    target: slotNames.indexOf(str(c['target']) ?? ''),
-    positionMode: indexOfMode(POSITION_MODES, c['positionMode'], 'percent'),
-    spacingMode: indexOfMode(SPACING_MODES, c['spacingMode'], 'length'),
-    rotateMode: indexOfMode(ROTATE_MODES, c['rotateMode'], 'tangent'),
-    offsetRotation: num(c['rotation'], 0),
-    position: num(c['position'], 0),
-    spacing: num(c['spacing'], 0),
-    mixRotate: num(is38 ? c['rotateMix'] : c['mixRotate'], 1),
-    mixX: num(is38 ? c['translateMix'] : c['mixX'], 1),
-    mixY: num(is38 ? c['translateMix'] : c['mixY'], 1),
-  }))
+  const path: PathRecord[] = rawPath.map((c) => {
+    const mixX = num(is38 ? c['translateMix'] : c['mixX'], 1)
+    return {
+      name: str(c['name']) ?? '',
+      order: num(c['order'], 0),
+      skinRequired: bool(c['skin'], false),
+      bones: ((c['bones'] as string[]) ?? []).map((b) => boneNames.indexOf(b)),
+      target: slotNames.indexOf(str(c['target']) ?? ''),
+      positionMode: indexOfMode(POSITION_MODES, c['positionMode'], 'percent'),
+      spacingMode: indexOfMode(SPACING_MODES, c['spacingMode'], 'length'),
+      rotateMode: indexOfMode(ROTATE_MODES, c['rotateMode'], 'tangent'),
+      offsetRotation: num(c['rotation'], 0),
+      position: num(c['position'], 0),
+      spacing: num(c['spacing'], 0),
+      mixRotate: num(is38 ? c['rotateMix'] : c['mixRotate'], 1),
+      mixX,
+      mixY: is38 ? mixX : num(c['mixY'], mixX),
+    }
+  })
 
   const rawSkins = (root['skins'] as Json[]) ?? []
   const skinNames = rawSkins.map((s) => str(s['name']) ?? 'default')
@@ -609,6 +677,7 @@ export function fromJson(root: Json, major?: SpineMajor): SkeletonPart {
     path: rawPath.map((c) => str(c['name']) ?? ''),
     skins: skinNames,
     events: events.map((e) => e.name),
+    eventDefs: events,
   }
 
   const animations = Object.entries((root['animations'] as Json) ?? {}).map(([name, j]) =>

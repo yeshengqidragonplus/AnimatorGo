@@ -81,9 +81,12 @@ Esoteric 从未公开发布 `.skel` 的格式规范(`.json` 只公开到 3.8)。
 | length | `float` | 受 scale 缩放 |
 | transformMode | `varint` | 枚举下标 |
 | skinRequired | `bool` | |
-| color | `int` | **仅 nonessential**,运行时跳过不用 |
+| color | `int` | **仅 nonessential**,运行时跳过不用;缺省 `9b9b9bff` |
 
 **3.8 与 4.1 完全一致。**
+
+⚠️ 骨骼颜色运行时不用,但**写回要原样还**。曾经读时丢弃、写时填 0,仓库里的两个样本恰好不带
+nonessential 所以往返测试一直是绿的;对全盘 3296 个 4.x 骨架跑逐字节往返时 1445 个在这里挂掉。
 
 ---
 
@@ -178,7 +181,7 @@ offsetRotation、offsetX、offsetY、offsetScaleX、offsetScaleY、offsetShearY(
 ### Attachment 时间轴(4.x 新增子类型)
 
 4.x 在 attachment 时间轴下分了 DEFORM(0)和 **SEQUENCE**(1)。
-**sequence 是 4.1 新特性,3.8 没有对应物,降级必丢。**
+**sequence 是 4.1 新特性,3.8 没有对应物,降级必丢。** 帧布局见 7.9。
 
 ### 曲线类型 —— 两版一致
 
@@ -189,6 +192,10 @@ offsetRotation、offsetX、offsetY、offsetScaleX、offsetScaleY、offsetShearY(
 ## 7. 动画 —— 两版差异最多的一段
 
 已用真实文件完整验证:两个版本都能读到文件最后一个字节,且时间轴结构逐项一致。
+
+**全盘验收(2026-09-23)**:`E:/UnityProject` 下按内容去重后 **3295 个 4.1.23 + 4915 个 3.8** 骨架,
+全部读到精确 EOF、写回逐字节相同。最后三处缺口是 7.2(时间轴总数)、7.6(同一 owner 分成两组)、
+7.10(音频事件的 volume / balance)—— 仓库样本一处都没覆盖到,只有扫全盘才撞得到。
 
 ### 7.1 ⚠️ 帧与曲线的排列顺序不同(最容易踩的一处)
 
@@ -202,6 +209,19 @@ offsetRotation、offsetX、offsetY、offsetScaleX、offsetScaleY、offsetShearY(
 ### 7.2 每条动画的开头
 
 4.x 多一个**时间轴总数** varint,3.8 没有。
+
+⚠️ **这个数不一定等于后面实际写了几条。** 运行时只拿它当列表的初始容量,读多读少都不出错,
+所以 Spine 自己写的值有时偏大:全盘 10567 条 4.1 动画里 81 条(分布在 48 个文件)比实际多,
+多 1 的最常见,最多多 63;**从没见过偏小**。
+
+偏大的来历是推断,但证据很一致:48 个文件里 47 个的字符串表有**谁也不引用的名字**(不相关的文件里这个比例约 29%)。
+典型如 `Door.skel`:字符串表里有 `door_7`、slot `door_7` 也在,可是**没有任何皮肤装着叫 `door_7` 的 attachment**,
+三条动画各多 1 —— 像是 Spine 先按工程里的时间轴计了数、登记了名字,写正文时又把「attachment 没进导出」
+的 deform 时间轴跳过了(deform 必须在皮肤里找到 attachment,否则运行时直接抛错)。
+
+**处理:** 读的时候存原值(`AnimationData.timelineCount`),写回原样还;3.8 / JSON 来的没有这个值,
+写 4.x 时用实际条数 —— 这正是运行时真正会建出来的时间轴数。跨版本转换(`convert.ts`)重建了时间轴,
+所以会丢掉原值、现算。
 
 ### 7.3 时间轴头
 
@@ -280,6 +300,19 @@ inSlope  = (v1 - cy2) / (t1 - cx2)
 4.x 把 deform 段改名为「attachment 时间轴」,并在每条时间轴前加了**子类型字节**
 (0 = deform,1 = sequence)。
 
+slot / 骨骼 / path 三段是「组数 → 每组:owner 下标 + 组内条数 + N 条时间轴」;deform 段多套两层
+(skin → slot → attachment)。
+
+⚠️ **同一个 owner 可以出现在两个不相邻的组里。** 全盘只有一例:`man.skel` 的 `work_3_fear`,
+骨骼 2 先有一组 rotate / translate / scale,隔了骨骼 3 那一组,又来一组只有 rotate —— 同一根骨骼两条 rotate。
+写回时要按**连续段**分组,不能按 owner 合并(合并后组数 39 → 38,文件短 2 字节)。
+读取端按文件顺序平铺时间轴,连续段正好还原原分组;JSON 来的时间轴本来就按 owner 连续,两种分法结果一样。
+
+📌 **组内重复**在 3.8 里很常见:99 个文件、共 4800 处(attachment 1557、color 2930、deform 313),
+都是同一个 slot 的同类时间轴在同一组里出现两次。二进制往返原样保留;**JSON 表达不了**(同一个键只能有一个值),
+`toJson` 留最后一条 —— 运行时按顺序套用,满权重时后一条整条盖掉前一条(它首帧之前的时段也会被拉回 setup),
+所以正常播放看不出区别;动画间混合过渡时可能有细微差异。这是 `skel → json` 方向的已知损失,目前没报 issue。
+
 ### 7.7 deform 帧序
 
 ```
@@ -290,6 +323,64 @@ inSlope  = (v1 - cy2) / (t1 - cx2)
 ### 7.8 slot 颜色
 
 3.8 打包成 `int`;4.x 分通道逐字节。类型也从 3 种扩到 6 种(见第 6 节)。
+
+### 7.9 sequence 时间轴(4.1)
+
+attachment 时间轴段里,子类型字节为 1 的一项:
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| frameCount | `varint` | **没有 bezierCount** —— 序列帧不插值 |
+| 每帧 time | `float` | |
+| 每帧 modeAndIndex | `int`(定长 4 字节,不是 varint) | 低 4 位是模式,其余位是起始帧号(`>> 4`) |
+| 每帧 delay | `float` | 秒/帧 |
+
+模式:`hold / once / loop / pingpong / onceReverse / loopReverse / pingpongReverse`(0~6)。
+求值规则见 `src/spine-eval/sequence.ts`。attachment 上的 `sequence` 字段是 `count / start / digits / setupIndex`
+四个 varint;帧 i 的图集区域名 = path + (start + i) 补零到 digits 位。
+
+⚠️ **曾经把子类型字节读了就丢,一律按 deform 解析** —— 全盘 9 个带 sequence 的 4.1 骨架全部读不通
+(报「读到文件尾之后」)。修好后 9 个都读到精确 EOF、写回逐字节相同,覆盖 hold / once / loop / loopReverse。
+
+JSON 里是 `animations.*.attachments[皮肤][slot][attachment].sequence = [{time, mode, index, delay}]`,
+**`delay` 缺省沿用上一帧的**(不是 0),`mode` 缺省 `hold`。见 `src/spine-format/json/realFormat.test.ts`。
+
+### 7.10 事件 —— ⚠️ 帧的长度取决于**事件定义**
+
+**两版一致。** 事件定义表紧跟皮肤、在动画之前:
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| name | `stringRef` | |
+| int | `varint`(**zigzag**,可为负) | |
+| float | `float` | |
+| string | `string` | 可为 null |
+| audioPath | `string` | null = 不带音频 |
+| ↳ volume, balance | 2 × `float` | **仅 audioPath 非 null** |
+
+动画末尾的事件时间轴:`varint` 帧数(0 = 没有这条时间轴),每帧:
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| time | `float` | |
+| event | `varint` | 事件定义下标 |
+| int | `varint`(zigzag) | |
+| float | `float` | |
+| hasString | `bool` | |
+| ↳ string | `string` | 仅 hasString;没有时运行时沿用定义里的 string |
+| ↳ volume, balance | 2 × `float` | ⚠️ **仅当该帧引用的事件定义带音频** |
+
+**帧里没有任何标志位说明后面有没有 volume / balance** —— 只能拿 event 下标回查定义表。
+所以读动画必须先读完事件定义(`readAnimations` 收 `events` 参数),写入端按同一个条件镜像。
+
+曾经完全没读这 8 字节:全盘 6 个带音频事件的骨架(Cooking12 OrderGame 的 cheese / cucumber / onion / tomato / drink,
+外加一个 3.8 的 `Pre_prop_scissors`),前 4 个读不通(报「读到文件尾之后」),drink 的音频帧恰好在最后一条动画里,
+表现为停在 EOF 前 8 字节。修后 6 个都逐字节往返,共 38 个音频帧。
+
+JSON 里帧的 `volume` / `balance` **缺省取事件定义的值**(Spine 读 JSON 就是这么补的),不是 1 / 0 ——
+`toJson` 与定义相等就省略,`fromJson` 缺省补定义值,从 JSON 来的帧没有这两个字段时写入端也用定义值。
+实测 38 个音频帧全等于定义值(1 / 0),所以「帧值 ≠ 定义值」这条分支只有合成用例覆盖
+(`animationLayout.test.ts`)。
 
 ## 8. 转换验证结果
 
@@ -321,5 +412,6 @@ float32 只有约 7 位有效数字,所以比对要用**相对容差 1e-6**,不�
 
 ## 9. 待整理
 
-- path 约束的字段顺序(测试骨架里没有 path 约束,未经真实数据验证)
-- 事件时间轴中带音频事件的 volume / balance(测试骨架无事件)
+- path 约束的字段顺序:全盘 99 个带 path 约束的骨架(42 个 4.1 + 57 个 3.8)都逐字节往返,**字节布局**已确认;
+  但往返查不出同类型字段互换(三个 mode 都是 varint,offsetRotation / position / spacing 都是 float),语义顺序仍待对照
+- ~~事件时间轴中带音频事件的 volume / balance~~ 已用真实文件验证,见 7.10

@@ -1,4 +1,4 @@
-# 开发进度与交接(2026-09-10)
+# 开发进度与交接(2026-09-23)
 
 ## 产品定位
 
@@ -118,7 +118,7 @@ Unity.exe -batchmode -quit -nographics -projectPath <工程>           -executeM
 | 20 | 贝塞尔控制点贴端点 | 退化为线性 |
 | ~~16~~ | ~~逐帧绘制顺序~~ | ✅ **已解**(2026-09-10):挪过位的 slot 每条动画一条 `m_SortingOrder` 阶梯曲线,见 [UNITY-2D.md](UNITY-2D.md) 第 12 节 |
 | 9 | `transformMode` 非默认继承 | 无对应物 |
-| **7** | **linkedmesh(共享网格)** | 纯功能缺口,做得了 |
+| ~~6~~ | ~~linkedmesh(共享网格)~~ | ✅ **已解**(2026-09-23):导出前展开成独立网格,118 处全部展开,见 [UNITY-2D.md](UNITY-2D.md) 第 14 节 |
 | 3 | IK / transform / path 约束 | 无对应物,**也没有烘进曲线**(之前「已烘进曲线」的说法不对,代码里没有求解器)—— 受约束驱动的骨骼停在自己的关键帧上 |
 
 ### deform 到底动多大(2026-09-08 摸底,1118 条时间轴)
@@ -319,14 +319,68 @@ Unity batchmode 自检 + `angry` 三套皮肤各渲两帧肉眼看(见下)。
 路线已定(2026-09-09,见 [DECISIONS.md](DECISIONS.md)):**Spine → Unity 先做正常动画,
 VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
-1. **linkedmesh** —— 7 个骨架 / 138 处,唯一剩下的纯功能缺口
-2. **跨度 < 64px 的加权网格不参与缩放分流**的边界(`Valentines_flower1/2`、`WestCowboy-sign` 缩放差 50% 留在 SpriteSkin)
-3. **运行时换皮肤**(同一实例 `SetSkin`)—— 方案已在 Unity 里验过(见上),等确认游戏里真有这个需求再做
-4. **Unity → Spine**(反方向)
-5. **Godot / Cocos 导出**
-6. `.skel` 里没有样本覆盖的区域:path 约束的字段顺序、音频事件的 `volume` / `balance`
-7. **VAT 出口** —— 极限性能时才需要。来源有两个:Spine 直出,以及 Unity 正常动画烘焙。
+1. **跨度 < 64px 的加权网格不参与缩放分流**的边界(`Valentines_flower1/2`、`WestCowboy-sign` 缩放差 50% 留在 SpriteSkin)
+2. **Unity → Spine**(反方向)
+3. **Godot / Cocos 导出**
+4. `.skel` 里往返验不出的区域:path 约束里同类型字段的语义顺序(字节布局已由 99 个真实文件确认,
+   见 [SPINE-BINARY.md](SPINE-BINARY.md) 第 9 节)
+5. **VAT 出口** —— 极限性能时才需要。来源有两个:Spine 直出,以及 Unity 正常动画烘焙。
    求值器按「(数据, 时间) → 顶点数组」设计,让两边共用
+
+~~linkedmesh~~ 已做完(2026-09-23)。~~运行时换皮肤~~ 早在 2026-09-10 就做完了(零脚本 + `--skins script`
+两种),之前这里漏删。
+
+### ✅ 4.1 序列帧(sequence)(2026-09-23)
+
+MC2 全是 3.8,一直没暴露;扫全盘 Unity 工程(4553 个 4.x 骨架)找到 9 个带 sequence 的真实样本 +
+Spine 官方示例 dragon.json。**缺口比预想的大** —— 不只是 Unity 导出,整条链路都有问题:
+
+| 环节 | 之前 | 现在 |
+|---|---|---|
+| `.skel` 读 | attachment 时间轴的子类型字节读了就丢、一律按 deform 解析 → 9 个样本**全部读不通** | 9 个读到精确 EOF、写回逐字节相同 |
+| `.json` 读写 | 不认识 sequence 时间轴 | 读写都支持,`delay` 缺省沿用上一帧 |
+| 4.1 → 3.8 降级 | 只清掉 sequence 字段,path 还是基名 → **3.8 运行时找不到区域,加载失败** | sequence 时间轴丢弃报 loss;path 改成 setup 帧的区域名 |
+| Unity 导出 | 没处理(基名在图集里找不到,报「缺图」) | 每帧一个节点,见 [UNITY-2D.md](UNITY-2D.md) 第 15 节 |
+
+**顺带挖出并修掉的老问题**(都是拿真实文件一比才暴露,仓库里的两个样本碰巧都覆盖不到):
+
+| 问题 | 影响 |
+|---|---|
+| nonessential 的骨骼颜色读时丢弃、写时填 0 | 全盘 3296 个 4.x 骨架里 1445 个写回不是逐字节相同。修后 3246 个逐字节往返 |
+| 4.x JSON 的 attachment 时间轴少一层 `deform` | 读真实 4.1 JSON 直接崩(goblins.json:`raw.map is not a function`),写出的 Spine 读不了 |
+| 4.x JSON 曲线写成 `"curve":"bezier"` + `"bezier":[…]`,真实是 `"curve":[…]` | 读 4.x JSON **所有缓动丢失**,写出的 Spine 读不了 |
+| 3.8 JSON 曲线当数组读,真实是 `"curve":0.25,"c2":…` | 读带贝塞尔的 3.8 JSON 直接崩 |
+| 4.x JSON → 4.x `.skel` 没算 bezierCount | 该路径一直失败(自检拦住了,没产坏文件)。现在官方 15 个示例 JSON 转 4.1 / 3.8 `.skel` 全过 |
+
+JSON 这几处的根因是**只做过「我们写 → 我们读」的自洽往返**,从没和真实导出比过。新的
+`realFormat.test.ts` 用真实文件形状的片段要求逐项相等。
+
+随后又修了约束 mix 的缺省值(同日):4.x 的 transform / path 约束 mix 缺省是 1,且**连锁** ——
+`mixY` 缺省等于 `mixX`、`mixScaleY` 缺省等于 `mixScaleX`(时间轴与约束定义两处都是);之前按 0 省略,
+写出的文件读回来是另一个值。同时:4.x path 时间轴的值键名是 `value`;隐藏 attachment 的 `name`
+在 4.x 省略、3.8 必须写 `null`(3.8 运行时硬取这个键,缺了抛异常)。
+
+**全盘真实 JSON:4.1 共 117 个、3.8 抽样 12 个,animations 段写回全部与原文件逐项相等。**
+
+### ✅ `.skel` 全盘逐字节往返(2026-09-23)
+
+上面剩下的 46 个写回不同 + 4 个读不通,查下来是三处布局理解错(都在动画段,详见 [SPINE-BINARY.md](SPINE-BINARY.md)):
+
+| 问题 | 影响 | 见 |
+|---|---|---|
+| 事件帧引用的定义带音频时,帧尾多 volume / balance 两个 float,没读 | 4 个读不通 + drink 停在 EOF 前 8 字节(另有一个 3.8 文件同病,之前没被统计) | 7.10 |
+| 4.x 动画开头的时间轴总数写成实际条数 —— Spine 自己写的有时偏大(疑似计入了没导出的 attachment 的 deform) | 44 个同长度但字节不同 | 7.2 |
+| 写回按 owner 合并分组 —— 同一根骨骼可以在两个不相邻的组里 | man.skel 短 2 字节 | 7.6 |
+
+现在按内容去重后 **3296 个 4.x + 4915 个 3.8 全部读到精确 EOF、写回逐字节相同**。
+合成用例在 `src/spine-format/binary/animationLayout.test.ts`。
+
+**还没修的**:
+
+- `skel → json` 丢组内重复的时间轴(99 个 3.8 文件、1 个 4.1 文件有),`toJson` 留最后一条、不报 issue ——
+  满权重播放等价,见 [SPINE-BINARY.md](SPINE-BINARY.md) 7.6
+- JSON 事件帧的 `int` / `float` 缺省按 0 处理;Spine 读 JSON 时缺省取**事件定义**的值。全盘二进制里没有一帧会因此写错
+  (定义非 0 的 20 个事件,引用它们的帧没有一个取值为 0),但读 Spine 自己导出的 JSON 时若它按定义值省略,会读成 0 —— 未验证
 
 烘焙不许旋转,打包效率会降 —— BBQ_grill 原图集 1024×512,烘焙后是 1024×1024。
 目前固定 POT,需要的话可以加个 `--npot` 省显存。
