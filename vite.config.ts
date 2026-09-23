@@ -1,4 +1,5 @@
 import { defineConfig } from 'vite'
+import { configDefaults } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 import { fileURLToPath, URL } from 'node:url'
 
@@ -9,7 +10,20 @@ import { fileURLToPath, URL } from 'node:url'
  * 刻意不用 vite-plugin-electron —— 它当前版本按 rolldown 的接口传参,
  * 和 Vite 6 对不上,能构建但启动不了 Electron。手写这几十行反而可控。
  */
+/**
+ * vitest 读的也是这份配置。不能改用 vitest/config 的 defineConfig 来拿 `test` 的类型 ——
+ * vitest 2 自带 vite 5 的类型,和工程的 vite 6 的 Plugin 类型对不上,typecheck 过不了。
+ * 所以单独放一个对象再展开进去(展开的属性不做多余属性检查)。
+ */
+const vitest = {
+  test: {
+    // .claude/worktrees/ 下是整份仓库的拷贝(独立任务的工作区),别把它们的测试也跑一遍
+    exclude: [...configDefaults.exclude, '.claude/**'],
+  },
+}
+
 export default defineConfig({
+  ...vitest,
   plugins: [react()],
   resolve: {
     alias: {
