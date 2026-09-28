@@ -1,5 +1,6 @@
 import type { BoneRecord, SkeletonPart } from '../spine-format/binary/readSkeleton.ts'
 import type { AnimationData, Timeline } from '../spine-format/binary/readAnimations.ts'
+import { lastPerProperty } from '../spine-format/duplicateTimelines.ts'
 
 /**
  * Spine 骨架的姿势求值:(骨架, 动画, 时间) → 每根骨骼的世界矩阵。
@@ -262,7 +263,8 @@ export function localsAt(part: SkeletonPart, animation: AnimationData, time: num
   const is38 = part.header.major === '3.8'
   const locals = setupLocals(part.bones).map((l) => ({ ...l }))
 
-  for (const t of animation.timelines) {
+  // 同一属性的重复时间轴只算最后一条 —— Spine 是后一条整条覆盖,下面的 += 叠两次就错了(全盘 1 处,4.1 的 rotate)
+  for (const t of lastPerProperty(animation.timelines).kept) {
     if (!BONE_TIMELINES.has(t.kind)) continue
     const l = locals[t.owner]
     if (l === undefined) continue

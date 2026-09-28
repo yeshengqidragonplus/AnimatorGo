@@ -143,3 +143,15 @@ describe('时间轴取值', () => {
     expect(Math.hypot(at[0]!.a, at[0]!.c)).toBeCloseTo(3, 6)
   })
 })
+
+describe('同一属性的重复时间轴', () => {
+  it('只算最后一条(Spine 后一条整条覆盖前一条),不会叠加两次', () => {
+    const rotate = (value: number) => ({ kind: 'rotate', owner: 0, bezierCount: 0, frames: [{ time: 0, value }] })
+    const part = skeleton([bone({ name: 'root', parent: -1 })], [], '4.x')
+    const pose = poseAt(part, anim([rotate(30), rotate(90)]), 0)
+    // 转 90°:局部 x 轴朝上
+    const tip = applyPoint(pose[0]!, 10, 0)
+    expect(tip.x).toBeCloseTo(0, 6)
+    expect(tip.y).toBeCloseTo(10, 6)
+  })
+})

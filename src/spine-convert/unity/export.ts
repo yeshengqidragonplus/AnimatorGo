@@ -742,6 +742,57 @@ export function exportToUnity(
     }
   }
   const metaSprites: MetaSprite[][] = baked.pages.map(() => [])
+
+  /**
+   * SkinnedMeshRenderer 的绑定矩阵是 setup 的逆,顶点是 setup 下的位置 —— 前提是网格在 setup 下绑、各影响一致。
+   * 绑完又在别的姿势下改过顶点的网格不满足:setup 姿势精确,动起来各影响之间的不一致就露出来
+   * (实测 MergeCooking2 有 23 个,最大 127 像素,之前一直没报)。逐帧量出最大偏差;不到 0.5 像素返回 null。
+   * Godot 导出对同一类网格会逐帧打修正,见 docs/GODOT.md。
+   */
+  let driftPoses: Affine[][] | null = null
+  const bindingDrift = (verts: SpineVertices): { spread: number; worst: number } | null => {
+    const setupPos: { x: number; y: number }[] = []
+    let spread = 0
+    for (const entry of verts.weights) {
+      const ps = entry.map((w) => applyPoint(setupSpine[w.bone]!, w.x, w.y))
+      const m = ps.reduce((acc, p, i) => ({ x: acc.x + p.x * entry[i]!.weight, y: acc.y + p.y * entry[i]!.weight }), { x: 0, y: 0 })
+      for (const p of ps) spread = Math.max(spread, Math.hypot(p.x - m.x, p.y - m.y))
+      setupPos.push(m)
+    }
+    if (spread < 0.05) return null
+    if (driftPoses === null) {
+      driftPoses = []
+      for (const anim of part.animations) {
+        const times = new Set<number>([0])
+        let end = 0
+        for (const t of anim.timelines) {
+          for (const f of t.frames) {
+            if (typeof f['time'] !== 'number') continue
+            times.add(f['time'])
+            end = Math.max(end, f['time'])
+          }
+        }
+        for (let i = 0; i / 30 < end; i++) times.add(i / 30)
+        for (const t of times) driftPoses.push(poseAt(part, anim, t))
+      }
+    }
+    const setupInv = setupSpine.map((m) => invert(m))
+    let worst = 0
+    for (const pose of driftPoses) {
+      verts.weights.forEach((entry, i) => {
+        let ux = 0, uy = 0, sx = 0, sy = 0
+        for (const w of entry) {
+          const inv = setupInv[w.bone]
+          if (inv === null || inv === undefined) continue
+          const u = applyPoint(multiply(pose[w.bone]!, inv), setupPos[i]!.x, setupPos[i]!.y)
+          const p = applyPoint(pose[w.bone]!, w.x, w.y)
+          ux += u.x * w.weight; uy += u.y * w.weight; sx += p.x * w.weight; sy += p.y * w.weight
+        }
+        worst = Math.max(worst, Math.hypot(ux - sx, uy - sy))
+      })
+    }
+    return worst > 0.5 ? { spread, worst } : null
+  }
   const seenSprite = new Set<string>()
 
   for (const item of used) {
@@ -810,6 +861,16 @@ export function exportToUnity(
     }
     if (reasons.length > 0) {
       const geo = buildSkinnedGeometry(item, rect, slotBone, reasons)
+      const verts = item.attachment.data['vertices'] as SpineVertices
+      const drift = verts.weighted ? bindingDrift(verts) : null
+      if (drift !== null) {
+        issues.add(
+          'approximated',
+          `mesh.${item.spriteName}`,
+          `绑定姿势各顶点不一致(各影响最多差 ${drift.spread.toFixed(1)} 像素):SkinnedMeshRenderer 按 setup 绑定,` +
+            `setup 姿势精确,动画中(30 fps 逐帧实测)最多偏 ${drift.worst.toFixed(1)} 像素`,
+        )
+      }
       skinned.push(geo)
       skinnedByItem.set(item, geo)
       for (const k of new Set(deformKeysOf(item))) {

@@ -490,6 +490,9 @@ approximated —— MC2 的 458 条里 431 条 < 0.5px,最大 20px。
   静态颜色烘进顶点色,动画部分报 loss
 - 这些网格在 Sprite Editor 里不能再刷权重;骨骼和形变权重曲线在 Animation 窗口里照常能改
 - deform 打在 `path` 上(路径约束用)不参与渲染,报 info 跳过 —— MC2 的 `wave` 有这种
+- ⚠️ **绑定矩阵是 setup 的逆** —— 网格绑完又在别的姿势下改过顶点时(各影响在 setup 下不一致),setup 姿势精确、
+  一动就偏。逐帧(30 fps)实测并报 approximated:MergeCooking2 里 25 处、最大 77 像素(`female_lead`)。
+  之前一直没报。修法在 Godot 那边验证过(GODOT.md 第 6 节),Unity 这边还没做,见 PROGRESS.md
 
 ### 11.7 自检
 
