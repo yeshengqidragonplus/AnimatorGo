@@ -99,6 +99,21 @@ pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [
 deform 变成 Blend Shape。`--skin-quality` 默认 `bone4`(渲染器写死 4 根,外观不随工程 Quality 档位变);
 `auto` 只给所有档位都是 Unlimited 的工程用。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 11 节。
 
+导出到 Godot 4(Godot 4.7 原生节点 + AnimationPlayer,零运行时脚本):
+
+```bash
+pnpm godot <骨架文件或目录> [--out 目录] [--atlas 图集] [--skin 初始皮肤] [--dry-run]
+```
+
+⚠️ **Godot 2D 的绑定姿势是 `Bone2D.rest`,每根骨骼一个、全场景共用**(Unity 是每个 sprite / Mesh 一套)。
+不在 setup 下绑的网格靠辅助子骨骼表达;绑完又改过顶点的网格,两种绑定按实测取小的、还偏就逐帧加修正轨道。
+**离散轨道要 `callback_mode_discrete = 2`、换动画回 setup 要 `deterministic` + RESET、节点名不能含 `@`** ——
+三条都是探针实测出来的,不看实测一定写错。详见 [docs/GODOT.md](docs/GODOT.md)。
+
+Godot 侧的验证:`tools/godot/` 的探针 / 自检 / 渲染脚本拷进一个 Godot 工程根,本机 Godot 在
+`E:/Tools/Godot_v4.7.2-stable_win64/Godot_v4.7.2-stable_win64_console.exe`(`--import` 先导入贴图;
+渲染不能加 `--headless`)。端到端测试把写出的 `.tscn` 读回来按 Godot 的规则算顶点,和 Spine 求值逐点比。
+
 跑单个测试文件:`pnpm exec vitest run src/core/math.test.ts`
 跑单个用例:`pnpm exec vitest run -t "旋转差值走最短路径"`
 

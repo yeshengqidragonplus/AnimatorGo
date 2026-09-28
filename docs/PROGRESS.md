@@ -1,4 +1,4 @@
-# 开发进度与交接(2026-09-23)
+# 开发进度与交接(2026-09-28)
 
 ## 产品定位
 
@@ -342,14 +342,56 @@ Unity batchmode 自检 + `angry` 三套皮肤各渲两帧肉眼看(见下)。
 路线已定(2026-09-09,见 [DECISIONS.md](DECISIONS.md)):**Spine → Unity 先做正常动画,
 VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
-1. **Unity → Spine**(反方向)
-2. **Godot / Cocos 导出**
-3. `.skel` 里往返验不出的区域:path 约束里同类型字段的语义顺序(字节布局已由 99 个真实文件确认,
+1. **Unity 产物 → 中转模型**(读回我们导出、又在 Unity 里改过的角色)—— 接上下面的 Godot 写出器就是 Unity → Godot(2026-09-28 用户定的方向)
+2. **Cocos 原生节点 + 动画剪辑**(用户定:不用 Cocos 自带的 Spine 组件)。Cocos 原生没有网格蒙皮,只能做刚性部件
+3. **Unity SkinnedMeshRenderer 的绑定误差**:见下文「Unity 导出里之前没报的绑定误差」,现在只报不修
+4. `.skel` 里往返验不出的区域:path 约束里同类型字段的语义顺序(字节布局已由 99 个真实文件确认,
    见 [SPINE-BINARY.md](SPINE-BINARY.md) 第 9 节)
-4. **VAT 出口** —— 极限性能时才需要。来源有两个:Spine 直出,以及 Unity 正常动画烘焙。
+5. **VAT 出口** —— 极限性能时才需要。来源有两个:Spine 直出,以及 Unity 正常动画烘焙。
    求值器按「(数据, 时间) → 顶点数组」设计,让两边共用
 
 ~~跨度 < 64px 的加权网格不参与缩放分流~~ 查下来不是缺口,见上文。
+~~Godot 导出~~ 中转模型 → Godot 已做完(2026-09-28),见下文。
+
+### ✅ Spine(中转模型)→ Godot 4(2026-09-28)
+
+```bash
+pnpm godot <骨架文件或目录> [--out 目录] [--atlas 图集] [--skin 初始皮肤] [--dry-run]
+```
+
+Godot 4.7 原生 `Skeleton2D` + `Bone2D` + `Polygon2D` + `AnimationPlayer`,**零运行时脚本**,在 Godot 里可编辑。
+写出器吃的是中转模型,所以它既是 Spine → Godot,也是 Unity → Godot 的后半段。设计与全部实测结论见 [GODOT.md](GODOT.md)。
+
+**先探针、后实现**:`tools/godot/` 的两个探针用 Godot 自己的 API 搭样例存成 `.tscn`(格式以 Godot 写出的为准),
+并渲染到 SubViewport 量质心,核对了蒙皮公式、绑定姿势、deform 顺序、贝塞尔控制柄语义、离散轨道和换动画的行为。
+其中三条不看实测一定会错:离散轨道默认档位往回拖不重新求值、默认换动画不回 setup、节点名不能含 `@`。
+
+**与 Unity 导出最大的不同**:Godot 2D 的绑定姿势是 `Bone2D.rest`,**每根骨骼一个、全场景共用**;不是在 setup 下
+绑的网格靠辅助子骨骼表达自己的绑定姿势(实测误差 0)。反过来也有省掉的:不用重新烘焙图集(Polygon2D 的 UV 是
+页像素,旋转区域靠 UV 映射)、不用反推图集缩放 k 和 ppu。
+
+验证:
+
+| 层 | 结果 |
+|---|---|
+| 端到端(读回 `.tscn`,按 Godot 的规则算顶点,和 Spine 求值比 setup / 每个关键帧 / 相邻关键帧中点) | 9 个样本 48 个用例全过:MX2_cat 3.8 与 4.1、加权 deform、全靠 deform、linkedmesh、6 套皮肤、100 个 region、绑定不一致 |
+| Godot 4.7 里加载(`AnimatorGoVerify.gd`) | 5 个场景:轨道路径、蒙皮骨骼全部解析 |
+| 渲染肉眼看(`AnimatorGoRender.gd`) | MX2_cat / Female staff / BBQ_grill / wave 正常 |
+| MergeCooking2 全部 535 个骨架 | 全部导出成功 |
+
+### ⚠️ Unity 导出里之前没报的绑定误差(2026-09-28,做 Godot 时发现)
+
+有一类加权网格,**绑完又在别的姿势下改过顶点**,各顶点对应的不是同一个绑定姿势 —— 既不能按 setup 绑,按图也拟合不准。
+Unity 导出里这类网格如果走 **SkinnedMeshRenderer**(有 deform / 非刚性 / 缩放不一致),绑定矩阵写的是 setup 的逆:
+setup 姿势精确,一动就偏,而且**之前一声不响**。现在逐帧实测(30 fps)并报 approximated:MergeCooking2 里
+**25 处、10 个骨架**,最严重 `female_lead` 的 `nvzhu_t_gb1` 77 像素、`Oldwoman_sit` 的 `B_body` 44 像素。
+
+走 SpriteSkin 的那些没有这个问题 —— 它的绑定本来就是逐骨骼按图拟合的(`bindMesh`)。⚠️ 这里一度说错过:
+做 Godot 时第一版按「逐影响残差的最大值」判,把 Unity 里走 SpriteSkin、完全正常的 `whiteman_sit` / `B_body2` 也算了进去,
+得出「Unity 同样差 127 像素」。按**加权后**的偏差重判后,它两边都没问题。
+
+修法已经在 Godot 那边验证过(GODOT.md 第 6 节):两种绑定按实测取小的;还偏就逐帧加修正。Unity 这边对应的是
+SkinnedMeshRenderer 用按图拟合的绑定矩阵(Mesh 的 bindposes 本来就是任意 4×4)+ 逐帧的修正 Blend Shape。**还没做,等用户定。**
 
 ~~linkedmesh~~ 已做完(2026-09-23)。~~运行时换皮肤~~ 早在 2026-09-10 就做完了(零脚本 + `--skins script`
 两种),之前这里漏删。
