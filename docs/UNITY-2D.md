@@ -686,16 +686,32 @@ mesh 各帧的顶点、pivot、绑定都跟着图走,换 sprite 换不动网格;
   换图关键帧的那一刻 —— `.anim` 的时间写 7 位小数,0.53333336 写成了 0.5333334(晚 4×10⁻⁸ 秒),肉眼不可见。
   ⚠️ 比对时采样时刻要按 C# 的 float 算(`clip.length * i / steps`),用 double 算会在关键帧边界上多出几个假的不一致
 
-## 16. 读回:Unity 产物 → Spine / Godot(`src/spine-convert/unity-import/`)
+## 16. 读回:Unity 角色 → Spine / Godot(`src/spine-convert/unity-import/`)
 
-用途:角色导到 Unity、**在 Unity 里改过之后**再转到 Godot(或 Spine JSON)。这不是往返编辑 —— 读回来的是 Unity 那一份,
-Spine 有而 Unity 没有的东西(约束、shear、两色染色……)导出时已经报过丢失,读回来也不会有。
+用途:角色导到 Unity、**在 Unity 里改过之后**再转到 Godot(或 Spine JSON);也读别人在 Unity 里做的 2D 角色。
+这不是往返编辑 —— 读回来的是 Unity 那一份,Spine 有而 Unity 没有的东西(约束、shear、两色染色……)导出时已经报过丢失,
+读回来也不会有。
 
-**只认我们自己导出的结构**(本文 1~15 节):根物体下不带渲染器的 Transform 是骨骼;挂图节点名 `<slot>[__键名][#帧][@皮肤]`;
-`m_SortingOrder` 是绘制顺序;controller 里的状态顺序是动画顺序,`@skin@` 皮肤 clip 跳过。别的工具做的 Unity 2D 角色
-(PSB 导入之类)不在范围内。`--ppu` 要与导出时一致。
+输入是一个目录:**正好一个 `.prefab`**,加上 `.anim`、controller(只用来定动画顺序)、贴图 / Mesh / 材质及其 `.meta`。
+根物体是角色本身,它自己的变换是摆在场景里的位置,不算骨骼。`--ppu` 要与导出时一致。
 
 输出 Spine 4.1 JSON,再过 `fromJson` 进中转模型 —— 字符串表、写法细节交给已经拿真实文件对过的读取器,顺带就有了 Unity → Spine。
+
+### 16.0 结构:按 Unity 的规则读,我们的命名只是锦上添花
+
+| Unity | Spine | 说明 |
+|---|---|---|
+| 不带渲染器的物体 | 骨骼 | |
+| 带渲染器的物体,**下面挂着东西 / 被变换曲线驱动 / 被蒙皮引用** | 骨骼 + 挂在自己身上的 slot | ⚠️ 别人的角色常把图直接挂在骨骼上。第一版只把不带渲染器的当骨骼,挂在图下面的子骨骼找不到父骨骼,**静默**变成第二根根骨骼、位置全错 |
+| 其余带 SpriteRenderer / SkinnedMeshRenderer 的物体 | 挂在父骨骼上的 slot | |
+| 物体名 `<slot>[__键名][#帧][@皮肤]`(我们导出的) | 几个物体合成一个 slot、不同皮肤 | 合不起来的组 —— setup 时同时亮着两个以上,或(SkinnedMeshRenderer / SpriteSkin 之外)挂在不同骨骼上 —— 说明名字不是这个约定(别人的 `arm__L`),组里的物体各自成 slot。重名的(左右手都叫 Hand)加后缀 |
+| 画不画 = 渲染器 `m_Enabled` 且自己和各级父物体 `m_IsActive` | 换图时间轴 | `m_IsActive` 曲线(classID 1)打在骨骼上,下面挂的图一起灭。我们导出的多皮肤角色里,挂图物体**自己的** `m_IsActive` 是皮肤那一维(具名皮肤的物体,和被初始皮肤同 slot 同键名盖住的默认皮肤物体),交给 Spine 的皮肤,不当显隐读 |
+| `m_Sprite` 曲线(引用曲线,阶梯) | 每张图一个 attachment(按图名),换图时间轴 | 逐帧动画的标准写法。Single 模式的贴图(引用 fileID 固定 21300000,`.meta` 里没有顶点)用整个矩形 —— Unity 的紧凑网格只是裁掉透明像素,画出来一样 |
+| 绘制顺序:Sorting Group → Sorting Layer → Order in Layer → z(远的先画)→ 层级先后 | slot 顺序 + drawOrder 时间轴 | 每层一组 `[层, 序, −z, 层级先后]`,由外到内依次比。`m_SortingOrder` 曲线(渲染器 212 / 137、Sorting Group 210)→ drawOrder |
+| prefab 里亮着的那套具名皮肤 | `initialSkin` | `pnpm from-unity --to godot` 不给 `--skin` 就用它 |
+
+sprite 引用的三种写法(真实文件里都见过,`src/unity/spriteMeta.ts`):Single 模式固定 21300000;Multiple 2019.3 之后是 sprite 的
+`internalID`;更早是 21300000、21300002…… 经 `fileIDToRecycleName` 映射到 sprite 名。轴心:`alignment` 不是 9(Custom)时按预设算。
 
 ### 16.1 几何:全部转成 Spine 的 mesh,都是精确的
 
@@ -717,6 +733,9 @@ region 也读成四顶点 mesh。图集每个 sprite 一个区域(Unity 的矩�
   **只有阶梯与非阶梯混在同一帧**才近似,报 approximated
 - ⚠️ **时间要吸附到 `m_SampleRate` 的帧格**:`.anim` 的时间只存 7 位有效数字(31/30 写成 1.0333334)。不吸附的话,
   不同曲线上「同一帧」差 1e-7 秒,对不上帧,阶梯跳变也会早晚一点
+- **第一个键不在 0 秒**(在 Unity 里删了 0 秒那个键):Unity 在第一个键之前取它的值,Spine 取 setup —— 0 秒补一个同值的键
+- **clip 比最后一个键长**(`m_StopTime`;逐帧动画最后一帧要停 1/12 秒):Spine 的时长 = 最后一个键,会把最后一帧吃掉、
+  循环变快 —— 末尾补一个不改变任何东西的 drawOrder 帧把时长撑回来
 
 ### 16.3 Blend Shape → deform
 
@@ -730,12 +749,19 @@ region 也读成四顶点 mesh。图集每个 sprite 一个区域(Unity 的矩�
 |---|---|
 | prefab 里嵌套了别的 prefab 实例(没展开) | loss |
 | 四元数旋转曲线 `m_RotationCurves`(导出写的是欧拉;在 Animation 窗口把插值改成 Quaternion 才会出现) | loss |
-| 换 sprite 的 `m_PPtrCurves`(导出换图用的是节点显隐) | loss |
-| 曲线指向的物体不是骨骼 / 挂图节点,或属性不认识 | loss |
+| 根物体自己的变换 / 显隐动画(根物体的位置是摆在场景里的位置) | loss |
+| `m_Sprite` 以外的引用曲线(SpriteResolver 换装等) | loss |
+| 曲线指向的物体不存在,或属性不认识(`m_FlipX` 等) | loss |
 | 引用的贴图 / sprite / Mesh 不在目录里 | loss |
 | 绕 x / y 的旋转(只取绕 z 的部分) | approximated |
+| z 坐标的动画(只影响同层同序谁先画,没转) | approximated |
 | 同一时刻同一 slot 亮着几个挂图节点(Spine 一个 slot 只挂一个) | approximated |
+| 几套具名皮肤的挂图物体同时亮着(取第一套当初始皮肤) | approximated |
 | SpriteSkin 节点不在根物体原点 | approximated |
+
+**还读不了的**(都会在上表里报出来,不静默):PSD Importer(`.psb`)做的角色 —— prefab 是导入时生成的,磁盘上没有,
+要解析 `.psb` 图层,Unity 官方 2D Animation 示例全是这种;SpriteLibrary + SpriteResolver 换装;Unity 2D IK。
+Sorting Layer 的先后取渲染器里缓存的 `m_SortingLayer` 值 —— 真正的顺序在工程的 TagManager 里,不在角色目录里。
 
 ### 16.5 ⚠️ 验收的参照物是 Unity 的规则,不是原 Spine
 
@@ -744,8 +770,23 @@ region 也读成四顶点 mesh。图集每个 sprite 一个区域(Unity 的矩�
 Blend Shape 加完再蒙皮),与读回来的 Spine 在同一时刻逐点比 —— setup、每条动画的关键帧、相邻关键帧的四分点和中点,0.05 像素;
 slot 颜色 1/255。原 Spine 只做 setup 粗检,容差按导出自己的分流判据(第 11 节)。
 
-另有一组「在 Unity 里改过」的用例:直接改文本(改关键帧值、插一个 Unity 默认切线的新关键帧、挪 prefab 里骨骼的位置),
-改动要落在对应的时间轴 / 骨骼上,逐点仍符合 Unity 的规则。
+除了顶点,还比**画了哪些、谁压着谁**:Spine 按 slot 挂的 attachment(当前皮肤 → 默认皮肤)和 drawOrder 铺出来,
+换成 Unity 那边的(物体, 图),与 Unity 按 `m_Enabled` / `m_IsActive` / `m_Sprite` / 排序规则算出的序列相等。
+
+用例:
+
+| 组 | 内容 |
+|---|---|
+| 我们导出的 7 个样本 | 3.8 / 4.1、加权 deform、全靠 deform、linkedmesh、6 套皮肤、100 个 region 换图 |
+| 在 Unity 里改过 | 改关键帧值、插一个 Unity 默认切线的新关键帧、挪 prefab 里骨骼的位置 |
+| 别人的角色常见的写法(在 MX2_cat 上改) | 给挂图物体打旋转关键帧、把骨骼拖到挂图物体下面、`m_IsActive` 曲线关掉一根骨骼、prefab 里关掉一个 GameObject、`m_Sprite` 换图、删掉 0 秒的键、clip 比最后一个键长、改 Order in Layer、加 Sorting Group,以及全部一起改 |
+| 真实的别人的角色 | 第三方插件 Easy Performant Outline 自带的 2D 演示角色:11 条动画全是 `m_Sprite` 逐帧换图,85 张 Single 模式贴图。另转成 Godot 场景,Godot 4.7 里自检通过、渲染逐帧正确 |
+
+这些用例**故意把读取器改坏过**(不让挂图物体变骨骼、不补 0 秒的键、不看 `m_IsActive`、不看 `m_Sprite`、不撑时长),
+每一处都有用例变红 —— 不是空转的绿。
+
+⚠️ 排序里 Sorting Group / Sorting Layer / z 三条是照 Unity 文档写的,读取器和参照物用的是同一套理解,**没有在 Unity 里实测**
+(样本里没有用到它们的角色)。显示规则(`m_Enabled` × 各级 `m_IsActive`)和 `m_Sprite` 逐帧换图有真实角色兜着。
 
 ## 17. 待确认
 

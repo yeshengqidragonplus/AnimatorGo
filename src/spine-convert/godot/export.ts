@@ -297,9 +297,17 @@ function floatTrack(
 
 /** 离散值轨道,相邻相同的值合并 */
 function stepTrack(path: string, steps: readonly { t: number; v: G.GodotValue }[]): Track {
+  // 同一时刻的几步只留最后一步。⚠️ 实测:Godot 在恰好那一刻取的是**第一个**键 —— 0 秒先写 setup 值、再写第一帧的话,
+  // 动画开头(以及每次循环回到 0)那一帧两张图一起亮
+  const merged: { t: number; v: G.GodotValue }[] = []
+  for (const s of steps) {
+    const last = merged[merged.length - 1]
+    if (last !== undefined && Math.abs(last.t - s.t) < 1e-9) last.v = s.v
+    else merged.push({ ...s })
+  }
   const times: number[] = []
   const values: G.GodotValue[] = []
-  for (const s of steps) {
+  for (const s of merged) {
     if (values.length > 0 && JSON.stringify(values[values.length - 1]) === JSON.stringify(s.v)) continue
     times.push(s.t)
     values.push(s.v)
@@ -307,10 +315,30 @@ function stepTrack(path: string, steps: readonly { t: number; v: G.GodotValue }[
   return { path, kind: 'value', discrete: true, times, values }
 }
 
+/**
+ * 写出来时刻相同(7 位有效数字)的键只留最后一个。来源不同的时刻(某条时间轴的关键帧、另一条的「下一帧前 ε」、
+ * 采样网格)在 double 里差一丁点,写进 .tscn 就成了同一时刻的两个键 —— Godot 在恰好那一刻取第一个,
+ * Spine 取后一个
+ */
+function distinctTimes(t: Track): Track {
+  const keep: number[] = []
+  t.times.forEach((time, k) => {
+    if (keep.length > 0 && G.formatNumber(t.times[keep[keep.length - 1]!]!) === G.formatNumber(time)) keep[keep.length - 1] = k
+    else keep.push(k)
+  })
+  if (keep.length === t.times.length) return t
+  return {
+    ...t,
+    times: keep.map((k) => t.times[k]!),
+    values: keep.map((k) => t.values[k]!),
+    ...(t.handles === undefined ? {} : { handles: keep.map((k) => t.handles![k]!) }),
+  }
+}
+
 function animationResource(id: string, name: string, length: number, loop: boolean, tracks: readonly Track[]): G.SubResourceDecl {
   const props: [string, G.GodotValue][] = [['resource_name', name], ['length', G.float(Math.max(length, 0.001))]]
   if (loop) props.push(['loop_mode', 1])
-  tracks.forEach((t, i) => {
+  tracks.map(distinctTimes).forEach((t, i) => {
     const p = `tracks/${i}`
     props.push([`${p}/type`, t.kind], [`${p}/imported`, false], [`${p}/enabled`, true], [`${p}/path`, G.nodePath(t.path)])
     if (t.kind === 'value') {

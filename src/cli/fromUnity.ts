@@ -1,11 +1,12 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { basename, join, relative, resolve } from 'node:path'
+import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
+import { basename, join, resolve } from 'node:path'
 import { importUnity } from '../spine-convert/unity-import/readUnity.ts'
 import { fromJson } from '../spine-format/json/fromJson.ts'
 import { writeAtlas } from '../core/atlas.ts'
 import { exportToGodot } from '../spine-convert/godot/export.ts'
 import type { ConversionIssue } from '../spine-convert/types.ts'
 import { findGodotProject, godotResDir } from './godotProject.ts'
+import { readUnityDir } from './unityDir.ts'
 
 /**
  * Unity 产物 → Spine / Godot 的命令行入口。
@@ -14,8 +15,10 @@ import { findGodotProject, godotResDir } from './godotProject.ts'
  * pnpm from-unity <Unity 产物目录> --to godot|json [--out 目录] [--ppu 100] [--skin 初始皮肤]
  * ```
  *
- * 读的是我们自己导出(`pnpm unity`)、可能又在 Unity 里改过的一个骨架目录:prefab + `.anim` + controller +
- * 贴图 / Mesh / 材质及其 `.meta`。`--ppu` 要与导出时一致。
+ * 读一个 Unity 角色目录:正好一个 prefab,加上 `.anim` + controller + 贴图 / Mesh / 材质及其 `.meta`。
+ * 我们导出(`pnpm unity`)、又在 Unity 里改过的可以读;别人做的(骨骼上直接挂图、`m_IsActive` 显隐、
+ * `m_Sprite` 逐帧换图)也可以读。`--ppu` 要与导出时一致;别人的角色就是想要的 Spine 像素 / Unity 单位。
+ * `--skin` 不给就用 prefab 里亮着的那套皮肤。
  *
  * - `--to godot`:Godot 4 场景(`pnpm godot` 同一个写出器)
  * - `--to json`:Spine 4.1 JSON + `.atlas` + 贴图
@@ -55,24 +58,6 @@ function parseArgs(argv: readonly string[]): Options | string {
   return { input: resolved, to, out: resolve(flags.get('out') ?? `${resolved}_${to}`), ppu, skin: flags.get('skin') ?? null }
 }
 
-/** 目录里的所有文件,键是相对路径(正斜杠) */
-function readDir(root: string): Map<string, string | Uint8Array> {
-  const out = new Map<string, string | Uint8Array>()
-  const walk = (dir: string) => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const full = join(dir, entry.name)
-      if (entry.isDirectory()) walk(full)
-      else {
-        const rel = relative(root, full).split('\\').join('/')
-        const bytes = readFileSync(full)
-        out.set(rel, /\.(png|jpg|jpeg)$/i.test(rel) ? new Uint8Array(bytes) : bytes.toString('utf8'))
-      }
-    }
-  }
-  walk(root)
-  return out
-}
-
 const MARKS: Record<string, string> = { loss: '✗', approximated: '≈', info: 'ℹ' }
 const describe = (issue: ConversionIssue) => `  ${MARKS[issue.level] ?? '·'} ${issue.path}:${issue.message}`
 
@@ -83,7 +68,7 @@ function main(): void {
     process.exitCode = 1
     return
   }
-  const files = readDir(parsed.input)
+  const files = readUnityDir(parsed.input)
   const imported = importUnity(files, { pixelsPerUnit: parsed.ppu })
   const name = [...files.keys()].find((p) => p.endsWith('.prefab'))!.replace(/^.*\//, '').replace(/\.prefab$/, '')
   // 自检:写出的 Spine JSON 要能被自己的读取器读通
@@ -105,7 +90,7 @@ function main(): void {
     const result = exportToGodot(part, imported.atlas, imported.sources, {
       name,
       resDir: godotResDir(findGodotProject(dir), dir),
-      ...(parsed.skin === null ? {} : { skin: parsed.skin }),
+      ...((parsed.skin ?? imported.initialSkin) === null ? {} : { skin: (parsed.skin ?? imported.initialSkin)! }),
     })
     for (const out of result.files) writeFileSync(join(dir, out.path), typeof out.content === 'string' ? out.content : Buffer.from(out.content))
     for (const issue of result.issues) console.log(describe(issue))

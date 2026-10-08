@@ -2,21 +2,28 @@ import type { Atlas, AtlasPage, AtlasRegion } from '../../core/atlas.ts'
 import { decodePng, type Image } from '../../unity/png.ts'
 import { parseMesh } from '../../unity/writeMesh.ts'
 import { SPRITE_SKIN_SCRIPT_GUID } from '../../unity/writePrefab.ts'
-import { list, map, num, parseUnityYaml, parseYamlDocument, ref, str, vec, type UnityObject, type YamlMap, type YamlValue } from '../../unity/yaml.ts'
+import { spriteRecord } from '../../unity/spriteMeta.ts'
+import { list, map, num, parseUnityYaml, parseYamlDocument, ref, str, vec, type UnityObject, type UnityRef, type YamlMap, type YamlValue } from '../../unity/yaml.ts'
 import { IssueCollector, type ConversionIssue } from '../types.ts'
 import { drawOrderOf } from '../../spine-eval/drawOrder.ts'
 import { align, frameCurve, readHermite, toSpineKeys, valueAt, type SpineKey } from './curves.ts'
 
 /**
- * Unity 产物(我们导出、可能又在 Unity 里改过的)→ Spine 4.1 JSON。
+ * Unity 角色(我们导出、在 Unity 里改过的,或者别的工具 / 手工在 Unity 里做的)→ Spine 4.1 JSON。
  *
  * 输出 Spine JSON 而不是直接拼中转模型:`fromJson` 已经拿真实文件逐项对过,字符串表下标这些细节交给它;
  * 顺带 Unity → Spine 也就有了。再接 Godot 写出器就是 Unity → Godot。
  *
- * ## 认的结构(与 spine-convert/unity/export.ts 写出的一致)
+ * ## 结构
  *
- * - 根物体下,**不带渲染器的 Transform 是骨骼**,带 SpriteRenderer / SkinnedMeshRenderer 的是挂图节点
- * - 挂图节点名 `<slot>[__<键名>][#<帧>][@<皮肤>]`;绘制顺序取渲染器的 `m_SortingOrder`
+ * - 一个目录一个角色:正好一个 `.prefab`,根物体是角色本身(它的变换是摆在场景里的位置,不算骨骼)
+ * - **骨骼**:不带渲染器的物体;带渲染器的物体下面挂着东西、被变换曲线驱动、或被蒙皮引用时也是骨骼
+ *   (别人做的角色常把图直接挂在骨骼上)
+ * - **slot**:每个带 SpriteRenderer / SkinnedMeshRenderer 的物体。我们导出的物体名 `<slot>[__<键名>][#<帧>][@<皮肤>]`
+ *   会把几个物体合成一个 slot —— 合不起来的(setup 时同时亮着、或挂在不同骨骼上)按物体各自成 slot
+ * - **显示** = 渲染器 `m_Enabled` 且自己和各级父物体 `m_IsActive`(Unity 的规则);`m_Sprite` 曲线换图,每张图一个 attachment。
+ *   我们导出的多皮肤角色里,挂图物体自己的 `m_IsActive` 是皮肤那一维,交给 Spine 的皮肤
+ * - **绘制顺序**:Sorting Group → Sorting Layer → Order in Layer → z(离镜头远的先画)→ 层级先后
  * - 位置单位是 Unity 单位,×`pixelsPerUnit` 换回 Spine 像素(导出时的 `--ppu`,默认 100)
  *
  * ## 几何全部转成 Spine 的 mesh(region 也是四顶点 mesh),都是精确的
@@ -31,8 +38,9 @@ import { align, frameCurve, readHermite, toSpineKeys, valueAt, type SpineKey } f
  *
  * ## 曲线
  *
- * Unity 的 Hermite 切线逐段精确变成 Spine 4.x 的贝塞尔(curves.ts)。换图 = 各挂图节点 `m_Enabled`;
- * 颜色四通道对齐关键帧(贝塞尔精确细分);逐帧绘制顺序 = `m_SortingOrder`。
+ * Unity 的 Hermite 切线逐段精确变成 Spine 4.x 的贝塞尔(curves.ts)。第一个键不在 0 秒的,0 秒补一个同值的键
+ * (Unity 在第一个键之前取第一个键的值,Spine 取 setup)。clip 比最后一个键长的,末尾补一个不改变任何东西的
+ * 绘制顺序帧把时长撑回来(Spine 的时长 = 最后一个键)。
  */
 
 export interface UnityImportOptions {
@@ -47,8 +55,13 @@ export interface UnityImportResult {
   /** 图集页名 → 图像 */
   readonly sources: Map<string, Image>
   readonly issues: readonly ConversionIssue[]
-  /** 每个挂图节点(相对根物体的路径)读成了哪个 slot / 键名 / 皮肤 —— 排查与验收用 */
-  readonly nodes: readonly { readonly path: string; readonly slot: string; readonly key: string; readonly skin: string }[]
+  /**
+   * 每个挂图物体(相对根物体的路径)的每张图读成了哪个 slot / 键名 / 皮肤 —— 排查与验收用。
+   * `sprite` 是贴图引用 `guid:fileID`(SkinnedMeshRenderer 为 null)
+   */
+  readonly nodes: readonly { readonly path: string; readonly slot: string; readonly key: string; readonly skin: string; readonly sprite: string | null }[]
+  /** prefab 里亮着的那套具名皮肤(没有就是 null,用默认皮肤) */
+  readonly initialSkin: string | null
 }
 
 type Json = Record<string, unknown>
@@ -77,16 +90,19 @@ const trs = (x: number, y: number, deg: number, sx: number, sy: number): Affine 
 }
 const hex2 = (v: number) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0')
 const round = (v: number) => Math.round(v * 1e5) / 1e5
-
-/** 小端 uint32 的十六进制串 → 三角形下标 */
-function decodeIndices(hex: string): number[] {
-  const out: number[] = []
-  for (let i = 0; i + 8 <= hex.length; i += 8) {
-    const b = hex.slice(i, i + 8)
-    out.push(parseInt(b.slice(6, 8) + b.slice(4, 6) + b.slice(2, 4) + b.slice(0, 2), 16))
-  }
-  return out
+const spriteId = (r: UnityRef): string | null => (r.guid === null || r.fileID === '0' ? null : `${r.guid}:${r.fileID}`)
+/** 依次比较:Sorting Group 链上每一层、再到渲染器自己的 [层, 序, −z, 层级先后] */
+const compareKeys = (p: readonly number[], q: readonly number[]) => {
+  for (let i = 0; i < Math.min(p.length, q.length); i++) if (p[i] !== q[i]) return p[i]! - q[i]!
+  return p.length - q.length
 }
+
+/** Unity 的 classID */
+const CLASS_GAME_OBJECT = 1
+const CLASS_SKINNED_MESH_RENDERER = 137
+const CLASS_SORTING_GROUP = 210
+const CLASS_SPRITE_RENDERER = 212
+const TRANSFORM_CURVES = ['m_PositionCurves', 'm_EulerCurves', 'm_ScaleCurves', 'm_RotationCurves'] as const
 
 interface NodeName {
   readonly slot: string
@@ -119,6 +135,8 @@ interface TransformNode {
   readonly components: UnityObject[]
   /** 相对根物体的路径(动画曲线的 path) */
   path: string
+  /** 层级里的先后(深度优先) */
+  index: number
 }
 
 export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, options: UnityImportOptions = {}): UnityImportResult {
@@ -163,6 +181,7 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
       t: o,
       components: list(go.data['m_Component']).map((c) => byId.get(ref(map(c)['component']).fileID)).filter((c): c is UnityObject => c !== undefined),
       path: '',
+      index: 0,
     })
   }
   const roots = [...nodes.values()].filter((n) => n.parent === null)
@@ -171,6 +190,7 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
   const order: TransformNode[] = []
   const walk = (n: TransformNode, path: string) => {
     n.path = path
+    n.index = order.length
     order.push(n)
     for (const c of n.children) {
       const child = nodes.get(c)
@@ -178,9 +198,18 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
     }
   }
   walk(container, '')
-  const byPath = new Map(order.map((n) => [n.path, n]))
+  // 同名兄弟的路径相同:Unity 的曲线绑定到第一个
+  const byPath = new Map<string, TransformNode>()
+  for (const n of order) if (!byPath.has(n.path)) byPath.set(n.path, n)
   const renderer = (n: TransformNode) => n.components.find((c) => c.type === 'SpriteRenderer' || c.type === 'SkinnedMeshRenderer')
   const spriteSkin = (n: TransformNode) => n.components.find((c) => c.type === 'MonoBehaviour' && ref(c.data['m_Script']).guid === SPRITE_SKIN_SCRIPT_GUID)
+  const parentOf = (n: TransformNode) => (n.parent === null ? undefined : nodes.get(n.parent))
+  /** 自己和各级父物体(不含根物体),由内到外 */
+  const chainOf = (n: TransformNode): TransformNode[] => {
+    const out: TransformNode[] = []
+    for (let m: TransformNode | undefined = n; m !== undefined && m !== container; m = parentOf(m)) out.push(m)
+    return out
+  }
 
   // 局部 / 相对根物体的矩阵(Unity 单位)
   const localOf = (n: TransformNode): Affine => {
@@ -199,25 +228,69 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
     worldCache.set(n.id, w)
     return w
   }
+  /** 相对根物体的 z(只用来排绘制顺序) */
+  const zOf = (n: TransformNode): number => {
+    let z = 0
+    const chain = chainOf(n).reverse()
+    let scale = 1
+    for (const m of chain) {
+      z += vec(m.t.data['m_LocalPosition']).z * scale
+      scale *= vec(m.t.data['m_LocalScale']).z || 1
+    }
+    return z
+  }
+
+  // ── 动画 clip:先解析 —— 哪些物体被变换曲线驱动,决定它是不是骨骼 ──
+  const clipOrder = controllerOrder(files, text, pathOfGuid)
+  const clipPaths = [...files.keys()].filter((p) => p.endsWith('.anim'))
+  clipPaths.sort((a, b) => (clipOrder.get(a) ?? 1e9) - (clipOrder.get(b) ?? 1e9) || a.localeCompare(b))
+  const clips = clipPaths
+    .map((p) => parseUnityYaml(text(p)).find((o) => o.type === 'AnimationClip'))
+    .filter((c): c is UnityObject => c !== undefined)
+    .map((c) => ({ name: str(c.data['m_Name']), data: c.data }))
+    // 皮肤 clip(我们导出的多皮肤角色,只写 m_IsActive)是皮肤的实现细节,不是动画
+    .filter((c) => !c.name.includes('@skin@'))
+  const transformDriven = new Set<string>()
+  /** 物体 id → m_Sprite 曲线里出现过的图 */
+  const curveSprites = new Map<string, UnityRef[]>()
+  for (const c of clips) {
+    for (const field of TRANSFORM_CURVES) for (const e of list(c.data[field]).map(map)) transformDriven.add(str(e['path']))
+    for (const e of list(c.data['m_PPtrCurves']).map(map)) {
+      const n = byPath.get(str(e['path']))
+      if (n === undefined || str(e['attribute']) !== 'm_Sprite' || num(e['classID']) !== CLASS_SPRITE_RENDERER) continue
+      const refs = curveSprites.get(n.id) ?? []
+      curveSprites.set(n.id, refs)
+      for (const k of list(e['curve'])) refs.push(ref(map(k)['value']))
+    }
+  }
+  const referencedAsBone = new Set<string>()
+  for (const n of order) {
+    for (const t of list(spriteSkin(n)?.data['m_BoneTransforms'])) referencedAsBone.add(ref(t).fileID)
+    const r = renderer(n)
+    if (r?.type === 'SkinnedMeshRenderer') for (const b of list(r.data['m_Bones'])) referencedAsBone.add(ref(b).fileID)
+  }
 
   // ── 骨骼 ──
-  const boneNodes = order.filter((n) => n !== container && renderer(n) === undefined)
+  const isBone = (n: TransformNode) =>
+    n !== container &&
+    (renderer(n) === undefined || n.children.some((c) => nodes.has(c)) || transformDriven.has(n.path) || referencedAsBone.has(n.id))
+  const boneNodes = order.filter(isBone)
   const boneName = new Map<string, string>()
   const used = new Set<string>()
-  const claim = (wanted: string) => {
+  const claim = (taken: Set<string>, wanted: string) => {
     let name = wanted
-    for (let i = 2; used.has(name); i++) name = `${wanted}_${i}`
-    used.add(name)
+    for (let i = 2; taken.has(name); i++) name = `${wanted}_${i}`
+    taken.add(name)
     return name
   }
   const topBones = boneNodes.filter((n) => n.parent === container.id)
-  // Spine 只能有一根根骨骼:根物体下直接有几根骨骼时补一根
-  const syntheticRoot = topBones.length === 1 ? null : claim('root')
+  // Spine 只能有一根根骨骼:根物体下直接有几根骨骼(或一根都没有)时补一根
+  const syntheticRoot = topBones.length === 1 ? null : claim(used, 'root')
   const bones: Json[] = []
   if (syntheticRoot !== null) bones.push({ name: syntheticRoot })
   const setup = new Map<string, { x: number; y: number; rotation: number; scaleX: number; scaleY: number }>()
   for (const n of boneNodes) {
-    const name = claim(n.name)
+    const name = claim(used, n.name)
     boneName.set(n.id, name)
     const p = vec(n.t.data['m_LocalPosition'])
     const s = vec(n.t.data['m_LocalScale'])
@@ -225,7 +298,7 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
     const b: Json = { name }
     const parent = n.parent === container.id ? syntheticRoot : boneName.get(n.parent!)
     if (parent !== null && parent !== undefined) b['parent'] = parent
-    const firstChild = n.children.map((c) => nodes.get(c)).find((c) => c !== undefined && renderer(c) === undefined)
+    const firstChild = n.children.map((c) => nodes.get(c)).find((c) => c !== undefined && isBone(c))
     if (firstChild !== undefined) {
       const cp = vec(firstChild.t.data['m_LocalPosition'])
       const length = Math.hypot(cp.x, cp.y) * ppu
@@ -240,12 +313,22 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
     setup.set(n.id, { x: p.x * ppu, y: p.y * ppu, rotation, scaleX: s.x, scaleY: s.y })
   }
   const rootBoneName = syntheticRoot ?? boneName.get(topBones[0]!.id)!
+  // 骨骼名 → JSON 里的下标(加权顶点按下标引用)
+  const boneIndexOf = (name: string): number => bones.findIndex((b) => b['name'] === name)
+  const boneWorld = (name: string): Affine => {
+    const id = [...boneName.entries()].find(([, v]) => v === name)?.[0]
+    return id === undefined ? IDENTITY : worldOf(nodes.get(id)!)
+  }
+  /** 挂图物体的 slot 挂在哪根骨骼上:自己是骨骼就挂自己,否则挂父物体 */
+  const slotBoneOf = (n: TransformNode) =>
+    boneName.get(n.id) ?? (n.parent !== null && boneName.has(n.parent) ? boneName.get(n.parent)! : rootBoneName)
 
   // ── 贴图:guid → 页 ──
   const pages: AtlasPage[] = []
   const sources = new Map<string, Image>()
   const regions = new Map<string, AtlasRegion>()
-  const textureMeta = new Map<string, { meta: YamlMap; page: AtlasPage; ppuTex: number }>()
+  const regionOfSprite = new Map<string, string>()
+  const textureMeta = new Map<string, { meta: YamlMap; page: AtlasPage; ppuTex: number; name: string }>()
   const pageOfGuid = (guid: string | null, where: string) => {
     if (guid === null) return null
     const hit = textureMeta.get(guid)
@@ -262,110 +345,167 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
     pages.push(page)
     sources.set(pageName, image)
     const meta = map(parseYamlDocument(text(`${path}.meta`))['TextureImporter'])
-    const entry = { meta, page, ppuTex: num(meta['spritePixelsToUnits'], 100) }
+    const entry = { meta, page, ppuTex: num(meta['spritePixelsToUnits'], 100), name: pageName.replace(/\.[^.]*$/, '') }
     textureMeta.set(guid, entry)
     return entry
   }
 
-  // ── 挂图节点 → slot / attachment ──
-  interface SlotInfo { name: string; bone: string; order: number; index: number; color: string | null; attachment: string | null }
+  // ── 挂图物体 → slot ──
+  const rendererNodes = order.filter((n) => renderer(n) !== undefined)
+  const activeSelf = (n: TransformNode) => str(n.go.data['m_IsActive']) !== '0'
+  const enabledSelf = (n: TransformNode) => str(renderer(n)!.data['m_Enabled']) !== '0'
+  /** 按 Unity 的规则 setup 时画不画:渲染器开着,自己和各级父物体都激活 */
+  const shownRaw = (n: TransformNode) => enabledSelf(n) && chainOf(n).every(activeSelf)
+  // 我们导出的物体名会把几个物体合成一个 slot。合不起来的组 —— setup 时同时亮着两个以上,或者(SkinnedMeshRenderer 之外)
+  // 挂在不同骨骼上 —— 说明名字不是这个约定(别人的角色里 `arm__L` 之类),组里的物体按名字各自成 slot
+  const parsed = new Map(rendererNodes.map((n) => [n.id, parseNodeName(n.name)]))
+  const groups = new Map<string, TransformNode[]>()
+  for (const n of rendererNodes) {
+    const p = parsed.get(n.id)!
+    const k = `group:${p.skin ?? ''}/${p.slot}`
+    groups.set(k, [...(groups.get(k) ?? []), n])
+  }
+  /** 物体 id → 组;拆开的物体各自一组 */
+  const groupOf = new Map<string, string>()
+  for (const [k, group] of groups) {
+    const rigidBones = new Set(group.filter((n) => renderer(n)!.type === 'SpriteRenderer' && spriteSkin(n) === undefined).map(slotBoneOf))
+    const split = group.length > 1 && (group.filter(shownRaw).length > 1 || rigidBones.size > 1)
+    for (const n of group) {
+      if (split) parsed.set(n.id, { slot: n.name, key: n.name, skin: null })
+      groupOf.set(n.id, split ? `split:${n.id}` : k)
+    }
+  }
+  // slot 名:不同皮肤里同名的 slot 是同一个;名字撞了的(别人的角色里左右手都叫 Hand)加后缀
+  const slotOfGroup = new Map<string, string>()
+  {
+    const taken = new Set<string>()
+    const shared = new Map<string, string>()
+    for (const n of rendererNodes) {
+      const g = groupOf.get(n.id)!
+      if (slotOfGroup.has(g)) continue
+      const p = parsed.get(n.id)!
+      const split = g.startsWith('split:')
+      const name = (split ? undefined : shared.get(p.slot)) ?? claim(taken, p.slot)
+      if (!split) shared.set(p.slot, name)
+      slotOfGroup.set(g, name)
+    }
+  }
+  const slotOfNode = new Map(rendererNodes.map((n) => [n.id, slotOfGroup.get(groupOf.get(n.id)!)!]))
+
+  interface SlotInfo { name: string; bone: string; rep: TransformNode; color: string | null; attachment: string | null }
   const slots = new Map<string, SlotInfo>()
   const skins = new Map<string, Json>()
-  /** 节点 id → (slot, 键名, 皮肤);动画按它把曲线归到 slot 上 */
-  const attachmentOf = new Map<string, { slot: string; key: string; skin: string }>()
+  /** 物体 id → slot / 皮肤 / 每张图的键名 */
+  const attachmentOf = new Map<string, { slot: string; skin: string; keyOfSprite: Map<string | null, string> }>()
   const skinnedMeshes = new Map<string, { shapes: { name: string; deltas: { index: number; x: number; y: number }[] }[]; bindposes: Affine[]; boneOfIndex: string[]; weights: { bone: number; weight: number }[][]; flatStart: number[] }>()
 
-  const nodeList = order.filter((n) => renderer(n) !== undefined)
-  nodeList.forEach((n, index) => {
-    const r = renderer(n)!
-    const parsed = parseNodeName(n.name)
-    const skin = parsed.skin ?? 'default'
-    const parentBone = n.parent !== null && boneName.has(n.parent) ? boneName.get(n.parent)! : rootBoneName
-    let slot = slots.get(parsed.slot)
-    if (slot === undefined) {
-      slot = { name: parsed.slot, bone: parentBone, order: num(r.data['m_SortingOrder']), index, color: null, attachment: null }
-      slots.set(parsed.slot, slot)
+  /** SpriteRenderer 的一张图 → Spine mesh(顶点在 slot 骨骼的局部坐标里) */
+  const spriteMesh = (n: TransformNode, sref: UnityRef, slotBone: string, where: string): { name: string; json: Json } | null => {
+    const tex = pageOfGuid(sref.guid, where)
+    if (tex === null) return null
+    const sprite = spriteRecord(tex.meta, sref.fileID, tex.name, tex.page)
+    if (sprite === null) {
+      issues.loss(where, `贴图 ${tex.page.name} 里找不到 sprite(fileID ${sref.fileID})`)
+      return null
     }
-    const enabled = str(r.data['m_Enabled']) !== '0'
-    if (enabled && skin === 'default' && slot.attachment === null) slot.attachment = parsed.key
+    const { width: rw, height: rh } = sprite.rect
+    // 区域名按图唯一:别人的角色里不同贴图常有同名的 sprite
+    const id = spriteId(sref)!
+    let regionName = regionOfSprite.get(id)
+    if (regionName === undefined) {
+      regionName = sprite.name
+      for (let i = 2; regions.has(regionName); i++) regionName = `${sprite.name}_${i}`
+      regionOfSprite.set(id, regionName)
+      regions.set(regionName, {
+        name: regionName, page: tex.page.name,
+        x: sprite.rect.x, y: tex.page.height - sprite.rect.y - rh, width: rw, height: rh,
+        rotate: 0, offsetX: 0, offsetY: 0, originalWidth: rw, originalHeight: rh, index: -1,
+      })
+    }
+    const uvs = sprite.vertices.flatMap((v) => [round(v.x / rw), round(1 - v.y / rh)])
+    const local = sprite.vertices.map((v) => ({ x: (v.x - sprite.pivot.x) / tex.ppuTex, y: (v.y - sprite.pivot.y) / tex.ppuTex }))
+    const skinComp = spriteSkin(n)
+    let vertices: number[]
+    if (skinComp !== undefined) {
+      // 加权:sprite 骨骼的绑定 —— 根骨骼减 pivot,子骨骼相对父骨骼(writeMeta.ts 开头那三条约定)
+      const binds: Affine[] = []
+      sprite.bones.forEach((b, i) => {
+        const pos = map(b['position'])
+        const parentId = num(b['parentId'], -1)
+        const deg = zDegrees(vec(b['rotation']))
+        const isRoot = parentId < 0
+        const x = (num(pos['x']) - (isRoot ? sprite.pivot.x : 0)) / tex.ppuTex
+        const y = (num(pos['y']) - (isRoot ? sprite.pivot.y : 0)) / tex.ppuTex
+        binds[i] = isRoot ? trs(x, y, deg, 1, 1) : mul(binds[parentId]!, trs(x, y, deg, 1, 1))
+      })
+      const boneTransforms = list(skinComp.data['m_BoneTransforms']).map((t) => ref(t).fileID)
+      const nodeWorld = worldOf(n)
+      if (Math.hypot(nodeWorld.x, nodeWorld.y) > 1e-6 || Math.abs(nodeWorld.a - 1) > 1e-6 || Math.abs(nodeWorld.b) > 1e-6) {
+        issues.add('approximated', where, 'SpriteSkin 节点不在根物体原点,按原点处理')
+      }
+      vertices = []
+      local.forEach((v, i) => {
+        const w = sprite.weights[i] ?? {}
+        const infl: number[] = []
+        for (let k = 0; k < 4; k++) {
+          const weight = num(w[`weight[${k}]`])
+          if (weight <= 0) continue
+          const bi = num(w[`boneIndex[${k}]`])
+          const target = boneName.get(boneTransforms[bi] ?? '')
+          if (target === undefined || binds[bi] === undefined) continue
+          const l = apply(inverse(binds[bi]!), v.x, v.y)
+          infl.push(boneIndexOf(target), round(l.x * ppu), round(l.y * ppu), round(weight))
+        }
+        vertices.push(infl.length / 4, ...infl)
+      })
+    } else {
+      // 不加权:骨骼局部 = 骨骼世界⁻¹ · 节点世界 · 顶点
+      const toBone = mul(inverse(slotBone === rootBoneName && syntheticRoot !== null ? IDENTITY : boneWorld(slotBone)), worldOf(n))
+      vertices = local.flatMap((v) => { const p = apply(toBone, v.x, v.y); return [round(p.x * ppu), round(p.y * ppu)] })
+    }
+    return { name: sprite.name, json: { type: 'mesh', path: regionName, uvs, triangles: [...sprite.indices], vertices, hull: 0, width: rw, height: rh } }
+  }
+
+  for (const n of rendererNodes) {
+    const r = renderer(n)!
+    const p = parsed.get(n.id)!
+    const slotName = slotOfNode.get(n.id)!
+    const skin = p.skin ?? 'default'
+    const slotBone = slotBoneOf(n)
+    let slot = slots.get(slotName)
+    if (slot === undefined) {
+      slot = { name: slotName, bone: slotBone, rep: n, color: null, attachment: null }
+      slots.set(slotName, slot)
+    }
     const skinJson = skins.get(skin) ?? {}
     skins.set(skin, skinJson)
-    const bySlot = (skinJson[parsed.slot] as Json | undefined) ?? {}
-    skinJson[parsed.slot] = bySlot
-    let key = parsed.key
-    for (let i = 2; key in bySlot; i++) key = `${parsed.key}_${i}`
-    attachmentOf.set(n.id, { slot: parsed.slot, key, skin })
+    const bySlot = (skinJson[slotName] as Json | undefined) ?? {}
+    skinJson[slotName] = bySlot
+    const uniqueKey = (wanted: string) => {
+      let key = wanted
+      for (let i = 2; key in bySlot; i++) key = `${wanted}_${i}`
+      return key
+    }
+    const keyOfSprite = new Map<string | null, string>()
+    attachmentOf.set(n.id, { slot: slotName, skin, keyOfSprite })
     const where = `node.${n.path}`
 
     if (r.type === 'SpriteRenderer') {
       const c = rgbaOf(r.data['m_Color'])
-      const color = `${hex2(c.r)}${hex2(c.g)}${hex2(c.b)}${hex2(c.a)}`
-      if (slot.color === null) slot.color = color
-      const sref = ref(r.data['m_Sprite'])
-      const tex = pageOfGuid(sref.guid, where)
-      if (tex === null) return
-      const sprite = list(map(tex.meta['spriteSheet'])['sprites']).map(map).find((s) => str(s['internalID']) === sref.fileID)
-      if (sprite === undefined) {
-        issues.loss(where, `贴图里找不到 sprite(internalID ${sref.fileID})`)
-        return
+      if (slot.color === null) slot.color = `${hex2(c.r)}${hex2(c.g)}${hex2(c.b)}${hex2(c.a)}`
+      const setupSprite = ref(r.data['m_Sprite'])
+      const swaps = curveSprites.get(n.id) ?? []
+      // 有换图曲线的物体,每张图一个 attachment,按图名;没有的就是物体名里的键名
+      const all = new Map<string, UnityRef>()
+      for (const s of [setupSprite, ...swaps]) { const id = spriteId(s); if (id !== null && !all.has(id)) all.set(id, s) }
+      for (const [id, sref] of all) {
+        const mesh = spriteMesh(n, sref, slotBone, where)
+        if (mesh === null) continue
+        const key = uniqueKey(swaps.length > 0 ? mesh.name : p.key)
+        bySlot[key] = mesh.json
+        keyOfSprite.set(id, key)
       }
-      const rect = map(sprite['rect'])
-      const rw = num(rect['width']), rh = num(rect['height'])
-      const pivot = map(sprite['pivot'])
-      const px = num(pivot['x'], 0.5) * rw, py = num(pivot['y'], 0.5) * rh
-      const regionName = str(sprite['name'])
-      regions.set(regionName, {
-        name: regionName, page: tex.page.name,
-        x: num(rect['x']), y: tex.page.height - num(rect['y']) - rh, width: rw, height: rh,
-        rotate: 0, offsetX: 0, offsetY: 0, originalWidth: rw, originalHeight: rh, index: -1,
-      })
-      const verts = list(sprite['vertices']).map((v) => ({ x: num(map(v)['x']), y: num(map(v)['y']) }))
-      const triangles = decodeIndices(str(sprite['indices']))
-      const uvs = verts.flatMap((v) => [round(v.x / rw), round(1 - v.y / rh)])
-      const local = verts.map((v) => ({ x: (v.x - px) / tex.ppuTex, y: (v.y - py) / tex.ppuTex }))
-      const skinComp = spriteSkin(n)
-      let vertices: number[]
-      if (skinComp !== undefined) {
-        // 加权:sprite 骨骼的绑定 —— 根骨骼减 pivot,子骨骼相对父骨骼(writeMeta.ts 开头那三条约定)
-        const spriteBones = list(sprite['bones']).map(map)
-        const binds: Affine[] = []
-        spriteBones.forEach((b, i) => {
-          const pos = map(b['position'])
-          const parentId = num(b['parentId'], -1)
-          const deg = zDegrees(vec(b['rotation']))
-          const isRoot = parentId < 0
-          const x = (num(pos['x']) - (isRoot ? px : 0)) / tex.ppuTex
-          const y = (num(pos['y']) - (isRoot ? py : 0)) / tex.ppuTex
-          binds[i] = isRoot ? trs(x, y, deg, 1, 1) : mul(binds[parentId]!, trs(x, y, deg, 1, 1))
-        })
-        const boneTransforms = list(skinComp.data['m_BoneTransforms']).map((t) => ref(t).fileID)
-        const nodeWorld = worldOf(n)
-        if (Math.hypot(nodeWorld.x, nodeWorld.y) > 1e-6 || Math.abs(nodeWorld.a - 1) > 1e-6 || Math.abs(nodeWorld.b) > 1e-6) {
-          issues.add('approximated', where, 'SpriteSkin 节点不在根物体原点,按原点处理')
-        }
-        const weights = list(sprite['weights']).map(map)
-        vertices = []
-        local.forEach((v, i) => {
-          const w = weights[i] ?? {}
-          const infl: number[] = []
-          for (let k = 0; k < 4; k++) {
-            const weight = num(w[`weight[${k}]`])
-            if (weight <= 0) continue
-            const bi = num(w[`boneIndex[${k}]`])
-            const target = boneName.get(boneTransforms[bi] ?? '')
-            if (target === undefined || binds[bi] === undefined) continue
-            const l = apply(inverse(binds[bi]!), v.x, v.y)
-            infl.push(boneIndexOf(target), round(l.x * ppu), round(l.y * ppu), round(weight))
-          }
-          vertices.push(infl.length / 4, ...infl)
-        })
-      } else {
-        // 不加权:骨骼局部 = 骨骼世界⁻¹ · 节点世界 · 顶点
-        const toBone = mul(inverse(parentBone === rootBoneName && syntheticRoot !== null ? IDENTITY : boneWorld(parentBone)), worldOf(n))
-        vertices = local.flatMap((v) => { const p = apply(toBone, v.x, v.y); return [round(p.x * ppu), round(p.y * ppu)] })
-      }
-      bySlot[key] = { type: 'mesh', path: regionName, uvs, triangles, vertices, hull: 0, width: rw, height: rh }
-      return
+      continue
     }
 
     // ── SkinnedMeshRenderer ──
@@ -373,14 +513,14 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
     const meshPath = meshGuid === null ? undefined : pathOfGuid.get(meshGuid)
     if (meshPath === undefined || !files.has(meshPath)) {
       issues.loss(where, 'SkinnedMeshRenderer 引用的 Mesh 不在目录里')
-      return
+      continue
     }
     const mesh = parseMesh(text(meshPath))
     const materialGuid = ref(list(r.data['m_Materials'])[0]).guid
     const materialPath = materialGuid === null ? undefined : pathOfGuid.get(materialGuid)
     const texGuid = materialPath === undefined ? null : textureOfMaterial(text(materialPath))
     const tex = pageOfGuid(texGuid, where)
-    if (tex === null) return
+    if (tex === null) continue
     const regionName = `${prefabName}#${n.name}`
     regions.set(regionName, {
       name: regionName, page: tex.page.name, x: 0, y: 0, width: tex.page.width, height: tex.page.height,
@@ -392,51 +532,77 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
     const vertices: number[] = []
     const flatStart: number[] = []
     let flat = 0
-    mesh.positions.forEach((p, i) => {
+    mesh.positions.forEach((q, i) => {
       const ws = (weights[i] ?? []).filter((w) => w.weight > 0)
       flatStart.push(flat)
       vertices.push(ws.length)
       for (const w of ws) {
-        const l = apply(mesh.bindposes[w.bone] ?? IDENTITY, p.x, p.y)
+        const l = apply(mesh.bindposes[w.bone] ?? IDENTITY, q.x, q.y)
         vertices.push(boneIndexOf(boneOfIndex[w.bone]!), round(l.x * ppu), round(l.y * ppu), round(w.weight))
         flat += 2
       }
     })
     const c = mesh.colors[0]
     if (c !== undefined && slot.color === null) slot.color = `${hex2(c.r)}${hex2(c.g)}${hex2(c.b)}${hex2(c.a)}`
+    const key = uniqueKey(p.key)
     bySlot[key] = {
       type: 'mesh', path: regionName,
       uvs: mesh.uvs.flatMap((uv) => [round(uv.u), round(1 - uv.v)]),
       triangles: mesh.triangles, vertices, hull: 0,
     }
+    keyOfSprite.set(null, key)
     skinnedMeshes.set(n.id, { shapes: mesh.blendShapes, bindposes: mesh.bindposes, boneOfIndex, weights: weights.map((ws) => ws.filter((w) => w.weight > 0)), flatStart })
-  })
-
-  // 骨骼名 → JSON 里的下标(加权顶点按下标引用)
-  function boneIndexOf(name: string): number {
-    return bones.findIndex((b) => b['name'] === name)
   }
-  function boneWorld(name: string): Affine {
-    const id = [...boneName.entries()].find(([, v]) => v === name)?.[0]
-    return id === undefined ? IDENTITY : worldOf(nodes.get(id)!)
+  const setupSpriteOf = (n: TransformNode): string | null => (renderer(n)!.type === 'SpriteRenderer' ? spriteId(ref(renderer(n)!.data['m_Sprite'])) : null)
+
+  // ── 皮肤 ──
+  // 我们导出的多皮肤角色:具名皮肤的挂图物体只有初始皮肤的亮着;默认皮肤里被初始皮肤同 slot 同键名盖住的也灭着。
+  // 这两种物体自己的 m_IsActive 是「皮肤」那一维,交给 Spine 的皮肤,不当显隐读
+  const named = rendererNodes.filter((n) => attachmentOf.get(n.id)?.skin !== 'default' && attachmentOf.has(n.id))
+  const activeSkins = [...new Set(named.filter(activeSelf).map((n) => attachmentOf.get(n.id)!.skin))]
+  if (activeSkins.length > 1) issues.add('approximated', 'skin', `几套皮肤的挂图物体同时亮着(${activeSkins.join('、')}),初始皮肤取 ${activeSkins[0]}`)
+  const initialSkin = activeSkins[0] ?? null
+  const setupKeyOf = (n: TransformNode) => attachmentOf.get(n.id)?.keyOfSprite.get(setupSpriteOf(n))
+  const skinDimension = (n: TransformNode): boolean => {
+    const a = attachmentOf.get(n.id)
+    if (a === undefined) return false
+    if (a.skin !== 'default') return true
+    if (activeSelf(n)) return false
+    const key = setupKeyOf(n)
+    return named.some((m) => activeSelf(m) && attachmentOf.get(m.id)!.slot === a.slot && setupKeyOf(m) === key)
+  }
+  /** 显隐用的 m_IsActive:皮肤那一维的当作激活 */
+  const activeForShow = (n: TransformNode) => skinDimension(n) || activeSelf(n)
+  for (const n of rendererNodes) {
+    const a = attachmentOf.get(n.id)
+    const slot = slots.get(slotOfNode.get(n.id)!)!
+    if (a === undefined || slot.attachment !== null) continue
+    if (enabledSelf(n) && chainOf(n).every(activeForShow)) slot.attachment = setupKeyOf(n) ?? null
   }
 
-  // slot 顺序:sortingOrder,相同的按 prefab 里的先后
-  const slotList = [...slots.values()].sort((a, b) => a.order - b.order || a.index - b.index)
+  // ── 绘制顺序 ──
+  /** 排序键:外层 Sorting Group 到渲染器自己,每层 [Sorting Layer, Order in Layer, −z, 层级先后] */
+  const sortKeyOf = (n: TransformNode, orderAt: (m: TransformNode, cls: number) => number | undefined): number[] => {
+    const key: number[] = []
+    const levels = [container, ...chainOf(n).reverse()]
+    for (const m of levels) {
+      const group = m.components.find((c) => c.type === 'SortingGroup')
+      if (group === undefined || str(group.data['m_Enabled']) === '0') continue
+      key.push(num(group.data['m_SortingLayer']), orderAt(m, CLASS_SORTING_GROUP) ?? num(group.data['m_SortingOrder']), -zOf(m), m.index)
+    }
+    const r = renderer(n)!
+    key.push(num(r.data['m_SortingLayer']), orderAt(n, r.type === 'SpriteRenderer' ? CLASS_SPRITE_RENDERER : CLASS_SKINNED_MESH_RENDERER) ?? num(r.data['m_SortingOrder']), -zOf(n), n.index)
+    return key
+  }
+  const slotList = [...slots.values()].sort((a, b) => compareKeys(sortKeyOf(a.rep, () => undefined), sortKeyOf(b.rep, () => undefined)))
   const slotIndex = new Map(slotList.map((s, i) => [s.name, i]))
+  const slotNodes = new Map<string, TransformNode[]>()
+  for (const n of rendererNodes) slotNodes.set(slotOfNode.get(n.id)!, [...(slotNodes.get(slotOfNode.get(n.id)!) ?? []), n])
 
   // ── 动画 ──
-  const clipOrder = controllerOrder(files, text, pathOfGuid)
-  const clips = [...files.keys()].filter((p) => p.endsWith('.anim'))
-  clips.sort((a, b) => (clipOrder.get(a) ?? 1e9) - (clipOrder.get(b) ?? 1e9) || a.localeCompare(b))
   const animations: Json = {}
-  for (const clipPath of clips) {
-    const clip = parseUnityYaml(text(clipPath)).find((o) => o.type === 'AnimationClip')
-    if (clip === undefined) continue
-    const clipName = str(clip.data['m_Name'])
-    // 皮肤 clip(只写 m_IsActive)是皮肤的实现细节,不是动画
-    if (clipName.includes('@skin@')) continue
-    const animName = clipName.startsWith(`${prefabName}@`) ? clipName.slice(prefabName.length + 1) : clipName
+  for (const clip of clips) {
+    const animName = clip.name.startsWith(`${prefabName}@`) ? clip.name.slice(prefabName.length + 1) : clip.name
     issues.scoped(animName, () => {
       animations[animName] = readClip(clip.data)
     })
@@ -452,36 +618,41 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
       const r = Math.round(f)
       return Math.abs(f - r) < 1e-3 ? r / fps : t
     }
-    const hermite = (curve: YamlValue | undefined, component?: 'x' | 'y' | 'z') => readHermite(curve, component).map((k) => ({ ...k, time: snap(k.time) }))
-    const bonesOut: Json = {}
-    const boneAt = (path: string) => {
-      const n = byPath.get(path)
-      return n === undefined ? undefined : boneName.has(n.id) ? n : undefined
+    /** Unity 曲线 → Spine 的键。第一个键不在 0 秒的,0 秒补一个同值的键:Unity 在第一个键之前取它的值,Spine 取 setup */
+    const spineKeys = (curve: YamlValue | undefined, component?: 'x' | 'y' | 'z', transform?: (v: number) => number): SpineKey[] => {
+      const keys = toSpineKeys(readHermite(curve, component).map((k) => ({ ...k, time: snap(k.time) })), transform)
+      return keys.length > 0 && keys[0]!.time > 1e-9 ? [{ time: 0, value: keys[0]!.value, segment: { kind: 'linear' } }, ...keys] : keys
     }
+    const bonesOut: Json = {}
     const vectorCurves = (field: string, kind: 'translate' | 'rotate' | 'scale') => {
       for (const entry of list(data[field]).map(map)) {
         const path = str(entry['path'])
-        const n = boneAt(path)
-        if (n === undefined) {
-          issues.add('loss', `${field}.${path}`, '曲线指向的物体不是骨骼(或不存在),没转')
+        const n = byPath.get(path)
+        if (n === container) {
+          issues.add('loss', `${field}.(根物体)`, '根物体自己的变换动画没转 —— 根物体的位置是角色摆在场景里的位置,不是骨骼')
+          continue
+        }
+        if (n === undefined || !boneName.has(n.id)) {
+          issues.add('loss', `${field}.${path}`, '曲线指向的物体不存在,没转')
           continue
         }
         const s = setup.get(n.id)!
         const byKind = (bonesOut[boneName.get(n.id)!] as Json | undefined) ?? {}
         bonesOut[boneName.get(n.id)!] = byKind
         if (kind === 'rotate') {
-          const keys = toSpineKeys(hermite(entry['curve'], 'z'), (v) => v - s.rotation)
+          const keys = spineKeys(entry['curve'], 'z', (v) => v - s.rotation)
           byKind['rotate'] = keysToFrames([keys], (vs) => ({ value: vs[0] }))
         } else if (kind === 'translate') {
-          const [x, y] = align([
-            toSpineKeys(hermite(entry['curve'], 'x'), (v) => v * ppu - s.x),
-            toSpineKeys(hermite(entry['curve'], 'y'), (v) => v * ppu - s.y),
-          ])
+          const [x, y] = align([spineKeys(entry['curve'], 'x', (v) => v * ppu - s.x), spineKeys(entry['curve'], 'y', (v) => v * ppu - s.y)])
           byKind['translate'] = keysToFrames([x!, y!], (vs) => ({ x: vs[0], y: vs[1] }))
+          const z = readHermite(entry['curve'], 'z')
+          if (z.some((k) => Math.abs(k.value - z[0]!.value) > 1e-6)) {
+            issues.add('approximated', `m_PositionCurves.${path}`, 'z 坐标的动画没转 —— 2D 里它只影响同层同序的物体谁先画')
+          }
         } else {
           const [x, y] = align([
-            toSpineKeys(hermite(entry['curve'], 'x'), (v) => (s.scaleX === 0 ? v : v / s.scaleX)),
-            toSpineKeys(hermite(entry['curve'], 'y'), (v) => (s.scaleY === 0 ? v : v / s.scaleY)),
+            spineKeys(entry['curve'], 'x', (v) => (s.scaleX === 0 ? v : v / s.scaleX)),
+            spineKeys(entry['curve'], 'y', (v) => (s.scaleY === 0 ? v : v / s.scaleY)),
           ])
           byKind['scale'] = keysToFrames([x!, y!], (vs) => ({ x: vs[0], y: vs[1] }))
         }
@@ -495,40 +666,52 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
     }
     if (Object.keys(bonesOut).length > 0) out['bones'] = bonesOut
 
-    // 渲染器的曲线按节点归到 slot
-    const enabled = new Map<string, Map<string, SpineKey[]>>()
+    // 渲染器 / GameObject 的曲线:按物体 id 收
+    const enabledCurves = new Map<string, SpineKey[]>()
+    const activeCurves = new Map<string, SpineKey[]>()
+    const orderCurves = new Map<string, SpineKey[]>()
     const colors = new Map<string, Map<string, SpineKey[]>>()
-    const sorting = new Map<string, SpineKey[]>()
     const blend = new Map<string, Map<string, SpineKey[]>>()
     for (const entry of list(data['m_FloatCurves']).map(map)) {
       const path = str(entry['path'])
       const attribute = str(entry['attribute'])
+      const cls = num(entry['classID'])
       const n = byPath.get(path)
-      const att = n === undefined ? undefined : attachmentOf.get(n.id)
-      const keys = toSpineKeys(hermite(entry['curve']))
-      if (n === undefined || att === undefined) {
-        issues.add('loss', `${attribute}.${path}`, '曲线指向的物体不是挂图节点(或不存在),没转')
-        continue
-      }
-      if (attribute === 'm_Enabled') {
-        const perSlot = enabled.get(att.slot) ?? new Map()
-        enabled.set(att.slot, perSlot)
-        perSlot.set(n.id, keys)
-      } else if (attribute.startsWith('m_Color.')) {
+      const keys = spineKeys(entry['curve'])
+      const onRenderer = n !== undefined && attachmentOf.has(n.id) && (cls === CLASS_SPRITE_RENDERER || cls === CLASS_SKINNED_MESH_RENDERER)
+      if (n !== undefined && cls === CLASS_GAME_OBJECT && attribute === 'm_IsActive') {
+        if (n === container) issues.add('loss', 'm_IsActive.(根物体)', '根物体自己的显隐动画没转')
+        else activeCurves.set(n.id, keys)
+      } else if (n !== undefined && cls === CLASS_SORTING_GROUP && attribute === 'm_SortingOrder') {
+        orderCurves.set(`${n.id}|${cls}`, keys)
+      } else if (onRenderer && attribute === 'm_Enabled') {
+        enabledCurves.set(n.id, keys)
+      } else if (onRenderer && attribute === 'm_SortingOrder') {
+        orderCurves.set(`${n.id}|${cls}`, keys)
+      } else if (onRenderer && attribute.startsWith('m_Color.')) {
         const perNode = colors.get(n.id) ?? new Map()
         colors.set(n.id, perNode)
         perNode.set(attribute.slice('m_Color.'.length), keys)
-      } else if (attribute === 'm_SortingOrder') {
-        if (!sorting.has(att.slot)) sorting.set(att.slot, keys)
-      } else if (attribute.startsWith('blendShape.')) {
+      } else if (onRenderer && attribute.startsWith('blendShape.')) {
         const perNode = blend.get(n.id) ?? new Map()
         blend.set(n.id, perNode)
         perNode.set(attribute.slice('blendShape.'.length), keys)
-      } else if (attribute !== 'm_IsActive') {
-        issues.add('loss', `${attribute}.${path}`, `属性 ${attribute} 的曲线没转`)
+      } else {
+        issues.add('loss', `${attribute}.${path || '(根物体)'}`, n === undefined ? '曲线指向的物体不存在,没转' : `属性 ${attribute} 的曲线没转`)
       }
     }
-    if (list(data['m_PPtrCurves']).length > 0) issues.add('loss', 'm_PPtrCurves', '换 sprite 的曲线(m_Sprite)没转 —— 导出时换图用的是节点显隐')
+    /** 物体 id → m_Sprite 的阶梯键 */
+    const spriteCurves = new Map<string, { time: number; id: string | null }[]>()
+    for (const entry of list(data['m_PPtrCurves']).map(map)) {
+      const path = str(entry['path'])
+      const attribute = str(entry['attribute'])
+      const n = byPath.get(path)
+      if (n === undefined || attribute !== 'm_Sprite' || num(entry['classID']) !== CLASS_SPRITE_RENDERER || !attachmentOf.has(n.id)) {
+        issues.add('loss', `${attribute}.${path || '(根物体)'}`, `引用类曲线 ${attribute} 没转`)
+        continue
+      }
+      spriteCurves.set(n.id, list(entry['curve']).map(map).map((k) => ({ time: snap(num(k['time'])), id: spriteId(ref(k['value'])) })))
+    }
 
     const slotsOut: Json = {}
     const slotOut = (name: string) => {
@@ -536,13 +719,32 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
       slotsOut[name] = s
       return s
     }
-    // 换图:同一 slot 各节点的 m_Enabled 合成「这一刻挂哪个键名」
-    for (const [slotName, perNode] of enabled) {
-      const times = [...new Set([...perNode.values()].flatMap((k) => k.map((x) => x.time)))].sort((a, b) => a - b)
+    // 换图:按 Unity 的规则逐个物体算「这一刻画不画、画哪张图」,合成这个 slot 挂哪个键名
+    const enabledAt = (n: TransformNode, t: number) => { const k = enabledCurves.get(n.id); return k === undefined ? enabledSelf(n) : valueAt(k, t) >= 0.5 }
+    const activeAt = (n: TransformNode, t: number) => { const k = activeCurves.get(n.id); return k === undefined ? activeForShow(n) : valueAt(k, t) >= 0.5 }
+    const spriteAt = (n: TransformNode, t: number) => {
+      const ks = spriteCurves.get(n.id)
+      if (ks === undefined || ks.length === 0) return setupSpriteOf(n)
+      let id = ks[0]!.id
+      for (const k of ks) if (k.time <= t + 1e-9) id = k.id
+      return id
+    }
+    const keyAt = (n: TransformNode, t: number): string | null =>
+      enabledAt(n, t) && chainOf(n).every((m) => activeAt(m, t)) ? attachmentOf.get(n.id)!.keyOfSprite.get(spriteAt(n, t)) ?? null : null
+    for (const [slotName, members] of slotNodes) {
+      const times = new Set<number>()
+      for (const n of members) {
+        for (const k of enabledCurves.get(n.id) ?? []) times.add(k.time)
+        for (const k of spriteCurves.get(n.id) ?? []) times.add(k.time)
+        for (const m of chainOf(n)) for (const k of activeCurves.get(m.id) ?? []) times.add(k.time)
+      }
+      if (times.size === 0) continue
+      times.add(0)
       const frames: Json[] = []
       let last: string | null | undefined
-      for (const t of times) {
-        const on = [...perNode.entries()].filter(([, keys]) => valueAt(keys, t) >= 0.5).map(([id]) => attachmentOf.get(id)!.key)
+      for (const t of [...times].sort((a, b) => a - b)) {
+        // 几套皮肤的物体一起看:同一时刻亮着的键名在各皮肤里是同一个(导出时按键名开关),皮肤只决定挂哪一份
+        const on = members.map((n) => keyAt(n, t)).filter((k): k is string => k !== null)
         const distinct = [...new Set(on)]
         if (distinct.length > 1) issues.add('approximated', `attachment[${slotName}]`, `${t.toFixed(3)} 秒同一 slot 亮着 ${distinct.length} 个挂图节点(${distinct.join('、')}),Spine 一个 slot 只能挂一个,取第一个`)
         const name = distinct[0] ?? null
@@ -566,12 +768,13 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
     }
     if (Object.keys(slotsOut).length > 0) out['slots'] = slotsOut
 
-    // 逐帧绘制顺序:各 slot 的 sortingOrder 在关键帧时刻排一次序,换算成 Spine 的偏移
-    if (sorting.size > 0) {
-      const times = [...new Set([...sorting.values()].flatMap((k) => k.map((x) => x.time)))].sort((a, b) => a - b)
+    // 逐帧绘制顺序:各 slot 的排序键在关键帧时刻排一次序,换算成 Spine 的偏移
+    if (orderCurves.size > 0) {
+      const times = [...new Set([0, ...[...orderCurves.values()].flatMap((k) => k.map((x) => x.time))])].sort((a, b) => a - b)
       out['drawOrder'] = times.map((t) => {
-        const orderAt = slotList.map((s, i) => ({ name: s.name, i, v: sorting.has(s.name) ? valueAt(sorting.get(s.name)!, t) : s.order }))
-        const sorted = [...orderAt].sort((p, q) => p.v - q.v || p.i - q.i)
+        const orderAt = (m: TransformNode, cls: number) => { const k = orderCurves.get(`${m.id}|${cls}`); return k === undefined ? undefined : Math.round(valueAt(k, t)) }
+        const keyed = slotList.map((s, i) => ({ name: s.name, i, key: sortKeyOf(s.rep, orderAt) }))
+        const sorted = [...keyed].sort((p, q) => compareKeys(p.key, q.key))
         const offsets = sorted.map((s, newIndex) => ({ slot: s.name, offset: newIndex - s.i })).filter((o) => o.offset !== 0)
         // 自检:按 Spine 的规则铺回去要得到同一个顺序
         const rebuilt = drawOrderOf(slotList.length, offsets.map((o) => ({ slot: slotIndex.get(o.slot)!, offset: o.offset })))
@@ -588,15 +791,24 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
       const geo = skinnedMeshes.get(id)
       const att = attachmentOf.get(id)!
       if (geo === undefined) continue
-      const d = blendToDeform(geo, shapesCurves, ppu, att.key, issues)
+      const d = blendToDeform(geo, shapesCurves, ppu, att.keyOfSprite.get(null)!, issues)
       if (d === null) continue
       const bySkin = (deform[att.skin] as Json | undefined) ?? {}
       deform[att.skin] = bySkin
       const bySlot = (bySkin[att.slot] as Json | undefined) ?? {}
       bySkin[att.slot] = bySlot
-      bySlot[att.key] = { deform: d }
+      bySlot[att.keyOfSprite.get(null)!] = { deform: d }
     }
     if (Object.keys(deform).length > 0) out['attachments'] = deform
+
+    // clip 比最后一个键长(逐帧动画最后一帧要停一会儿):补一个不改变任何东西的绘制顺序帧把时长撑回来
+    const stop = snap(num(map(data['m_AnimationClipSettings'])['m_StopTime']))
+    if (stop > lastKeyTime(out) + 1e-6) {
+      const drawOrder = (out['drawOrder'] as Json[] | undefined) ?? []
+      const previous = drawOrder[drawOrder.length - 1]
+      drawOrder.push(previous?.['offsets'] === undefined ? { time: stop } : { time: stop, offsets: previous['offsets'] })
+      out['drawOrder'] = drawOrder
+    }
     return out
   }
 
@@ -615,8 +827,27 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
       .map(([name, attachments]) => ({ name, attachments })),
     animations,
   }
-  const nodesOut = [...attachmentOf.entries()].map(([id, a]) => ({ path: nodes.get(id)!.path, ...a }))
-  return { json, atlas: { pages, regions }, sources, issues: issues.all, nodes: nodesOut }
+  const nodesOut = [...attachmentOf.entries()].flatMap(([id, a]) =>
+    [...a.keyOfSprite.entries()].map(([sprite, key]) => ({ path: nodes.get(id)!.path, slot: a.slot, key, skin: a.skin, sprite })),
+  )
+  return { json, atlas: { pages, regions }, sources, issues: issues.all, nodes: nodesOut, initialSkin }
+}
+
+/** Spine 4.x JSON 一条动画里最晚的关键帧时刻 */
+function lastKeyTime(anim: Json): number {
+  let end = 0
+  const visit = (v: unknown): void => {
+    if (Array.isArray(v)) {
+      for (const f of v) {
+        if (f !== null && typeof f === 'object' && typeof (f as Json)['time'] === 'number') end = Math.max(end, (f as Json)['time'] as number)
+        visit(f)
+      }
+    } else if (v !== null && typeof v === 'object') {
+      for (const x of Object.values(v as Json)) if (typeof x === 'object') visit(x)
+    }
+  }
+  visit(anim)
+  return end
 }
 
 /** 键序列 → Spine 4.x JSON 的帧:各分量已对齐到同一组时刻 */

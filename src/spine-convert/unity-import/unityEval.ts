@@ -1,5 +1,6 @@
 import { parseMesh } from '../../unity/writeMesh.ts'
 import { SPRITE_SKIN_SCRIPT_GUID } from '../../unity/writePrefab.ts'
+import { spriteRecord } from '../../unity/spriteMeta.ts'
 import { list, map, num, parseUnityYaml, parseYamlDocument, ref, str, vec, type UnityObject, type YamlMap, type YamlValue } from '../../unity/yaml.ts'
 
 /**
@@ -15,7 +16,10 @@ import { list, map, num, parseUnityYaml, parseYamlDocument, ref, str, vec, type 
  * SkinnedMesh:     Σ w · 骨骼世界 · bindpose · (顶点 + Σ 权重/100 · Δ)     (加完再蒙皮)
  * ```
  *
- * 只认带权切线为 0 的曲线(我们导出的都是);坐标是 Unity 单位、相对根物体。
+ * 画不画:渲染器 `m_Enabled` 且自己和各级父物体 `m_IsActive`(根物体除外);画哪张图:`m_Sprite`(引用曲线,阶梯)。
+ * 先后:外层 Sorting Group 到渲染器自己,每层比 Sorting Layer、Order in Layer、z(远的先画),都一样按层级先后。
+ *
+ * 坐标是 Unity 单位、相对根物体。
  */
 
 type Affine = { a: number; b: number; c: number; d: number; x: number; y: number }
@@ -84,11 +88,13 @@ export function hermiteAt(ks: readonly Key[], t: number): number {
   return ks[ks.length - 1]!.v
 }
 
-interface Node { id: string; name: string; parent: string | null; go: UnityObject; t: UnityObject; comps: UnityObject[]; path: string }
+interface Node { id: string; name: string; parent: string | null; go: UnityObject; t: UnityObject; comps: UnityObject[]; path: string; index: number }
 
 export interface UnityScene {
-  /** 节点路径(相对根物体)→ 该时刻的顶点(Unity 单位,相对根物体) */
-  verticesAt(clip: string | null, t: number): Map<string, { x: number; y: number }[]>
+  /** 节点路径(相对根物体)→ 该时刻用的图(`guid:fileID`,SkinnedMeshRenderer 为 null)和顶点(Unity 单位,相对根物体) */
+  verticesAt(clip: string | null, t: number): Map<string, { sprite: string | null; points: { x: number; y: number }[] }>
+  /** 该时刻画出来的渲染器,按画的先后(先画的在前) */
+  drawnAt(clip: string | null, t: number): { path: string; sprite: string | null }[]
   /** 节点路径 → 该时刻的 m_Color(没有颜色曲线就是 prefab 里的) */
   colorAt(clip: string | null, t: number): Map<string, [number, number, number, number]>
   readonly clips: readonly string[]
@@ -101,6 +107,12 @@ export function loadUnityScene(files: ReadonlyMap<string, string | Uint8Array>):
   // 解析结果按文件缓存:每个时刻、每个节点都要用
   const metaCache = new Map<string, YamlMap>()
   const metaOf = (path: string) => { let m = metaCache.get(path); if (m === undefined) { m = map(parseYamlDocument(text(`${path}.meta`))['TextureImporter']); metaCache.set(path, m) } return m }
+  /** PNG 的宽高在 IHDR 里(第 16 字节起两个大端 uint32) */
+  const sizeOf = (path: string) => {
+    const b = files.get(path) as Uint8Array
+    const u32 = (i: number) => ((b[i]! << 24) | (b[i + 1]! << 16) | (b[i + 2]! << 8) | b[i + 3]!) >>> 0
+    return { width: u32(16), height: u32(20) }
+  }
   const meshCache = new Map<string, ReturnType<typeof parseMesh>>()
   const meshOf = (path: string) => { let m = meshCache.get(path); if (m === undefined) { m = parseMesh(text(path)); meshCache.set(path, m) } return m }
   const objects = parseUnityYaml(text([...files.keys()].find((p) => p.endsWith('.prefab'))!))
@@ -110,11 +122,13 @@ export function loadUnityScene(files: ReadonlyMap<string, string | Uint8Array>):
     if (o.type !== 'Transform') continue
     const go = byId.get(ref(o.data['m_GameObject']).fileID)!
     const f = ref(o.data['m_Father']).fileID
-    nodes.set(o.fileID, { id: o.fileID, name: str(go.data['m_Name']), parent: f === '0' ? null : f, go, t: o, comps: list(go.data['m_Component']).map((c) => byId.get(ref(map(c)['component']).fileID)!).filter(Boolean), path: '' })
+    nodes.set(o.fileID, { id: o.fileID, name: str(go.data['m_Name']), parent: f === '0' ? null : f, go, t: o, comps: list(go.data['m_Component']).map((c) => byId.get(ref(map(c)['component']).fileID)!).filter(Boolean), path: '', index: 0 })
   }
   const root = [...nodes.values()].find((n) => n.parent === null)!
+  let counter = 0
   const setPath = (n: Node, p: string) => {
     n.path = p
+    n.index = counter++
     for (const c of list(n.t.data['m_Children'])) { const ch = nodes.get(ref(c).fileID); if (ch) setPath(ch, p === '' ? ch.name : `${p}/${ch.name}`) }
   }
   setPath(root, '')
@@ -126,8 +140,21 @@ export function loadUnityScene(files: ReadonlyMap<string, string | Uint8Array>):
     if (clip !== undefined) clips.set(str(clip.data['m_Name']), clip.data)
   }
 
-  /** 每个 clip 的曲线预先拆成关键帧数组:(路径, 属性, 关键帧) */
+  /** 每个 clip 的曲线预先拆成关键帧数组:(路径, 属性, 关键帧);浮点曲线的属性带 classID 前缀(渲染器 / GameObject / Sorting Group 各是各的) */
   const parsedClips = new Map<string, { path: string; attr: string; keys: Key[] }[]>()
+  const parsedSprites = new Map<string, Map<string, { t: number; id: string }[]>>()
+  const spriteCurvesOf = (clip: string | null) => {
+    if (clip === null) return new Map<string, { t: number; id: string }[]>()
+    const hit = parsedSprites.get(clip)
+    if (hit !== undefined) return hit
+    const out = new Map<string, { t: number; id: string }[]>()
+    for (const e of list(clips.get(clip)!['m_PPtrCurves']).map(map)) {
+      if (str(e['attribute']) !== 'm_Sprite' || num(e['classID']) !== 212) continue
+      out.set(str(e['path']), list(e['curve']).map(map).map((k) => { const r = ref(k['value']); return { t: numInf(k['time']), id: `${r.guid}:${r.fileID}` } }))
+    }
+    parsedSprites.set(clip, out)
+    return out
+  }
   const curvesOf = (clip: string) => {
     const hit = parsedClips.get(clip)
     if (hit !== undefined) return hit
@@ -138,7 +165,7 @@ export function loadUnityScene(files: ReadonlyMap<string, string | Uint8Array>):
         for (const c of ['x', 'y', 'z'] as const) out.push({ path: str(e['path']), attr: `${attr}.${c}`, keys: keys(e['curve'], c) })
       }
     }
-    for (const e of list(data['m_FloatCurves']).map(map)) out.push({ path: str(e['path']), attr: str(e['attribute']), keys: keys(e['curve']) })
+    for (const e of list(data['m_FloatCurves']).map(map)) out.push({ path: str(e['path']), attr: `${num(e['classID'])}:${str(e['attribute'])}`, keys: keys(e['curve']) })
     parsedClips.set(clip, out)
     return out
   }
@@ -172,74 +199,128 @@ export function loadUnityScene(files: ReadonlyMap<string, string | Uint8Array>):
     return world
   }
 
+  /** 该时刻 SpriteRenderer 用哪张图 */
+  const spriteAt = (n: Node, sr: UnityObject, clip: string | null, t: number): string | null => {
+    const ks = spriteCurvesOf(clip).get(n.path)
+    if (ks !== undefined && ks.length > 0) {
+      let id = ks[0]!.id
+      for (const k of ks) if (k.t <= t) id = k.id
+      return id
+    }
+    const r = ref(sr.data['m_Sprite'])
+    return r.guid === null || r.fileID === '0' ? null : `${r.guid}:${r.fileID}`
+  }
+
   const verticesAt = (clip: string | null, t: number) => {
     const ov = override(clip, t)
     const world = worldAt(ov)
-    const out = new Map<string, { x: number; y: number }[]>()
+    const out = new Map<string, { sprite: string | null; points: { x: number; y: number }[] }>()
     for (const n of nodes.values()) {
       const sr = n.comps.find((c) => c.type === 'SpriteRenderer')
       const smr = n.comps.find((c) => c.type === 'SkinnedMeshRenderer')
       if (sr !== undefined) {
-        const sref = ref(sr.data['m_Sprite'])
-        const texPath = pathOfGuid.get(sref.guid ?? '')
+        const sprite = spriteAt(n, sr, clip, t)
+        if (sprite === null) continue
+        const [guid, fileID] = sprite.split(':') as [string, string]
+        const texPath = pathOfGuid.get(guid)
         if (texPath === undefined) continue
         const meta = metaOf(texPath)
         const ppu = num(meta['spritePixelsToUnits'], 100)
-        const sprite = list(map(meta['spriteSheet'])['sprites']).map(map).find((s) => str(s['internalID']) === sref.fileID)!
-        const rect = map(sprite['rect']), pivot = map(sprite['pivot'])
-        const px = num(pivot['x']) * num(rect['width']), py = num(pivot['y']) * num(rect['height'])
-        const local = list(sprite['vertices']).map((v) => ({ x: (num(map(v)['x']) - px) / ppu, y: (num(map(v)['y']) - py) / ppu }))
+        const record = spriteRecord(meta, fileID, texPath.replace(/^.*\//, '').replace(/\.[^.]*$/, ''), sizeOf(texPath))!
+        const local = record.vertices.map((v) => ({ x: (v.x - record.pivot.x) / ppu, y: (v.y - record.pivot.y) / ppu }))
         const skin = n.comps.find((c) => c.type === 'MonoBehaviour' && ref(c.data['m_Script']).guid === SPRITE_SKIN_SCRIPT_GUID)
         if (skin === undefined) {
           const w = world(n)
-          out.set(n.path, local.map((v) => apply(w, v.x, v.y)))
+          out.set(n.path, { sprite, points: local.map((v) => apply(w, v.x, v.y)) })
           continue
         }
         const binds: Affine[] = []
-        list(sprite['bones']).map(map).forEach((b, i) => {
+        record.bones.forEach((b, i) => {
           const pos = map(b['position'])
           const parent = num(b['parentId'], -1)
           const isRoot = parent < 0
-          const m = trs((num(pos['x']) - (isRoot ? px : 0)) / ppu, (num(pos['y']) - (isRoot ? py : 0)) / ppu, zDeg(vec(b['rotation'])), 1, 1)
+          const m = trs((num(pos['x']) - (isRoot ? record.pivot.x : 0)) / ppu, (num(pos['y']) - (isRoot ? record.pivot.y : 0)) / ppu, zDeg(vec(b['rotation'])), 1, 1)
           binds[i] = isRoot ? m : mul(binds[parent]!, m)
         })
         const bones = list(skin.data['m_BoneTransforms']).map((b) => nodes.get(ref(b).fileID)!)
-        const weights = list(sprite['weights']).map(map)
-        out.set(n.path, local.map((v, i) => {
-          let x = 0, y = 0
-          for (let k = 0; k < 4; k++) {
-            const w = num(weights[i]![`weight[${k}]`])
-            if (w <= 0) continue
-            const bi = num(weights[i]![`boneIndex[${k}]`])
-            const p = apply(mul(world(bones[bi]!), inverse(binds[bi]!)), v.x, v.y)
-            x += p.x * w
-            y += p.y * w
-          }
-          return { x, y }
-        }))
+        out.set(n.path, {
+          sprite,
+          points: local.map((v, i) => {
+            let x = 0, y = 0
+            for (let k = 0; k < 4; k++) {
+              const w = num(record.weights[i]![`weight[${k}]`])
+              if (w <= 0) continue
+              const bi = num(record.weights[i]![`boneIndex[${k}]`])
+              const p = apply(mul(world(bones[bi]!), inverse(binds[bi]!)), v.x, v.y)
+              x += p.x * w
+              y += p.y * w
+            }
+            return { x, y }
+          }),
+        })
       } else if (smr !== undefined) {
         const mesh = meshOf(pathOfGuid.get(ref(smr.data['m_Mesh']).guid ?? '')!)
         const bones = list(smr.data['m_Bones']).map((b) => nodes.get(ref(b).fileID)!)
         const o = ov.get(n.path)
         const delta = mesh.positions.map(() => ({ x: 0, y: 0 }))
         for (const s of mesh.blendShapes) {
-          const w = (o?.get(`blendShape.${s.name}`) ?? 0) / 100
+          const w = (o?.get(`137:blendShape.${s.name}`) ?? 0) / 100
           for (const d of s.deltas) { delta[d.index]!.x += d.x * w; delta[d.index]!.y += d.y * w }
         }
         const weights = mesh.fullWeights.length === mesh.vertexCount ? mesh.fullWeights : mesh.streamWeights
-        out.set(n.path, mesh.positions.map((p, i) => {
-          let x = 0, y = 0
-          for (const w of weights[i]!) {
-            if (w.weight <= 0) continue
-            const q = apply(mul(world(bones[w.bone]!), mesh.bindposes[w.bone]!), p.x + delta[i]!.x, p.y + delta[i]!.y)
-            x += q.x * w.weight
-            y += q.y * w.weight
-          }
-          return { x, y }
-        }))
+        out.set(n.path, {
+          sprite: null,
+          points: mesh.positions.map((p, i) => {
+            let x = 0, y = 0
+            for (const w of weights[i]!) {
+              if (w.weight <= 0) continue
+              const q = apply(mul(world(bones[w.bone]!), mesh.bindposes[w.bone]!), p.x + delta[i]!.x, p.y + delta[i]!.y)
+              x += q.x * w.weight
+              y += q.y * w.weight
+            }
+            return { x, y }
+          }),
+        })
       }
     }
     return out
+  }
+
+  const drawnAt = (clip: string | null, t: number) => {
+    const ov = override(clip, t)
+    const value = (n: Node, attr: string, fallback: number) => ov.get(n.path)?.get(attr) ?? fallback
+    const parentOf = (n: Node) => (n.parent === null ? undefined : nodes.get(n.parent))
+    /** 根物体到自己(含),由外到内 */
+    const chain = (n: Node) => { const out: Node[] = []; for (let m: Node | undefined = n; m !== undefined; m = parentOf(m)) out.unshift(m); return out }
+    const zOf = (n: Node) => {
+      let z = 0, scale = 1
+      for (const m of chain(n).slice(1)) {
+        z += value(m, 'pos.z', vec(m.t.data['m_LocalPosition']).z) * scale
+        scale *= value(m, 'scale.z', vec(m.t.data['m_LocalScale']).z) || 1
+      }
+      return z
+    }
+    const drawn: { path: string; sprite: string | null; key: number[] }[] = []
+    for (const n of nodes.values()) {
+      const r = n.comps.find((c) => c.type === 'SpriteRenderer' || c.type === 'SkinnedMeshRenderer')
+      if (r === undefined) continue
+      const cls = r.type === 'SpriteRenderer' ? 212 : 137
+      const on = value(n, `${cls}:m_Enabled`, str(r.data['m_Enabled']) === '0' ? 0 : 1) >= 0.5 &&
+        chain(n).slice(1).every((m) => value(m, '1:m_IsActive', str(m.go.data['m_IsActive']) === '0' ? 0 : 1) >= 0.5)
+      if (!on) continue
+      const sprite = r.type === 'SpriteRenderer' ? spriteAt(n, r, clip, t) : null
+      if (r.type === 'SpriteRenderer' && sprite === null) continue
+      const key: number[] = []
+      for (const m of chain(n)) {
+        const g = m.comps.find((c) => c.type === 'SortingGroup')
+        if (g === undefined || str(g.data['m_Enabled']) === '0') continue
+        key.push(num(g.data['m_SortingLayer']), Math.round(value(m, '210:m_SortingOrder', num(g.data['m_SortingOrder']))), -zOf(m), m.index)
+      }
+      key.push(num(r.data['m_SortingLayer']), Math.round(value(n, `${cls}:m_SortingOrder`, num(r.data['m_SortingOrder']))), -zOf(n), n.index)
+      drawn.push({ path: n.path, sprite, key })
+    }
+    const cmp = (p: number[], q: number[]) => { for (let i = 0; i < Math.min(p.length, q.length); i++) if (p[i] !== q[i]) return p[i]! - q[i]!; return p.length - q.length }
+    return drawn.sort((a, b) => cmp(a.key, b.key)).map(({ path, sprite }) => ({ path, sprite }))
   }
 
   const colorAt = (clip: string | null, t: number) => {
@@ -250,10 +331,10 @@ export function loadUnityScene(files: ReadonlyMap<string, string | Uint8Array>):
       if (sr === undefined) continue
       const c = map(sr.data['m_Color'])
       const o = ov.get(n.path)
-      out.set(n.path, [o?.get('m_Color.r') ?? num(c['r'], 1), o?.get('m_Color.g') ?? num(c['g'], 1), o?.get('m_Color.b') ?? num(c['b'], 1), o?.get('m_Color.a') ?? num(c['a'], 1)])
+      out.set(n.path, [o?.get('212:m_Color.r') ?? num(c['r'], 1), o?.get('212:m_Color.g') ?? num(c['g'], 1), o?.get('212:m_Color.b') ?? num(c['b'], 1), o?.get('212:m_Color.a') ?? num(c['a'], 1)])
     }
     return out
   }
 
-  return { verticesAt, colorAt, clips: [...clips.keys()] }
+  return { verticesAt, drawnAt, colorAt, clips: [...clips.keys()] }
 }

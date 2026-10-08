@@ -1,15 +1,19 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { readSkeletonPart, type SkeletonPart } from '../../spine-format/binary/readSkeleton.ts'
+import type { AnimationData } from '../../spine-format/binary/readAnimations.ts'
 import { fromJson } from '../../spine-format/json/fromJson.ts'
 import { parseAtlas } from '../../core/atlas.ts'
 import { decodePng, type Image } from '../../unity/png.ts'
 import { poseAt, setupPose } from '../../spine-eval/pose.ts'
 import { attachmentVertices } from '../../spine-eval/vertices.ts'
 import { slotColorAt, unpackRgba } from '../../spine-eval/color.ts'
+import { drawOrderAt, slotAttachmentsAt } from '../../spine-eval/slots.ts'
 import { exportToUnity } from '../unity/export.ts'
 import { importUnity } from './readUnity.ts'
 import { loadUnityScene } from './unityEval.ts'
+import { list, map, parseUnityYaml, ref, str } from '../../unity/yaml.ts'
+import { readUnityDir } from '../../cli/unityDir.ts'
 
 /**
  * Unity 读取器的验收。
@@ -37,8 +41,14 @@ const PPU = 100
 const slotIndex = (p: SkeletonPart, name: string) => p.slots.findIndex((s) => s.name === name)
 
 /**
- * 把 Unity 产物读成 Spine,按 Spine 的规则求值,与 Unity 的规则(unityEval)在同一时刻逐点比:
- * setup、每条动画的关键帧、相邻关键帧的四分点和中点。返回比过的「节点 × 时刻」数。
+ * 把 Unity 产物读成 Spine,按 Spine 的规则求值,与 Unity 的规则(unityEval)在同一时刻比:
+ * setup、每条动画的关键帧、相邻关键帧的四分点和中点。比两样 ——
+ *
+ * 1. 每个挂图物体当时用的那张图的顶点(逐点,0.05 像素)
+ * 2. 画了哪些、画的先后:Spine 按 slot 挂的 attachment(当前皮肤 → 默认皮肤)和 drawOrder 铺出来,
+ *    换成 Unity 那边的 (物体, 图),与 Unity 按 m_Enabled / m_IsActive / m_Sprite / 排序规则算出的序列相等
+ *
+ * 返回比过的「物体 × 时刻」数。
  */
 function compareWithUnity(files: ReadonlyMap<string, string | Uint8Array>): number {
   const imported = importUnity(files, { pixelsPerUnit: PPU })
@@ -48,11 +58,22 @@ function compareWithUnity(files: ReadonlyMap<string, string | Uint8Array>): numb
     back.skins.find((s) => s.name === skin)?.slots.find((e) => e.slot === slotIndex(back, slot))?.attachments.find((a) => a.key === key)
   /** 读取器报过「段内采样成直线」的 deform:它们在段内只近似 */
   const sampled = new Set(imported.issues.filter((i) => i.message.includes('段内按 30 fps 采样')).map((i) => /deform\[(.+)\]$/.exec(i.path)?.[1]))
+  const entryOf = (slot: string, key: string) =>
+    imported.nodes.find((n) => n.slot === slot && n.key === key && n.skin === imported.initialSkin) ??
+    imported.nodes.find((n) => n.slot === slot && n.key === key && n.skin === 'default')
+  const spineDrawn = (anim: AnimationData | null, t: number) => {
+    const names = slotAttachmentsAt(back, anim, t)
+    return drawOrderAt(back, anim, t).flatMap((si) => {
+      const key = names[si]
+      const hit = key === null || key === undefined ? undefined : entryOf(back.slots[si]!.name, key)
+      return hit === undefined ? [] : [`${hit.path} | ${hit.sprite}`]
+    })
+  }
   let checked = 0
   const clips: (string | null)[] = [null, ...scene.clips.filter((c) => !c.includes('@skin@'))]
   for (const clip of clips) {
-    const animName = clip === null ? null : clip.slice(clip.indexOf('@') + 1)
-    const anim = animName === null ? null : back.animations.find((a) => a.name === animName)!
+    const anim = clip === null ? null : back.animations.find((a) => a.name === clip || clip.endsWith(`@${a.name}`))!
+    const label = anim?.name ?? 'setup'
     const times = new Set<number>([0])
     if (anim !== null) {
       for (const tl of anim.timelines) {
@@ -71,18 +92,20 @@ function compareWithUnity(files: ReadonlyMap<string, string | Uint8Array>): numb
       const unityVerts = scene.verticesAt(clip, t)
       const pose = anim === null ? setupPose(back) : poseAt(back, anim, t)
       for (const n of imported.nodes) {
-        const att = attachmentOf(n.skin, n.slot, n.key)!
         const expected = unityVerts.get(n.path)
-        if (expected === undefined) continue
+        if (expected === undefined || expected.sprite !== n.sprite) continue
+        const att = attachmentOf(n.skin, n.slot, n.key)!
         const got = attachmentVertices(back, imported.atlas, att, n.skin, slotIndex(back, n.slot), pose, anim, t)
-        expect(got.length, n.path).toBe(expected.length)
+        expect(got.length, n.path).toBe(expected.points.length)
         const tolerance = sampled.has(n.key) ? 2 : 0.05
-        expected.forEach((q, i) => {
+        expected.points.forEach((q, i) => {
           const d = Math.hypot(q.x * PPU - got[i]!.x, q.y * PPU - got[i]!.y)
-          expect(d, `${n.path} 第 ${i} 个顶点 @${animName ?? 'setup'} ${t.toFixed(4)}`).toBeLessThan(tolerance)
+          expect(d, `${n.path} 第 ${i} 个顶点 @${label} ${t.toFixed(4)}`).toBeLessThan(tolerance)
         })
         checked++
       }
+      const unityDrawn = scene.drawnAt(clip, t).map((d) => `${d.path} | ${d.sprite}`)
+      expect(spineDrawn(anim, t), `画了哪些、先后 @${label} ${t.toFixed(4)}`).toEqual(unityDrawn)
     }
   }
   return checked
@@ -211,5 +234,216 @@ describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('Unity 产物�
 
   it('⭐ 改过的产物与 Unity 的规则逐点一致', () => {
     expect(compareWithUnity(edited)).toBeGreaterThan(20)
+  })
+})
+
+/**
+ * 别人的角色 / 在 Unity 里动过结构的角色:我们导出时不会出现、但 Unity 里很常见的写法。
+ * 每一条都直接改文本(写法照 Unity 自己写出的),读回来逐点、逐「画了哪些、先后」符合 Unity 的规则。
+ */
+describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('Unity 里常见、我们导出时不会出现的写法(MX2_cat 4.1 上改)', () => {
+  const part = readSkeletonPart(new Uint8Array(readFileSync('res/spine/4.1/MX2_cat.skel.bytes')))
+  const atlas = parseAtlas(readFileSync('res/spine/4.1/MX2_cat.atlas.txt', 'utf8'))
+  const sources = new Map<string, Image>(atlas.pages.map((p) => [p.name, decodePng(new Uint8Array(readFileSync(`res/spine/4.1/${p.name}`)))]))
+  const unity = exportToUnity(part, atlas, sources, { name: 'x', pixelsPerUnit: PPU, renderPipeline: 'urp' })
+  const original = new Map(unity.files.map((f) => [f.path, f.content]))
+  const originalNodes = importUnity(original, { pixelsPerUnit: PPU }).nodes
+  const spriteOf = (path: string) => originalNodes.find((n) => n.path === path)!.sprite!
+
+  type Files = Map<string, string | Uint8Array>
+  const textOf = (files: Files, path: string) => files.get(path) as string
+  /** prefab 里按路径找物体(和 Unity 绑曲线一样,从根物体按名字一级级往下) */
+  const nodeAt = (files: Files, path: string) => {
+    const objs = parseUnityYaml(textOf(files, 'x.prefab'))
+    const byId = new Map(objs.map((o) => [o.fileID, o]))
+    let t = objs.find((o) => o.type === 'Transform' && ref(o.data['m_Father']).fileID === '0')!
+    for (const seg of path === '' ? [] : path.split('/')) {
+      t = list(t.data['m_Children']).map((c) => byId.get(ref(c).fileID)!).find((c) => str(byId.get(ref(c.data['m_GameObject']).fileID)!.data['m_Name']) === seg)!
+    }
+    const go = byId.get(ref(t.data['m_GameObject']).fileID)!
+    return { t, go, comp: (type: string) => objs.find((o) => o.type === type && ref(o.data['m_GameObject']).fileID === go.fileID)! }
+  }
+  /** 改 prefab 里的一个对象(按 fileID 找到它那一段) */
+  const editObject = (files: Files, fileID: string, fn: (doc: string) => string) => {
+    const docs = textOf(files, 'x.prefab').split(/(?=^--- !u!)/m)
+    const i = docs.findIndex((d) => new RegExp(`^--- !u!\\d+ &${fileID}\\b`).test(d))
+    expect(i, `prefab 里找不到 &${fileID}`).toBeGreaterThan(-1)
+    const changed = fn(docs[i]!)
+    expect(changed, `&${fileID} 没改动`).not.toBe(docs[i])
+    docs[i] = changed
+    files.set('x.prefab', docs.join(''))
+  }
+  const editText = (files: Files, path: string, from: string, to: string) => {
+    const before = textOf(files, path)
+    expect(before.includes(from), `${path} 里没找到 ${from.slice(0, 40)}`).toBe(true)
+    files.set(path, before.replace(from, to))
+  }
+  const vecKey = (time: number, z: number) =>
+    `      - serializedVersion: 3\n        time: ${time}\n        value: {x: 0, y: 0, z: ${z}}\n        inSlope: {x: 0, y: 0, z: 0}\n        outSlope: {x: 0, y: 0, z: 0}\n` +
+    '        tangentMode: 0\n        weightedMode: 0\n        inWeight: {x: 0.33333334, y: 0.33333334, z: 0.33333334}\n        outWeight: {x: 0.33333334, y: 0.33333334, z: 0.33333334}\n'
+  const stepKey = (time: number, value: number) =>
+    `      - serializedVersion: 3\n        time: ${time}\n        value: ${value}\n        inSlope: Infinity\n        outSlope: Infinity\n` +
+    '        tangentMode: 103\n        weightedMode: 0\n        inWeight: 0.33333334\n        outWeight: 0.33333334\n'
+  const curveTail = '      m_PreInfinity: 2\n      m_PostInfinity: 2\n      m_RotationOrder: 4\n'
+  const read = (files: Files) => {
+    const imported = importUnity(files, { pixelsPerUnit: PPU })
+    return { imported, back: fromJson(imported.json) }
+  }
+  const idle = (back: SkeletonPart) => back.animations.find((a) => a.name === 'idle')!
+  const losses = (r: ReturnType<typeof read>) => r.imported.issues.filter((i) => i.level === 'loss')
+
+  const EDITS: { label: string; apply: (files: Files) => void; check: (r: ReturnType<typeof read>) => void }[] = [
+    {
+      label: '给挂图物体自己打旋转关键帧(Animation 窗口里直接转图片)→ 它变成骨骼',
+      apply: (files) => editText(files, 'x@idle.anim', '  m_EulerCurves:\n', `  m_EulerCurves:\n  - curve:\n      serializedVersion: 2\n      m_Curve:\n${vecKey(0, 0)}${vecKey(1, 40)}${curveTail}    path: root/bubble/bubble\n`),
+      check: (r) => {
+        expect(losses(r)).toEqual([])
+        const bone = r.back.bones.findIndex((b) => b.name === 'bubble_2')
+        expect(r.back.slots.find((s) => s.name === 'bubble')!.bone).toBe(bone)
+        expect(idle(r.back).timelines.some((t) => t.kind === 'rotate' && t.owner === bone)).toBe(true)
+      },
+    },
+    {
+      label: '把骨骼拖到挂图物体下面 → 子骨骼的父骨骼是这个物体,不会变成第二根根骨骼',
+      apply: (files) => {
+        const child = nodeAt(files, 'root/bubble2').t.fileID
+        const oldParent = nodeAt(files, 'root').t.fileID
+        const newParent = nodeAt(files, 'root/bubble/bubble').t.fileID
+        editObject(files, child, (d) => d.replace(/m_Father: \{fileID: \d+\}/, `m_Father: {fileID: ${newParent}}`))
+        editObject(files, oldParent, (d) => d.replace(`  - {fileID: ${child}}\n`, ''))
+        editObject(files, newParent, (d) => d.replace('m_Children: []', `m_Children:\n  - {fileID: ${child}}`))
+        for (const [path, content] of files) {
+          if (!path.endsWith('.anim')) continue
+          files.set(path, (content as string).replaceAll('path: root/bubble2\n', 'path: root/bubble/bubble/bubble2\n').replaceAll('path: root/bubble2/', 'path: root/bubble/bubble/bubble2/'))
+        }
+      },
+      check: (r) => {
+        expect(losses(r)).toEqual([])
+        expect(r.back.bones.filter((b) => b.parent === -1)).toHaveLength(1)
+        const holder = r.back.bones.findIndex((b) => b.name === 'bubble_2')
+        expect(r.back.bones.find((b) => b.name === 'bubble2')!.parent).toBe(holder)
+      },
+    },
+    {
+      label: 'm_IsActive 曲线关掉一根骨骼(连同下面挂的图)',
+      apply: (files) => editText(files, 'x@idle.anim', '  m_FloatCurves:\n', `  m_FloatCurves:\n  - serializedVersion: 2\n    curve:\n      serializedVersion: 2\n      m_Curve:\n${stepKey(0, 1)}${stepKey(0.5, 0)}${stepKey(1.5, 1)}${curveTail}    attribute: m_IsActive\n    path: root/bubble3\n    classID: 1\n    script: {fileID: 0}\n    flags: 0\n`),
+      check: (r) => {
+        expect(losses(r)).toEqual([])
+        const slot = r.back.slots.findIndex((s) => s.name === 'bubble3')
+        expect(slotAttachmentsAt(r.back, idle(r.back), 0.75)[slot]).toBeNull()
+        expect(slotAttachmentsAt(r.back, idle(r.back), 1.6)[slot]).toBe('bubble')
+      },
+    },
+    {
+      label: 'prefab 里把一根骨骼的 GameObject 关掉 → setup 不画它下面的图',
+      apply: (files) => editObject(files, nodeAt(files, 'root/bubble').go.fileID, (d) => d.replace('m_IsActive: 1', 'm_IsActive: 0')),
+      check: (r) => expect(r.back.slots.find((s) => s.name === 'bubble')!.attachmentName).toBeNull(),
+    },
+    {
+      label: 'm_Sprite 曲线换图(逐帧换 sprite)→ 每张图一个 attachment,换图时间轴',
+      apply: (files) => {
+        const [g1, f1] = spriteOf('root/bubble2/bubble2__bubble').split(':')
+        const [g2, f2] = spriteOf('head').split(':')
+        const k = (time: number, g: string, f: string) => `    - time: ${time}\n      value: {fileID: ${f}, guid: ${g}, type: 3}\n`
+        editText(files, 'x@idle.anim', 'm_PPtrCurves: []', `m_PPtrCurves:\n  - curve:\n${k(0, g1!, f1!)}${k(0.5, g2!, f2!)}${k(1, g1!, f1!)}    attribute: m_Sprite\n    path: root/bubble2/bubble2__bubble\n    classID: 212\n    script: {fileID: 0}\n    flags: 2`)
+      },
+      check: (r) => {
+        expect(losses(r)).toEqual([])
+        const slot = r.back.slots.findIndex((s) => s.name === 'bubble2')
+        const at = (t: number) => r.imported.nodes.find((n) => n.slot === 'bubble2' && n.key === slotAttachmentsAt(r.back, idle(r.back), t)[slot])?.sprite
+        expect(at(0.6)).toBe(spriteOf('head'))
+        expect(at(1.1)).toBe(spriteOf('root/bubble2/bubble2__bubble'))
+      },
+    },
+    {
+      label: '删掉 0 秒的关键帧 → 0 秒补一个同值的键(Unity 在第一个键之前取它的值,Spine 取 setup)',
+      apply: (files) => {
+        // swim 里第一条在变的旋转曲线,删掉它 0 秒那个键
+        const text = textOf(files, 'x@swim.anim')
+        const euler = text.slice(text.indexOf('  m_EulerCurves:\n'), text.indexOf('  m_PositionCurves:'))
+        const entries = euler.split(/(?=^ {2}- curve:\n)/m).slice(1)
+        const entry = entries.find((e) => new Set([...e.matchAll(/value: \{x: 0, y: 0, z: (\S+)\}/g)].map((m) => m[1])).size > 1)!
+        const firstKey = /^ {6}- serializedVersion: 3\n {8}time: 0\n[\s\S]*?(?=^ {6}- serializedVersion: 3\n)/m.exec(entry)![0]
+        editText(files, 'x@swim.anim', entry, entry.replace(firstKey, ''))
+      },
+      check: (r) => expect(losses(r)).toEqual([]),
+    },
+    {
+      label: 'clip 比最后一个关键帧长(m_StopTime)→ Spine 的时长跟着撑长',
+      apply: (files) => editText(files, 'x@idle.anim', 'm_StopTime: 2\n', 'm_StopTime: 2.5\n'),
+      check: (r) => {
+        const end = Math.max(...idle(r.back).timelines.flatMap((t) => t.frames.map((f) => Number(f['time'] ?? 0))))
+        expect(end).toBeCloseTo(2.5, 6)
+      },
+    },
+    {
+      label: '改 Order in Layer(prefab 里把 glass 提到最上面)',
+      apply: (files) => editObject(files, nodeAt(files, 'glass').comp('SpriteRenderer').fileID, (d) => d.replace(/m_SortingOrder: -?\d+/, 'm_SortingOrder: 100')),
+      check: (r) => expect(r.back.slots[r.back.slots.length - 1]!.name).toBe('glass'),
+    },
+    {
+      label: '给一根骨骼加 Sorting Group(Order 50)→ 它下面的图整组按 50 排',
+      apply: (files) => {
+        const go = nodeAt(files, 'root/bubble3').go.fileID
+        editObject(files, go, (d) => d.replace('  m_Component:\n', '  m_Component:\n  - component: {fileID: 990001}\n'))
+        files.set('x.prefab', `${textOf(files, 'x.prefab')}--- !u!210 &990001\nSortingGroup:\n  m_ObjectHideFlags: 0\n  m_CorrespondingSourceObject: {fileID: 0}\n  m_PrefabInstance: {fileID: 0}\n  m_PrefabAsset: {fileID: 0}\n  m_GameObject: {fileID: ${go}}\n  m_Enabled: 1\n  m_SortingLayerID: 0\n  m_SortingLayer: 0\n  m_SortingOrder: 50\n  m_SortAtRoot: 0\n`)
+      },
+      check: (r) => expect(r.back.slots[r.back.slots.length - 1]!.name).toBe('bubble3'),
+    },
+  ]
+
+  for (const e of EDITS) {
+    it(`⭐ ${e.label}`, () => {
+      const files = new Map(original)
+      e.apply(files)
+      expect(compareWithUnity(files)).toBeGreaterThan(20)
+      e.check(read(files))
+    })
+  }
+
+  it('⭐ 以上全部一起改', () => {
+    const files = new Map(original)
+    for (const e of EDITS) e.apply(files)
+    expect(compareWithUnity(files)).toBeGreaterThan(20)
+  })
+})
+
+/**
+ * 真实的「别人的角色」:第三方插件(Easy Performant Outline)自带的 2D 演示角色。根物体上一个 SpriteRenderer,
+ * 11 条动画全是 `m_Sprite` 逐帧换图,每帧一张单独的贴图(Single 模式,`.meta` 里没有顶点)。
+ */
+const PLAYER = 'E:/UnityProject/BlockTile1/BlockTile1/Assets/ThirdParty/Easy performant outline/Demo/Models for Demo scene/Free 2D Demo Character sprite sheet'
+describe.skipIf(!existsSync(PLAYER))('别人做的角色:逐帧换 sprite(Free 2D Demo Character)', () => {
+  const files = readUnityDir(PLAYER)
+  const imported = importUnity(files, { pixelsPerUnit: PPU })
+  const back = fromJson(imported.json)
+
+  it('结构:一个 slot、每张图一个 attachment、动画一条不少、没有丢失', () => {
+    expect(imported.issues.filter((i) => i.level === 'loss')).toEqual([])
+    expect(back.slots.map((s) => s.name)).toEqual(['Player'])
+    const sprites = new Set<string>()
+    for (const [path, content] of files) {
+      if (!path.endsWith('.anim') && !path.endsWith('.prefab')) continue
+      for (const m of (content as string).matchAll(/m_Sprite: \{fileID: (\d+), guid: (\w+), type: 3\}/g)) sprites.add(`${m[2]}:${m[1]}`)
+      for (const m of (content as string).matchAll(/value: \{fileID: (\d+), guid: (\w+), type: 3\}/g)) sprites.add(`${m[2]}:${m[1]}`)
+    }
+    expect(new Set(imported.nodes.map((n) => n.sprite))).toEqual(sprites)
+    expect(back.skins[0]!.slots[0]!.attachments).toHaveLength(sprites.size)
+    expect(back.animations).toHaveLength([...files.keys()].filter((p) => p.endsWith('.anim')).length)
+  })
+
+  it('⭐ 时长 = clip 的 m_StopTime(最后一帧要停一会儿,不能被吃掉)', () => {
+    for (const [path, content] of files) {
+      if (!path.endsWith('.anim')) continue
+      const clip = parseUnityYaml(content as string).find((o) => o.type === 'AnimationClip')!
+      const stop = Number(str(map(clip.data['m_AnimationClipSettings'])['m_StopTime']))
+      const anim = back.animations.find((a) => a.name === str(clip.data['m_Name']))!
+      const end = Math.max(...anim.timelines.flatMap((t) => t.frames.map((f) => Number(f['time'] ?? 0))))
+      expect(end, anim.name).toBeCloseTo(stop, 5)
+    }
+  })
+
+  it('⭐ 与 Unity 的规则一致:每一刻画哪张图、顶点在哪', () => {
+    expect(compareWithUnity(files)).toBeGreaterThan(100)
   })
 })

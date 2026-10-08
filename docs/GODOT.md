@@ -31,6 +31,7 @@ godot --path <工程> --script res://AnimatorGoProbeSkin.gd
 | 贝塞尔轨道控制柄 | **相对关键帧的 (Δ时间, Δ取值)**,与按此假设算的值差 4e-5 —— Spine 的贝塞尔能精确表达 |
 | `visible` / `z_index` 离散轨道 | ⚠️ 默认档位**往回拖不重新求值**(0.5 → 0.25 仍是 0.5 的值)。AnimationPlayer 设 **`callback_mode_discrete = 2`**(FORCE_CONTINUOUS)后前后乱拖都对 |
 | `self_modulate` / `rotation` 值轨道 | 线性插值 |
+| 同一时刻两个键 | ⚠️ **恰好在那一刻取第一个**(0 秒写 [setup, 第一帧] 两个键,`seek(0)` 时两张图一起亮,每次循环回到起点也是)。写出时同一时刻(7 位有效数字)只留最后一个键 |
 | 节点名 | ⚠️ **不能含 `@`**(以及 `.` `:` `/` `"` `%`)—— 探针里 `a@mesh` 被改名,骨骼路径对不上,网格直接不画。Unity 导出那套 `@皮肤名` 命名不能照搬 |
 
 ## 2. `.tscn` 的写法(取自 Godot 自己写出的文件)
@@ -157,7 +158,7 @@ MergeCooking2 全部 535 个骨架:需要第 3 档修正的网格修正后,采�
 | slot 颜色 | `self_modulate`;有贝塞尔时按 30 fps 采样(rgb + alpha 两条时间轴统一求值写一条) |
 | 逐帧绘制顺序 | 挪过位的 slot 的挂图节点 `z_index` 阶梯轨道 |
 | deform | `polygon` 关键帧。不蒙皮的线性段精确;**蒙皮网格逐帧反解**(30 fps):两帧之间 Godot 在绑定空间线性插值,Spine 是在各骨骼局部插值后再蒙皮,只在关键帧上解会在中间分开 |
-| 第一帧之前 | Spine 用 setup 值,Godot 保持第一帧 —— 0 处补 setup 值再阶梯过去 |
+| 第一帧之前 | Spine 用 setup 值,Godot 保持第一帧 —— 0 处补 setup 值再阶梯过去。第一帧就在 0 秒的,0 秒只留第一帧的值(见第 1 节「同一时刻两个键」) |
 | 换动画回 setup | `deterministic = true` + RESET(每个被任何动画碰过的属性的 setup 值) |
 
 动画一律循环(与 Unity 导出一致)。`autoplay` = 第一条动画。

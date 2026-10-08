@@ -299,6 +299,16 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
     }
   })
 
+  it('⭐ 没有一条轨道在同一时刻有两个键(Godot 在那一刻取第一个,和这里的求值不一样 —— 实测开头一帧两张图一起亮)', () => {
+    for (const [name, anim] of scene.animations) {
+      for (let i = 0; anim.props.has(`tracks/${i}/type`); i++) {
+        const keys = anim.props.get(`tracks/${i}/keys`) as Record<string, ParsedValue>
+        const times = args(keys['times'])
+        times.forEach((t, k) => { if (k > 0) expect(t, `${name}:${args(anim.props.get(`tracks/${i}/path`))[0]} 第 ${k} 个键`).toBeGreaterThan(times[k - 1]!) })
+      }
+    }
+  })
+
   it('皮肤:每套一条 SkinPlayer 动画;初始按默认皮肤,具名皮肤的节点灭、被它盖住的默认节点在它的动画里灭', () => {
     const named = part.skins.filter((s, i) => i > 0 && s.slots.length > 0)
     if (named.length === 0) {

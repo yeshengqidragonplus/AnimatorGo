@@ -359,8 +359,13 @@ VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 pnpm from-unity <Unity 产物目录> --to godot|json [--out 目录] [--ppu 100] [--skin 初始皮肤]
 ```
 
-读我们导到 Unity、**又在 Unity 里改过**的角色(prefab + `.anim` + controller + 贴图 / Mesh / 材质及 `.meta`),写成 Spine 4.1 JSON,
-过 `fromJson` 进中转模型,再接 Godot 写出器;`--to json` 顺带就是 Unity → Spine。规则与会报的东西见 [UNITY-2D.md](UNITY-2D.md) 第 16 节。
+读我们导到 Unity、**又在 Unity 里改过**的角色,以及**别人在 Unity 里做的**角色(prefab + `.anim` + controller + 贴图 / Mesh / 材质及 `.meta`),
+写成 Spine 4.1 JSON,过 `fromJson` 进中转模型,再接 Godot 写出器;`--to json` 顺带就是 Unity → Spine。规则与会报的东西见 [UNITY-2D.md](UNITY-2D.md) 第 16 节。
+
+**2026-10-08 通用化**:第一版只认我们自己导出的结构,别人的角色里「图直接挂在骨骼上」会让子骨骼**静默**丢掉父骨骼。
+现在按 Unity 的规则读 —— 带渲染器的物体有子物体 / 被动画驱动时也是骨骼;显示 = `m_Enabled` 且各级 `m_IsActive`;
+`m_Sprite` 逐帧换图;排序 Sorting Group → Layer → Order → z;Single / Multiple / 老版三种 sprite 引用。
+还读不了(会报):PSD Importer(`.psb`)的角色(Unity 官方示例全是这种,下一档的大活)、SpriteResolver 换装、2D IK。
 
 几何(SpriteRenderer / SpriteSkin / SkinnedMeshRenderer)和曲线(Hermite → 贝塞尔、Blend Shape → deform)都是**精确**换算,
 只有「阶梯与非阶梯混在一帧」和「在 Unity 里改过的 Blend Shape 权重曲线」两处近似,都报出来。
@@ -371,9 +376,19 @@ pnpm from-unity <Unity 产物目录> --to godot|json [--out 目录] [--ppu 100] 
 |---|---|
 | 与 **Unity 的规则**逐点比(`unityEval.ts` 独立求值) | 7 个样本(MX2_cat 3.8 / 4.1、加权 deform、全靠 deform、linkedmesh、6 套皮肤、100 个 region):setup + 每条动画的关键帧 / 四分点 / 中点,0.05 像素全过;slot 颜色差 < 1/255 |
 | 在 Unity 里改过 | 改关键帧值、插新关键帧、挪 prefab 里的骨骼:改动落在对应时间轴 / 骨骼上,逐点仍符合 Unity 的规则 |
+| 画了哪些、谁压着谁 | 上面所有样本每个采样时刻:Spine 铺出来的(物体, 图)序列 = Unity 规则算出的 |
+| 别人的角色常见的写法(在 MX2_cat 上改 9 种 + 全部一起) | 图直接挂骨骼、骨骼挂在图下面、`m_IsActive` 显隐、`m_Sprite` 换图、删 0 秒键、clip 比最后一个键长、改 Order in Layer、Sorting Group(这条和 Layer / z 只照文档,没在 Unity 里实测)。故意把读取器改坏 5 处,每处都有用例变红 |
+| 真实的别人的角色 | 第三方插件自带的 2D 演示角色(11 条 `m_Sprite` 逐帧动画、85 张 Single 贴图):逐点一致;转 Godot 后 Godot 4.7 自检通过、渲染逐帧正确 |
 | 与原 Spine 粗检 | setup 在 Unity 导出自己的分流判据内 |
 | Unity YAML 解析器 | 3000 个真实 Unity 文件(45975 个对象)0 异常 |
 | Unity → Godot 渲染 | MX2_cat 与 Spine 直出 Godot 的渲染一致 |
+
+### ⚠️ Godot 导出:同一时刻两个键,开头一帧两张图一起亮(2026-10-08 修)
+
+换图轨道在 0 秒先写 setup 值、再写第一帧的值 —— Godot **恰好在那一刻取第一个键**(实测),动画开头和每次循环回到起点,
+setup 那张图和第一帧一起亮。Spine 直出 Godot 同样中招:跑得到的 8 个端到端样本全有同一时刻的重复键(还有来源不同、
+写成 7 位有效数字后撞在一起的时刻)。端到端测试在关键帧后 0.1 毫秒取样,正好错过。现在写出时同一时刻只留最后一个键,
+加了「没有一条轨道在同一时刻有两个键」的用例。是渲染那个第三方角色时看出来的。
 
 ### ⚠️ 做读取器时查出的 Unity 导出问题(2026-10-08)
 
