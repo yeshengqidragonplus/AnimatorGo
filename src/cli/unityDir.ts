@@ -2,7 +2,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { join, relative } from 'node:path'
 
 /**
- * 一个 Unity 角色目录里的所有文件,键是相对路径(正斜杠)。图片按字节读,其余按 UTF-8 文本读 ——
+ * 一个 Unity 角色目录里的所有文件,键是相对路径(正斜杠)。图片和 Photoshop 文件按字节读,其余按 UTF-8 文本读 ——
  * Unity 读取器(`importUnity`)吃的就是这个。
  */
 export function readUnityDir(root: string): Map<string, string | Uint8Array> {
@@ -14,7 +14,7 @@ export function readUnityDir(root: string): Map<string, string | Uint8Array> {
       else {
         const rel = relative(root, full).split('\\').join('/')
         const bytes = readFileSync(full)
-        out.set(rel, /\.(png|jpg|jpeg)$/i.test(rel) ? new Uint8Array(bytes) : bytes.toString('utf8'))
+        out.set(rel, /\.(png|jpg|jpeg|psd|psb)$/i.test(rel) ? new Uint8Array(bytes) : bytes.toString('utf8'))
       }
     }
   }

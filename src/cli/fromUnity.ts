@@ -3,6 +3,7 @@ import { basename, join, resolve } from 'node:path'
 import { importUnity } from '../spine-convert/unity-import/readUnity.ts'
 import { fromJson } from '../spine-format/json/fromJson.ts'
 import { writeAtlas } from '../core/atlas.ts'
+import { encodePng } from '../unity/png.ts'
 import { exportToGodot } from '../spine-convert/godot/export.ts'
 import type { ConversionIssue } from '../spine-convert/types.ts'
 import { findGodotProject, godotResDir } from './godotProject.ts'
@@ -15,7 +16,7 @@ import { readUnityDir } from './unityDir.ts'
  * pnpm from-unity <Unity 产物目录> --to godot|json [--out 目录] [--ppu 100] [--skin 初始皮肤]
  * ```
  *
- * 读一个 Unity 角色目录:正好一个 prefab,加上 `.anim` + controller + 贴图 / Mesh / 材质及其 `.meta`。
+ * 读一个 Unity 角色目录:正好一个 prefab(或一个 PSD Importer 导入的 `.psb` / `.psd`),加上 `.anim` + controller + 贴图 / Mesh / 材质及其 `.meta`。
  * 我们导出(`pnpm unity`)、又在 Unity 里改过的可以读;别人做的(骨骼上直接挂图、`m_IsActive` 显隐、
  * `m_Sprite` 逐帧换图)也可以读。`--ppu` 要与导出时一致;别人的角色就是想要的 Spine 像素 / Unity 单位。
  * `--skin` 不给就用 prefab 里亮着的那套皮肤。
@@ -70,7 +71,7 @@ function main(): void {
   }
   const files = readUnityDir(parsed.input)
   const imported = importUnity(files, { pixelsPerUnit: parsed.ppu })
-  const name = [...files.keys()].find((p) => p.endsWith('.prefab'))!.replace(/^.*\//, '').replace(/\.prefab$/, '')
+  const name = imported.name
   // 自检:写出的 Spine JSON 要能被自己的读取器读通
   const part = fromJson(imported.json)
   console.log(`Unity → ${parsed.to === 'godot' ? 'Godot 4' : 'Spine 4.1 JSON'}:${basename(parsed.input)}`)
@@ -82,9 +83,10 @@ function main(): void {
   if (parsed.to === 'json') {
     writeFileSync(join(dir, `${name}.json`), JSON.stringify(imported.json, null, 2))
     writeFileSync(join(dir, `${name}.atlas`), writeAtlas(imported.atlas))
+    // 贴图从读取器拿:PSD Importer 的角色,大图是读取器按 .meta 重新拼的,目录里没有
     for (const page of imported.atlas.pages) {
-      const src = [...files.entries()].find(([p]) => p.replace(/^.*\//, '') === page.name)?.[1]
-      if (src instanceof Uint8Array) writeFileSync(join(dir, page.name), src)
+      const image = imported.sources.get(page.name)
+      if (image !== undefined) writeFileSync(join(dir, page.name), encodePng(image))
     }
   } else {
     const result = exportToGodot(part, imported.atlas, imported.sources, {

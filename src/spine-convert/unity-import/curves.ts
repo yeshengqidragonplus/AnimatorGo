@@ -52,7 +52,7 @@ function numInf(v: YamlValue | undefined, fallback = 0): number {
 }
 
 /** 读一条 Unity 曲线(`m_Curve` 列表);`component` 用于 Vector3 曲线的 x / y / z */
-export function readHermite(curve: YamlValue | undefined, component?: 'x' | 'y' | 'z'): HermiteKey[] {
+export function readHermite(curve: YamlValue | undefined, component?: 'x' | 'y' | 'z' | 'w'): HermiteKey[] {
   return list(map(curve)['m_Curve']).map((k) => {
     const m = map(k)
     const pick = (v: YamlValue | undefined) => (component === undefined ? numInf(v) : numInf(map(v)[component]))
@@ -132,10 +132,11 @@ export function valueAt(keys: readonly SpineKey[], t: number): number {
 export function splitAt(keys: readonly SpineKey[], t: number): SpineKey[] {
   if (keys.some((k) => Math.abs(k.time - t) < 1e-9)) return [...keys]
   if (keys.length === 0) return []
-  if (t < keys[0]!.time) {
-    // 第一键之前:Unity 保持第一键的值 —— 补一个同值的阶梯键
-    return [{ time: t, value: keys[0]!.value, segment: { kind: 'stepped' } }, ...keys]
-  }
+  // 第一键之前 / 最后一键之后:Unity 保持端点的值 —— 补一个同值的键。段用直线(两端同值就是常数),
+  // 与别的分量的贝塞尔混在一帧时仍然精确(阶梯混贝塞尔只能近似)
+  if (t < keys[0]!.time) return [{ time: t, value: keys[0]!.value, segment: { kind: 'linear' } }, ...keys]
+  const last = keys[keys.length - 1]!
+  if (t > last.time) return [...keys.slice(0, -1), { ...last, segment: { kind: 'linear' } }, { time: t, value: last.value }]
   const out: SpineKey[] = []
   for (let i = 0; i < keys.length; i++) {
     const a = keys[i]!

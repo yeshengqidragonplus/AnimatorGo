@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { readSkeletonPart, type SkeletonPart } from '../../spine-format/binary/readSkeleton.ts'
 import type { AnimationData } from '../../spine-format/binary/readAnimations.ts'
@@ -12,7 +12,9 @@ import { drawOrderAt, slotAttachmentsAt } from '../../spine-eval/slots.ts'
 import { exportToUnity } from '../unity/export.ts'
 import { importUnity } from './readUnity.ts'
 import { loadUnityScene } from './unityEval.ts'
-import { list, map, parseUnityYaml, ref, str } from '../../unity/yaml.ts'
+import { list, map, num, parseUnityYaml, parseYamlDocument, ref, str, vec } from '../../unity/yaml.ts'
+import { spriteRecord } from '../../unity/spriteMeta.ts'
+import { expandPsdImports } from './expandPsd.ts'
 import { readUnityDir } from '../../cli/unityDir.ts'
 
 /**
@@ -447,3 +449,136 @@ describe.skipIf(!existsSync(PLAYER))('别人做的角色:逐帧换 sprite(Free 2
     expect(compareWithUnity(files)).toBeGreaterThan(100)
   })
 })
+
+/**
+ * PSD Importer 的角色(.psb / .psd):Unity 官方 2D Animation 示例,全是 Unity 里做的、不是我们导出的。
+ *
+ * 标准答案是 **Unity 自己导入的结果**(tools/unity/AnimatorGoDumpPsd.cs 导出,存在 res/unity-psd/):
+ * 生成的 prefab 每个物体的路径 / 局部 TRS / 排序 / 蒙皮骨骼,每个 sprite 的 rect / 顶点,rect 内像素的指纹,
+ * 以及每条动画在 0、¼、½、¾、1 处 SampleAnimation 后各物体的世界矩阵。
+ */
+const PSD_SAMPLES = 'UnityAnimationGo/Library/PackageCache/com.unity.2d.animation@3c53dae92956/Samples~/AnimationSamples'
+const PSD_TRUTH = 'res/unity-psd'
+interface PsdTruth {
+  asset: string
+  texture: { width: number; height: number; format: string }
+  nodes: { path: string; pos: number[]; rot: number[]; renderer?: { sprite: string; order: number }; skin?: { root: string; bones: string[] } }[]
+  sprites: { key: string; name: string; rect: number[]; pivot: number[]; ppu: number; vertices: number[]; pixels: number | null }[]
+  clips: { name: string; samples: { t: number; world: Record<string, number[]> }[] }[]
+}
+const truths = existsSync(PSD_TRUTH) ? readdirSync(PSD_TRUTH).filter((f) => f.endsWith('.json')) : []
+for (const file of truths) {
+  const truth = JSON.parse(readFileSync(`${PSD_TRUTH}/${file}`, 'utf8')) as PsdTruth
+  const rel = truth.asset.slice('Assets/PsdSamples/'.length)
+  const sampleDir = rel.slice(0, rel.indexOf('/Sprites/'))
+  const psbName = rel.slice(rel.lastIndexOf('/') + 1)
+  describe.skipIf(!existsSync(`${PSD_SAMPLES}/${rel}`))(`PSD Importer 的角色 → Spine(${rel})`, () => {
+    // 角色目录:这个 .psb 和能绑上它的 .anim
+    const all = readUnityDir(`${PSD_SAMPLES}/${sampleDir}`)
+    const files = new Map<string, string | Uint8Array>()
+    for (const [p, c] of all) {
+      if (p.endsWith(`/${psbName}`) || p.endsWith(`/${psbName}.meta`)) files.set(p, c)
+      if (p.endsWith('.anim') && typeof c === 'string') {
+        const name = str(parseUnityYaml(c).find((o) => o.type === 'AnimationClip')?.data['m_Name'])
+        if (truth.clips.some((k) => k.name === name)) {
+          files.set(p, c)
+          files.set(`${p}.meta`, all.get(`${p}.meta`)!)
+        }
+      }
+    }
+    const ex = expandPsdImports(files).files
+    const prefabPath = [...ex.keys()].find((p) => p.endsWith('.prefab'))!
+    const objects = parseUnityYaml(ex.get(prefabPath) as string)
+    const byId = new Map(objects.map((o) => [o.fileID, o]))
+    const transforms = objects.filter((o) => o.type === 'Transform')
+    type T = (typeof transforms)[number]
+    const nameOf = (t: T) => str(byId.get(ref(t.data['m_GameObject']).fileID)!.data['m_Name'])
+    const pathOf = (t: T): string => {
+      const father = ref(t.data['m_Father']).fileID
+      if (father === '0') return ''
+      const parent = pathOf(byId.get(father)!)
+      return parent === '' ? nameOf(t) : `${parent}/${nameOf(t)}`
+    }
+    const order: T[] = []
+    const walk = (t: T) => {
+      order.push(t)
+      for (const c of list(t.data['m_Children'])) walk(byId.get(ref(c).fileID)!)
+    }
+    walk(transforms.find((t) => ref(t.data['m_Father']).fileID === '0')!)
+    const componentsOf = (t: T) => list(byId.get(ref(t.data['m_GameObject']).fileID)!.data['m_Component']).map((c) => byId.get(ref(map(c)['component']).fileID)!)
+    const metaPath = [...ex.keys()].find((p) => p.endsWith('.png.meta'))!
+    const importer = map(parseYamlDocument(ex.get(metaPath) as string)['TextureImporter'])
+    const atlasImage = decodePng(ex.get(metaPath.slice(0, -'.meta'.length)) as Uint8Array)
+
+    it('⭐ 生成的物体与 Unity 一致:层级顺序、名字、局部位置 / 旋转、排序、蒙皮骨骼', () => {
+      expect(order.map(pathOf)).toEqual(truth.nodes.map((n) => n.path))
+      order.forEach((t, i) => {
+        const n = truth.nodes[i]!
+        const p = vec(t.data['m_LocalPosition'])
+        const q = vec(t.data['m_LocalRotation'])
+        expect(Math.hypot(p.x - n.pos[0]!, p.y - n.pos[1]!), `${n.path} 位置`).toBeLessThan(1e-4)
+        expect(Math.abs(q.z - n.rot[2]!) + Math.abs(q.w - n.rot[3]!), `${n.path} 旋转`).toBeLessThan(1e-5)
+        const comps = componentsOf(t)
+        const renderer = comps.find((c) => c.type === 'SpriteRenderer')
+        expect(renderer !== undefined, `${n.path} 有没有 SpriteRenderer`).toBe(n.renderer !== undefined)
+        if (n.renderer !== undefined) expect(num(renderer!.data['m_SortingOrder']), `${n.path} 排序`).toBe(n.renderer.order)
+        const skin = comps.find((c) => c.type === 'MonoBehaviour')
+        expect(skin !== undefined, `${n.path} 有没有 SpriteSkin`).toBe(n.skin !== undefined)
+        if (n.skin !== undefined) expect(list(skin!.data['m_BoneTransforms']).map((b) => pathOf(byId.get(ref(b).fileID)!)), `${n.path} 蒙皮骨骼`).toEqual(n.skin.bones)
+      })
+    })
+
+    it('⭐ sprite 与 Unity 一致:rect、顶点(Unity 单位,相对轴心);rect 内可见像素逐字节相同', () => {
+      const sheet = list(map(importer['spriteSheet'])['sprites']).map(map)
+      const ppu = num(importer['spritePixelsToUnits'])
+      for (const s of truth.sprites) {
+        // 名字表里有的,fileID 与 Unity 一致;没有的(Unity 按标识串哈希,算法不公开)按名字认
+        const record = spriteRecord(importer, s.key.split(':')[1]!, '', atlasImage)
+          ?? spriteRecord(importer, str(sheet.find((x) => str(x['name']) === s.name)?.['internalID']), '', atlasImage)
+        expect(record, s.name).not.toBeNull()
+        // Unity 把超过 Max Size 的贴图连 rect / ppu 一起缩小
+        const k = s.ppu / ppu
+        expect([record!.rect.x, record!.rect.y, record!.rect.width, record!.rect.height].map((v) => v * k), `${s.name} rect`).toEqual(s.rect)
+        // 没画网格的 sprite,Unity 导入时生成紧凑网格(裁掉透明像素),这里用整个矩形 —— 画出来一样,不比顶点
+        if (record!.vertices.length * 2 === s.vertices.length) {
+          record!.vertices.forEach((v, i) => {
+            const d = Math.hypot((v.x - record!.pivot.x) / ppu - s.vertices[i * 2]!, (v.y - record!.pivot.y) / ppu - s.vertices[i * 2 + 1]!)
+            expect(d, `${s.name} 第 ${i} 个顶点`).toBeLessThan(1e-4)
+          })
+        }
+        if (s.pixels === null || truth.texture.format !== 'RGBA32' || k !== 1) continue
+        let h = 2166136261
+        for (let y = record!.rect.y; y < record!.rect.y + record!.rect.height; y++) {
+          for (let x = record!.rect.x; x < record!.rect.x + record!.rect.width; x++) {
+            const o = ((atlasImage.height - 1 - y) * atlasImage.width + x) * 4
+            const transparent = atlasImage.data[o + 3] === 0
+            for (let c = 0; c < 4; c++) h = Math.imul(h ^ (transparent ? 0 : atlasImage.data[o + c]!), 16777619) >>> 0
+          }
+        }
+        expect(h, `${s.name} 像素指纹`).toBe(s.pixels)
+      }
+    })
+
+    it('⭐ 动画取样与 Unity 的 SampleAnimation 一致(各物体相对根物体的世界矩阵)', () => {
+      const scene = loadUnityScene(ex)
+      let checked = 0
+      for (const clip of truth.clips) {
+        for (const sample of clip.samples) {
+          const world = scene.worldAt(clip.name, sample.t)
+          for (const [path, m] of Object.entries(sample.world)) {
+            const o = world.get(path)!
+            const e = Math.max(...[o.a, o.b, o.c, o.d, o.x, o.y].map((v, i) => Math.abs(v - m[i]!)))
+            expect(e, `${clip.name}@${sample.t} ${path}`).toBeLessThan(1e-4)
+            checked++
+          }
+        }
+      }
+      expect(checked).toBe(truth.clips.reduce((n, c) => n + c.samples.reduce((m, s) => m + Object.keys(s.world).length, 0), 0))
+    })
+
+    it('⭐ 读成 Spine 后与 Unity 的规则逐点一致(顶点 + 画了哪些、先后)', () => {
+      // IK 示例的动画驱动的是场景里的 IK 目标(不在 prefab 里),Unity 也绑不上 —— 只比 setup
+      expect(compareWithUnity(ex)).toBeGreaterThan(truth.clips.length > 0 ? 10 : 0)
+    })
+  })
+}

@@ -123,7 +123,9 @@ pnpm from-unity <Unity 角色目录> --to godot|json [--out 目录] [--ppu 100] 
 **按 Unity 的规则读**:带渲染器的物体下面挂着东西 / 被动画驱动时也是骨骼;显示 = `m_Enabled` 且各级 `m_IsActive`;
 `m_Sprite` 逐帧换图;排序按 Sorting Group → Layer → Order → z。我们导出的物体名 `<slot>[__键名][#帧][@皮肤]` 只用来合 slot、分皮肤。
 ⚠️ **验收的参照物是 Unity 的规则**(`unity-import/unityEval.ts` 独立求值,顶点 + 画了哪些 + 先后),不是原 Spine。
-PSD Importer(`.psb`)的角色、SpriteResolver 换装、2D IK 还读不了(会报)。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 16 节。
+**PSD Importer 的角色(`.psb` / `.psd`)也能读**:按 `.meta` + Photoshop 图层把 Unity 导入时在内存里生成的 prefab 和大图重建出来
+(`unity-import/expandPsd.ts`),标准答案是 Unity 自己导入的结果(`tools/unity/AnimatorGoDumpPsd.cs` 导出,存在 `res/unity-psd/`)。
+SpriteResolver 换装、2D IK 还读不了(会报)。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 16 节。
 
 跑单个测试文件:`pnpm exec vitest run src/core/math.test.ts`
 跑单个用例:`pnpm exec vitest run -t "旋转差值走最短路径"`

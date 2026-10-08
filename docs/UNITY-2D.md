@@ -718,7 +718,7 @@ sprite 引用的三种写法(真实文件里都见过,`src/unity/spriteMeta.ts`)
 | Unity | Spine |
 |---|---|
 | SpriteRenderer(无 SpriteSkin) | 不加权 mesh:`骨骼局部 = 骨骼世界⁻¹ · 节点世界 · (顶点 − pivot)/ppu` |
-| SpriteRenderer + SpriteSkin | 加权 mesh:sprite 骨骼按 Unity 的规则算绑定(**根骨骼减 pivot,子骨骼不减**),`lᵢ = bindᵢ⁻¹ · v` |
+| SpriteRenderer + SpriteSkin | 加权 mesh:sprite 骨骼按 Unity 的规则算绑定(**根骨骼减 pivot,子骨骼不减**;⚠️ 骨骼不一定父在前,按 parentId 递归),`lᵢ = bindᵢ⁻¹ · v`。SpriteSkin 节点自己的变换不参与(`SpriteSkinUtility.Deform` 先乘它的 worldToLocal、渲染再乘回,抵消) |
 | SkinnedMeshRenderer | 加权 mesh:`lᵢ = bindposeᵢ · v` |
 
 region 也读成四顶点 mesh。图集每个 sprite 一个区域(Unity 的矩形原点在左下,换成左上);SkinnedMeshRenderer 用整页做区域。
@@ -748,7 +748,7 @@ region 也读成四顶点 mesh。图集每个 sprite 一个区域(Unity 的矩�
 | 情况 | 级别 |
 |---|---|
 | prefab 里嵌套了别的 prefab 实例(没展开) | loss |
-| 四元数旋转曲线 `m_RotationCurves`(导出写的是欧拉;在 Animation 窗口把插值改成 Quaternion 才会出现) | loss |
+| 四元数旋转曲线 `m_RotationCurves`(动画窗口默认的「Euler Angles (Quaternion)」插值):角度 = 2·atan2(z, w) 不是三次曲线,按 clip 的帧率采样成折线,实测最大偏差 | approximated(偏差 > 0.01° 才报) |
 | 根物体自己的变换 / 显隐动画(根物体的位置是摆在场景里的位置) | loss |
 | `m_Sprite` 以外的引用曲线(SpriteResolver 换装等) | loss |
 | 曲线指向的物体不存在,或属性不认识(`m_FlipX` 等) | loss |
@@ -757,10 +757,9 @@ region 也读成四顶点 mesh。图集每个 sprite 一个区域(Unity 的矩�
 | z 坐标的动画(只影响同层同序谁先画,没转) | approximated |
 | 同一时刻同一 slot 亮着几个挂图节点(Spine 一个 slot 只挂一个) | approximated |
 | 几套具名皮肤的挂图物体同时亮着(取第一套当初始皮肤) | approximated |
-| SpriteSkin 节点不在根物体原点 | approximated |
 
-**还读不了的**(都会在上表里报出来,不静默):PSD Importer(`.psb`)做的角色 —— prefab 是导入时生成的,磁盘上没有,
-要解析 `.psb` 图层,Unity 官方 2D Animation 示例全是这种;SpriteLibrary + SpriteResolver 换装;Unity 2D IK。
+**还读不了的**(都会在上表里报出来,不静默):SpriteLibrary + SpriteResolver 换装(`m_SpriteHash` 曲线);Unity 2D IK
+(IK 目标通常在场景里,不在 prefab 里);`.anim` 里用 `m_Sprite` 引用 PSD Importer 角色里、名字表里没有的 sprite(见 16.6)。
 Sorting Layer 的先后取渲染器里缓存的 `m_SortingLayer` 值 —— 真正的顺序在工程的 TagManager 里,不在角色目录里。
 
 ### 16.5 ⚠️ 验收的参照物是 Unity 的规则,不是原 Spine
@@ -787,6 +786,42 @@ slot 颜色 1/255。原 Spine 只做 setup 粗检,容差按导出自己的分流
 
 ⚠️ 排序里 Sorting Group / Sorting Layer / z 三条是照 Unity 文档写的,读取器和参照物用的是同一套理解,**没有在 Unity 里实测**
 (样本里没有用到它们的角色)。显示规则(`m_Enabled` × 各级 `m_IsActive`)和 `m_Sprite` 逐帧换图有真实角色兜着。
+
+### 16.6 PSD Importer 的角色(`.psb` / `.psd`)
+
+Unity 官方 2D Animation 示例、很多正经做的 2D 角色都是这种:美术在 Photoshop 里每个部件一层,存 `.psb` 拖进 Unity,
+2D PSD Importer 导入时**在内存里**拼大图、切 sprite、生成角色 prefab。磁盘上只有 Photoshop 文件和 `.meta`。
+
+`expandPsd.ts` 把它展开成等价的普通 Unity 文件(prefab + 大图 + 大图的 `.meta`),交给读取器 —— 之后一切照旧。
+规则照 PSD Importer 12.x 的源码(`PSDImporter.OnProducePrefab`、`ExtractLayerTask`,2D Common 的 `ImagePacker`):
+
+| 东西 | 从哪来 |
+|---|---|
+| 骨骼、网格、权重、sprite 的 rect / pivot | `.meta` 的 `layeredSpriteImportData`(老 `.meta` 在 `rigSpriteImportData` / `mosaicSpriteImportData`) |
+| 部件用哪几根骨骼 | `characterData.parts[].bones` —— ⚠️ int 数组在 YAML 里是**小端 uint32 的十六进制串**(和 `indices` 一样),按列表读就是空的 |
+| 共享骨架(Skeleton Sharing,引用别的 `.psb` 的骨架) | 用 `sharedRigCharacterData`,不是 `characterData`(PSDImporter.characterData) |
+| 物体 | 根 `<贴图名>_GO`;每个导入的图层一个物体(图层顺序);再挂骨骼(父骨骼先建)。**图层物体和骨骼共用一个重名表**,重名加 `_1`(Knight 的骨骼 `neck` 与同名图层撞了,Unity 里叫 `neck_1`,`.anim` 也这么写) |
+| 位置 | 图层物体 =(spritePosition + pivot)/ ppu − 文档轴心;根骨骼 = 骨骼位置 / ppu − 文档轴心 |
+| Order in Layer | 图层总数 − 图层序号(`psdLayers` 的顺序,含没导入的图层和图层组) |
+| SpriteSkin | 部件有骨骼就挂,根骨骼是根物体,骨骼顺序 = parts[].bones |
+| 像素 | Photoshop 文件只用来取像素:图层裁到画布、翻成左下原点,透明像素清零;大图 (X, Y) = 图层缓冲 (X − uvTransform.x, Y − uvTransform.y),摆回 `.meta` 里 rect 的位置 —— sprite 的 rect 原样可用 |
+| sprite 的 fileID | `internalIDToNameTable` 里类型 213 的那些。名字表里没有的,Unity 按标识串哈希,算法不公开 —— 这里自己编号,`.anim` 用 `m_Sprite` 引用它会报找不到 |
+
+Photoshop 文件自己读(`src/psd/readPsd.ts`):8 位 RGB / 灰度,原始 / RLE / ZIP 压缩;PSB 只是几处长度字段变 8 字节。
+**Unity 不套用图层不透明度和混合模式**,这里也不套。图层蒙版样本里没有,现在没套用。
+
+**验收:标准答案是 Unity 自己导入的结果。** `tools/unity/AnimatorGoDumpPsd.cs` 在 Unity 里导入后导出:生成的物体(路径、局部 TRS、
+排序、蒙皮骨骼)、每个 sprite(rect、顶点、绑定矩阵、rect 内像素指纹)、每条动画 SampleAnimation 后各物体的世界矩阵 ——
+存在 `res/unity-psd/`。官方 11 个样本(Fei、Knight / Witch / Wolf / Skeleton 共享骨架、dialog、Boris、Plunkah……):
+
+- 物体层级、名字、位置、旋转、排序、蒙皮骨骼全部一致(1e-6 级)
+- sprite 顶点一致;贴图不压缩时可见像素**逐字节相同**(137 个 sprite)。透明像素的 RGB 不比 —— Alpha Is Transparency 会往里渗颜色
+- 动画取样的世界矩阵一致(1e-5 级),**包括四元数旋转曲线**(Plunkah)
+- 读成 Spine 后与 Unity 的规则逐点一致(顶点 + 画了哪些、先后)
+- 超过 Max Size 的大图 Unity 会连 rect / ppu 一起缩小(Attachment Points 那个 Fei 是 2048×4096 → 一半),按 Unity 单位算的几何不变,这里保留原分辨率
+
+导出脚本要 Play 前先把样本的 `.meta` 改成不压缩、可读(`textureCompression: 0`、`isReadable: 1`)才能比像素;
+`SampleAnimation` 不复原没碰的属性,**每条动画要一个新实例**,不然上一条的姿势会混进来 —— 两条都是踩过的。
 
 ## 17. 待确认
 

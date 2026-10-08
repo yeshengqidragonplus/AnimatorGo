@@ -7,6 +7,7 @@ import { list, map, num, parseUnityYaml, parseYamlDocument, ref, str, vec, type 
 import { IssueCollector, type ConversionIssue } from '../types.ts'
 import { drawOrderOf } from '../../spine-eval/drawOrder.ts'
 import { align, frameCurve, readHermite, toSpineKeys, valueAt, type SpineKey } from './curves.ts'
+import { expandPsdImports } from './expandPsd.ts'
 
 /**
  * Unity 角色(我们导出、在 Unity 里改过的,或者别的工具 / 手工在 Unity 里做的)→ Spine 4.1 JSON。
@@ -62,6 +63,8 @@ export interface UnityImportResult {
   readonly nodes: readonly { readonly path: string; readonly slot: string; readonly key: string; readonly skin: string; readonly sprite: string | null }[]
   /** prefab 里亮着的那套具名皮肤(没有就是 null,用默认皮肤) */
   readonly initialSkin: string | null
+  /** 角色名(prefab 的文件名;PSD Importer 的角色是 Photoshop 文件名) */
+  readonly name: string
 }
 
 type Json = Record<string, unknown>
@@ -139,8 +142,12 @@ interface TransformNode {
   index: number
 }
 
-export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, options: UnityImportOptions = {}): UnityImportResult {
+export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, options: UnityImportOptions = {}): UnityImportResult {
   const issues = new IssueCollector()
+  // PSD Importer 的角色(.psb / .psd)先展开成等价的 prefab + 贴图
+  const expanded = expandPsdImports(input)
+  for (const i of expanded.issues) issues.add(i.level, i.path, i.message)
+  const files: ReadonlyMap<string, string | Uint8Array> = expanded.files
   const ppu = options.pixelsPerUnit ?? 100
   const text = (path: string): string => {
     const c = files.get(path)
@@ -428,21 +435,25 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
     let vertices: number[]
     if (skinComp !== undefined) {
       // 加权:sprite 骨骼的绑定 —— 根骨骼减 pivot,子骨骼相对父骨骼(writeMeta.ts 开头那三条约定)
+      // ⚠️ 骨骼不一定父在前(PSD Importer 的角色里常是子骨骼先列),按 parentId 递归算
       const binds: Affine[] = []
-      sprite.bones.forEach((b, i) => {
+      const bindOf = (i: number): Affine => {
+        const hit = binds[i]
+        if (hit !== undefined) return hit
+        const b = sprite.bones[i]!
         const pos = map(b['position'])
         const parentId = num(b['parentId'], -1)
         const deg = zDegrees(vec(b['rotation']))
         const isRoot = parentId < 0
         const x = (num(pos['x']) - (isRoot ? sprite.pivot.x : 0)) / tex.ppuTex
         const y = (num(pos['y']) - (isRoot ? sprite.pivot.y : 0)) / tex.ppuTex
-        binds[i] = isRoot ? trs(x, y, deg, 1, 1) : mul(binds[parentId]!, trs(x, y, deg, 1, 1))
-      })
-      const boneTransforms = list(skinComp.data['m_BoneTransforms']).map((t) => ref(t).fileID)
-      const nodeWorld = worldOf(n)
-      if (Math.hypot(nodeWorld.x, nodeWorld.y) > 1e-6 || Math.abs(nodeWorld.a - 1) > 1e-6 || Math.abs(nodeWorld.b) > 1e-6) {
-        issues.add('approximated', where, 'SpriteSkin 节点不在根物体原点,按原点处理')
+        binds[i] = isRoot ? trs(x, y, deg, 1, 1) : mul(bindOf(parentId), trs(x, y, deg, 1, 1))
+        return binds[i]!
       }
+      sprite.bones.forEach((_, i) => bindOf(i))
+      const boneTransforms = list(skinComp.data['m_BoneTransforms']).map((t) => ref(t).fileID)
+      // SpriteSkin 节点自己的变换不参与:SpriteSkinUtility.Deform 先乘它的 worldToLocal,渲染时再乘回 localToWorld,
+      // 正好抵消 —— 顶点 = Σ w · 骨骼世界 · bindpose · v。PSD Importer 的角色里这些节点都摆在图层位置上,不在原点
       vertices = []
       local.forEach((v, i) => {
         const w = sprite.weights[i] ?? {}
@@ -661,8 +672,54 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
     vectorCurves('m_PositionCurves', 'translate')
     vectorCurves('m_EulerCurves', 'rotate')
     vectorCurves('m_ScaleCurves', 'scale')
-    if (list(data['m_RotationCurves']).length > 0) {
-      issues.add('loss', 'm_RotationCurves', '四元数旋转曲线没转(导出时写的是欧拉曲线;在 Unity 里改成四元数插值后才会有)')
+    // 四元数旋转曲线(动画窗口默认的「Euler Angles (Quaternion)」插值就存成这个):四个分量各一条 Hermite,
+    // 角度 = 2·atan2(z, w) 不是三次曲线,Spine 的贝塞尔表达不了 —— 关键帧和帧格上采样成折线,阶梯段保持阶梯,实测最大偏差
+    for (const entry of list(data['m_RotationCurves']).map(map)) {
+      const path = str(entry['path'])
+      const n = byPath.get(path)
+      if (n === container) {
+        issues.add('loss', 'm_RotationCurves.(根物体)', '根物体自己的变换动画没转 —— 根物体的位置是角色摆在场景里的位置,不是骨骼')
+        continue
+      }
+      if (n === undefined || !boneName.has(n.id)) {
+        issues.add('loss', `m_RotationCurves.${path}`, '曲线指向的物体不存在,没转')
+        continue
+      }
+      const s = setup.get(n.id)!
+      const q = align((['x', 'y', 'z', 'w'] as const).map((c) => toSpineKeys(readHermite(entry['curve'], c).map((k) => ({ ...k, time: snap(k.time) })))))
+      const [qx, qy, qz, qw] = q as [SpineKey[], SpineKey[], SpineKey[], SpineKey[]]
+      if ([...qx, ...qy].some((k) => Math.abs(k.value) > 1e-6)) issues.add('approximated', `m_RotationCurves.${path}`, '有绕 x / y 的旋转(3D),2D 骨骼只取绕 z 的部分')
+      const angleAt = (t: number) => (2 * Math.atan2(valueAt(qz, t), valueAt(qw, t))) / DEG
+      const keys: SpineKey[] = []
+      let previous: number | null = null
+      const push = (t: number, stepped: boolean) => {
+        let a = angleAt(t)
+        if (previous !== null) a += 360 * Math.round((previous - a) / 360)
+        previous = a
+        keys.push({ time: t, value: a - s.rotation, segment: { kind: stepped ? 'stepped' : 'linear' } })
+      }
+      for (let i = 0; i < qz.length; i++) {
+        const t0 = qz[i]!.time
+        const next = qz[i + 1]
+        const stepped = qz[i]!.segment?.kind === 'stepped' && qw[i]!.segment?.kind === 'stepped'
+        push(t0, stepped)
+        if (next === undefined || stepped) continue
+        for (let f = Math.floor(t0 * fps + 1e-6) + 1; f / fps < next.time - 1e-6; f++) push(f / fps, false)
+      }
+      if (keys.length > 0 && keys[0]!.time > 1e-9) keys.unshift({ time: 0, value: keys[0]!.value, segment: { kind: 'linear' } })
+      // 相邻采样点的中点上,折线与真实角度差多少
+      let worst = 0
+      for (let i = 0; i + 1 < keys.length; i++) {
+        if (keys[i]!.segment?.kind === 'stepped') continue
+        const mid = (keys[i]!.time + keys[i + 1]!.time) / 2
+        const truth = angleAt(mid) - s.rotation
+        const line = (keys[i]!.value + keys[i + 1]!.value) / 2
+        worst = Math.max(worst, Math.abs(((truth - line + 540) % 360) - 180))
+      }
+      const byKind = (bonesOut[boneName.get(n.id)!] as Json | undefined) ?? {}
+      bonesOut[boneName.get(n.id)!] = byKind
+      byKind['rotate'] = keysToFrames([keys], (vs) => ({ value: vs[0] }))
+      if (worst > 0.01) issues.add('approximated', `m_RotationCurves.${path}`, `四元数旋转曲线按 ${fps} fps 采样成折线,最多偏 ${worst.toFixed(3)}°`)
     }
     if (Object.keys(bonesOut).length > 0) out['bones'] = bonesOut
 
@@ -830,7 +887,7 @@ export function importUnity(files: ReadonlyMap<string, string | Uint8Array>, opt
   const nodesOut = [...attachmentOf.entries()].flatMap(([id, a]) =>
     [...a.keyOfSprite.entries()].map(([sprite, key]) => ({ path: nodes.get(id)!.path, slot: a.slot, key, skin: a.skin, sprite })),
   )
-  return { json, atlas: { pages, regions }, sources, issues: issues.all, nodes: nodesOut, initialSkin }
+  return { json, atlas: { pages, regions }, sources, issues: issues.all, nodes: nodesOut, initialSkin, name: prefabName }
 }
 
 /** Spine 4.x JSON 一条动画里最晚的关键帧时刻 */

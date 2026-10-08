@@ -365,7 +365,11 @@ pnpm from-unity <Unity 产物目录> --to godot|json [--out 目录] [--ppu 100] 
 **2026-10-08 通用化**:第一版只认我们自己导出的结构,别人的角色里「图直接挂在骨骼上」会让子骨骼**静默**丢掉父骨骼。
 现在按 Unity 的规则读 —— 带渲染器的物体有子物体 / 被动画驱动时也是骨骼;显示 = `m_Enabled` 且各级 `m_IsActive`;
 `m_Sprite` 逐帧换图;排序 Sorting Group → Layer → Order → z;Single / Multiple / 老版三种 sprite 引用。
-还读不了(会报):PSD Importer(`.psb`)的角色(Unity 官方示例全是这种,下一档的大活)、SpriteResolver 换装、2D IK。
+**PSD Importer 的角色(`.psb` / `.psd`)**:Unity 导入时在内存里生成 prefab 和大图,磁盘上只有 Photoshop 文件和 `.meta`。
+按 PSD Importer 的源码重建(`expandPsd.ts`,Photoshop 文件自己读 `src/psd/readPsd.ts`),拿 **Unity 自己导入的结果**当标准答案
+(`tools/unity/AnimatorGoDumpPsd.cs` → `res/unity-psd/`):官方 11 个样本的物体、sprite、像素(137 个 sprite 逐字节)、
+动画取样全部一致。顺带补上了**四元数旋转曲线**(动画窗口默认插值存成这个,按帧率采样成折线、实测偏差)。
+还读不了(会报):SpriteResolver 换装、2D IK(Knight 的跑步靠 IK 抬腿,转过去腿只按骨骼关键帧动)。
 
 几何(SpriteRenderer / SpriteSkin / SkinnedMeshRenderer)和曲线(Hermite → 贝塞尔、Blend Shape → deform)都是**精确**换算,
 只有「阶梯与非阶梯混在一帧」和「在 Unity 里改过的 Blend Shape 权重曲线」两处近似,都报出来。
@@ -379,6 +383,7 @@ pnpm from-unity <Unity 产物目录> --to godot|json [--out 目录] [--ppu 100] 
 | 画了哪些、谁压着谁 | 上面所有样本每个采样时刻:Spine 铺出来的(物体, 图)序列 = Unity 规则算出的 |
 | 别人的角色常见的写法(在 MX2_cat 上改 9 种 + 全部一起) | 图直接挂骨骼、骨骼挂在图下面、`m_IsActive` 显隐、`m_Sprite` 换图、删 0 秒键、clip 比最后一个键长、改 Order in Layer、Sorting Group(这条和 Layer / z 只照文档,没在 Unity 里实测)。故意把读取器改坏 5 处,每处都有用例变红 |
 | 真实的别人的角色 | 第三方插件自带的 2D 演示角色(11 条 `m_Sprite` 逐帧动画、85 张 Single 贴图):逐点一致;转 Godot 后 Godot 4.7 自检通过、渲染逐帧正确 |
+| PSD Importer 的角色(Unity 官方 11 个样本) | 与 Unity 自己导入的结果比:物体、sprite、像素、动画取样全部一致;Fei / Knight 转 Godot 后自检通过、渲染正常 |
 | 与原 Spine 粗检 | setup 在 Unity 导出自己的分流判据内 |
 | Unity YAML 解析器 | 3000 个真实 Unity 文件(45975 个对象)0 异常 |
 | Unity → Godot 渲染 | MX2_cat 与 Spine 直出 Godot 的渲染一致 |

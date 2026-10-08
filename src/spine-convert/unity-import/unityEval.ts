@@ -45,7 +45,7 @@ const numInf = (v: YamlValue | undefined) => { const n = Number(str(v)); return 
 
 interface Key { t: number; v: number; in: number; out: number; mode: number; wIn: number; wOut: number }
 
-function keys(curve: YamlValue | undefined, component?: 'x' | 'y' | 'z'): Key[] {
+function keys(curve: YamlValue | undefined, component?: 'x' | 'y' | 'z' | 'w'): Key[] {
   return list(map(curve)['m_Curve']).map((k) => {
     const m = map(k)
     const pick = (v: YamlValue | undefined) => (component === undefined ? numInf(v) : numInf(map(v)[component]))
@@ -93,6 +93,8 @@ interface Node { id: string; name: string; parent: string | null; go: UnityObjec
 export interface UnityScene {
   /** 节点路径(相对根物体)→ 该时刻用的图(`guid:fileID`,SkinnedMeshRenderer 为 null)和顶点(Unity 单位,相对根物体) */
   verticesAt(clip: string | null, t: number): Map<string, { sprite: string | null; points: { x: number; y: number }[] }>
+  /** 节点路径 → 该时刻相对根物体的 2D 仿射(Unity 单位) */
+  worldAt(clip: string | null, t: number): Map<string, { a: number; b: number; c: number; d: number; x: number; y: number }>
   /** 该时刻画出来的渲染器,按画的先后(先画的在前) */
   drawnAt(clip: string | null, t: number): { path: string; sprite: string | null }[]
   /** 节点路径 → 该时刻的 m_Color(没有颜色曲线就是 prefab 里的) */
@@ -165,6 +167,10 @@ export function loadUnityScene(files: ReadonlyMap<string, string | Uint8Array>):
         for (const c of ['x', 'y', 'z'] as const) out.push({ path: str(e['path']), attr: `${attr}.${c}`, keys: keys(e['curve'], c) })
       }
     }
+    // 四元数旋转曲线:四个分量各自一条 Hermite(Unity 求值完再归一化;只看绕 z 的话 atan2 与归一化无关)
+    for (const e of list(data['m_RotationCurves']).map(map)) {
+      for (const c of ['x', 'y', 'z', 'w'] as const) out.push({ path: str(e['path']), attr: `quat.${c}`, keys: keys(e['curve'], c) })
+    }
     for (const e of list(data['m_FloatCurves']).map(map)) out.push({ path: str(e['path']), attr: `${num(e['classID'])}:${str(e['attribute'])}`, keys: keys(e['curve']) })
     parsedClips.set(clip, out)
     return out
@@ -191,7 +197,9 @@ export function loadUnityScene(files: ReadonlyMap<string, string | Uint8Array>):
       const o = ov.get(n.path)
       const p = vec(n.t.data['m_LocalPosition']), s = vec(n.t.data['m_LocalScale'])
       const q = vec(n.t.data['m_LocalRotation'])
-      const local = trs(o?.get('pos.x') ?? p.x, o?.get('pos.y') ?? p.y, o?.get('euler.z') ?? zDeg(q), o?.get('scale.x') ?? s.x, o?.get('scale.y') ?? s.y)
+      const qz = o?.get('quat.z'), qw = o?.get('quat.w')
+      const angle = qz !== undefined && qw !== undefined ? zDeg({ z: qz, w: qw }) : (o?.get('euler.z') ?? zDeg(q))
+      const local = trs(o?.get('pos.x') ?? p.x, o?.get('pos.y') ?? p.y, angle, o?.get('scale.x') ?? s.x, o?.get('scale.y') ?? s.y)
       const w = mul(world(nodes.get(n.parent!)!), local)
       cache.set(n.id, w)
       return w
@@ -234,13 +242,20 @@ export function loadUnityScene(files: ReadonlyMap<string, string | Uint8Array>):
           out.set(n.path, { sprite, points: local.map((v) => apply(w, v.x, v.y)) })
           continue
         }
+        // 骨骼不一定父在前,按 parentId 递归
         const binds: Affine[] = []
-        record.bones.forEach((b, i) => {
+        const bindOf = (i: number): Affine => {
+          if (binds[i] !== undefined) return binds[i]!
+          const b = record.bones[i]!
           const pos = map(b['position'])
           const parent = num(b['parentId'], -1)
           const isRoot = parent < 0
           const m = trs((num(pos['x']) - (isRoot ? record.pivot.x : 0)) / ppu, (num(pos['y']) - (isRoot ? record.pivot.y : 0)) / ppu, zDeg(vec(b['rotation'])), 1, 1)
-          binds[i] = isRoot ? m : mul(binds[parent]!, m)
+          binds[i] = isRoot ? m : mul(bindOf(parent), m)
+          return binds[i]!
+        }
+        record.bones.forEach((_, i) => {
+          bindOf(i)
         })
         const bones = list(skin.data['m_BoneTransforms']).map((b) => nodes.get(ref(b).fileID)!)
         out.set(n.path, {
@@ -336,5 +351,10 @@ export function loadUnityScene(files: ReadonlyMap<string, string | Uint8Array>):
     return out
   }
 
-  return { verticesAt, drawnAt, colorAt, clips: [...clips.keys()] }
+  const worldMatrices = (clip: string | null, t: number) => {
+    const world = worldAt(override(clip, t))
+    return new Map([...nodes.values()].map((n) => [n.path, world(n)] as const))
+  }
+
+  return { verticesAt, worldAt: worldMatrices, drawnAt, colorAt, clips: [...clips.keys()] }
 }
