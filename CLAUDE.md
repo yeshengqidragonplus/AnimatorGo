@@ -109,7 +109,8 @@ pnpm godot <骨架文件或目录> [--out 目录] [--atlas 图集] [--skin 初�
 ```
 
 ⚠️ **Godot 2D 的绑定姿势是 `Bone2D.rest`,每根骨骼一个、全场景共用**(Unity 是每个 sprite / Mesh 一套)。
-不在 setup 下绑的网格靠辅助子骨骼表达;绑完又改过顶点的网格,两种绑定按实测取小的、还偏就逐帧加修正轨道。
+不在 setup 下绑的网格靠辅助子骨骼表达;绑完又改过顶点的网格,同一根骨骼下挂多根辅助子骨骼、每个影响原样表达(与 Unity 共用
+`spine-convert/skinSlots.ts`)。⚠️ Polygon2D 每顶点只用权重最大的 4 根(源码写死),超过的挑留哪 4 根并拟合坐标。
 **离散轨道要 `callback_mode_discrete = 2`、换动画回 setup 要 `deterministic` + RESET、节点名不能含 `@`** ——
 三条都是探针实测出来的,不看实测一定写错。详见 [docs/GODOT.md](docs/GODOT.md)。
 

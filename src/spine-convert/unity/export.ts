@@ -26,6 +26,7 @@ import { encodePng, type Image } from '../../unity/png.ts'
 import { writeMesh, MESH_FILE_ID, type BlendShape, type BoneInfluence, type MeshVertex } from '../../unity/writeMesh.ts'
 import { writeSpriteMaterial, MATERIAL_FILE_ID, TEXTURE_FILE_ID } from '../../unity/writeMaterial.ts'
 import { skinWeightsLabel, UNLIMITED_SKIN_WEIGHTS, type QualityLevel } from '../../unity/qualitySettings.ts'
+import { bindSlots, compactSlots, truncateVertex, type BoundMesh, type PosePair } from '../skinSlots.ts'
 import { toAbsoluteBezier } from '../../spine-format/bezier.ts'
 import {
   applyPoint,
@@ -41,7 +42,7 @@ import {
 import { drawOrderOf, layerOfSlot, type DrawOrderOffset } from '../../spine-eval/drawOrder.ts'
 import { bakeAtlas, type BakedRect } from './bakeAtlas.ts'
 import { detectPremultiplied, unpremultiply } from './alpha.ts'
-import { applyFit, attachmentScale, bindMesh, estimateAtlasScale, fitAffine, fitMatrix, fitSimilarity, uvToRect, type SpineVertices } from './mesh.ts'
+import { attachmentScale, bindMesh, estimateAtlasScale, uvToRect, type SpineVertices } from './mesh.ts'
 import { resolveLinkedMeshes } from './linkedMesh.ts'
 import { describeTimeline, DUPLICATE_TIMELINE_MESSAGE, lastPerProperty } from '../../spine-format/duplicateTimelines.ts'
 import { sequenceCycle, sequenceFrameAt, sequenceRegionName, sequenceSteps, type SequenceKey } from '../../spine-eval/sequence.ts'
@@ -152,165 +153,6 @@ function unpackColor(packed: number): { r: number; g: number; b: number; a: numb
 /** 逐帧修正里,阶梯跳变前补的那个采样离跳变多远(秒) */
 const STEP_EPSILON = 1e-4
 
-/**
- * Bone4 截断的顶点:留下 4 个影响,重新挑它们的局部坐标(Unity 骨骼局部,像素)和权重,让全部姿势上
- * Σ w'ₖ·Uₖ(P)·xₖ 与 Spine 的 Σ wᵢ·Sᵢ(P)·lᵢ 的平方差之和最小。
- *
- * 未知数取 yₖ = w'ₖ·xₖ 和 w'ₖ,位置 = Σ lin(Uₖ)·yₖ + Σ w'ₖ·平移(Uₖ),对它们是线性的;Σ w'ₖ = 1 消掉最后一个权重。
- * 解出来有权重 < 1% 的(Unity 的权重不能为负,太小的除回 xₖ 会放大误差)就退回「权重固定、只挑坐标」,两种取最大误差小的。
- * 加一点向原值的岭项 —— 几根骨骼总是一起动时方程是奇异的,那时取离原值最近的解。
- */
-function fitTruncated(
-  all: readonly { bone: number; x: number; y: number; weight: number }[],
-  kept: readonly { bone: number; weight: number; local: { x: number; y: number } }[],
-  poses: readonly { spine: readonly Affine[]; unity: readonly Affine[] }[],
-): { locals: { x: number; y: number }[]; weights: number[]; error: number } {
-  const K = kept.length
-  const target = (spine: readonly Affine[]) => {
-    let x = 0
-    let y = 0
-    for (const w of all) {
-      const p = applyPoint(spine[w.bone]!, w.x, w.y)
-      x += w.weight * p.x
-      y += w.weight * p.y
-    }
-    return { x, y }
-  }
-  const targets = poses.map((pose) => target(pose.spine))
-  const errorOf = (locals: readonly { x: number; y: number }[], weights: readonly number[]) => {
-    let error = 0
-    poses.forEach((pose, i) => {
-      let x = 0
-      let y = 0
-      kept.forEach((k, q) => {
-        const p = applyPoint(pose.unity[k.bone]!, locals[q]!.x, locals[q]!.y)
-        x += weights[q]! * p.x
-        y += weights[q]! * p.y
-      })
-      error = Math.max(error, Math.hypot(x - targets[i]!.x, y - targets[i]!.y))
-    })
-    return error
-  }
-
-  /** 按行累加正规方程,加岭项后解 */
-  const leastSquares = (n: number, rowsOf: (pose: (typeof poses)[number], t: { x: number; y: number }) => { r: number[]; b: number }[], prior: readonly number[]) => {
-    const ata = Array.from({ length: n }, () => new Array<number>(n).fill(0))
-    const atb = new Array<number>(n).fill(0)
-    poses.forEach((pose, i) => {
-      for (const { r, b } of rowsOf(pose, targets[i]!)) {
-        for (let a = 0; a < n; a++) {
-          if (r[a] === 0) continue
-          for (let c = 0; c < n; c++) ata[a]![c]! += r[a]! * r[c]!
-          atb[a]! += r[a]! * b
-        }
-      }
-    })
-    const ridge = 1e-6 * Math.max(1, ...ata.map((row, i) => row[i]!))
-    for (let a = 0; a < n; a++) {
-      ata[a]![a]! += ridge
-      atb[a]! += ridge * prior[a]!
-    }
-    return solveLinear(ata, atb)
-  }
-
-  // 权重固定,只挑坐标
-  const fixedWeights = kept.map((k) => k.weight)
-  const fixed = leastSquares(
-    K * 2,
-    (pose, t) => {
-      const rx = new Array<number>(K * 2).fill(0)
-      const ry = new Array<number>(K * 2).fill(0)
-      let cx = 0
-      let cy = 0
-      kept.forEach((k, q) => {
-        const m = pose.unity[k.bone]!
-        rx[q * 2] = k.weight * m.a
-        rx[q * 2 + 1] = k.weight * m.b
-        ry[q * 2] = k.weight * m.c
-        ry[q * 2 + 1] = k.weight * m.d
-        cx += k.weight * m.x
-        cy += k.weight * m.y
-      })
-      return [{ r: rx, b: t.x - cx }, { r: ry, b: t.y - cy }]
-    },
-    kept.flatMap((k) => [k.local.x, k.local.y]),
-  )
-  let best = {
-    locals: fixed === null ? kept.map((k) => k.local) : kept.map((_, q) => ({ x: fixed[q * 2]!, y: fixed[q * 2 + 1]! })),
-    weights: fixedWeights,
-  }
-  let bestError = errorOf(best.locals, best.weights)
-
-  // 坐标和权重一起挑
-  const n = K * 2 + K - 1
-  const last = K - 1
-  const free = leastSquares(
-    n,
-    (pose, t) => {
-      const rx = new Array<number>(n).fill(0)
-      const ry = new Array<number>(n).fill(0)
-      const tl = pose.unity[kept[last]!.bone]!
-      kept.forEach((k, q) => {
-        const m = pose.unity[k.bone]!
-        rx[q * 2] = m.a
-        rx[q * 2 + 1] = m.b
-        ry[q * 2] = m.c
-        ry[q * 2 + 1] = m.d
-        if (q < last) {
-          rx[K * 2 + q] = m.x - tl.x
-          ry[K * 2 + q] = m.y - tl.y
-        }
-      })
-      return [{ r: rx, b: t.x - tl.x }, { r: ry, b: t.y - tl.y }]
-    },
-    [...kept.flatMap((k) => [k.weight * k.local.x, k.weight * k.local.y]), ...kept.slice(0, last).map((k) => k.weight)],
-  )
-  if (free !== null) {
-    const weights = kept.map((_, q) => (q < last ? free[K * 2 + q]! : 0))
-    weights[last] = 1 - weights.reduce((a, b) => a + b, 0)
-    if (weights.every((w) => w >= 0.01)) {
-      const locals = kept.map((_, q) => ({ x: free[q * 2]! / weights[q]!, y: free[q * 2 + 1]! / weights[q]! }))
-      const error = errorOf(locals, weights)
-      if (error < bestError) {
-        best = { locals, weights }
-        bestError = error
-      }
-    }
-  }
-  return { ...best, error: bestError }
-}
-
-/** 从 items 里取 k 个的全部组合(保持原顺序) */
-function combinations<T>(items: readonly T[], k: number): T[][] {
-  if (k === 0) return [[]]
-  const out: T[][] = []
-  items.forEach((item, i) => {
-    for (const rest of combinations(items.slice(i + 1), k - 1)) out.push([item, ...rest])
-  })
-  return out
-}
-
-/** 高斯消元(部分选主元);奇异返回 null */
-function solveLinear(a: number[][], b: number[]): number[] | null {
-  const n = b.length
-  const m = a.map((row, i) => [...row, b[i]!])
-  for (let c = 0; c < n; c++) {
-    let pivot = c
-    for (let r = c + 1; r < n; r++) if (Math.abs(m[r]![c]!) > Math.abs(m[pivot]![c]!)) pivot = r
-    if (Math.abs(m[pivot]![c]!) < 1e-12) return null
-    ;[m[c], m[pivot]] = [m[pivot]!, m[c]!]
-    for (let r = 0; r < n; r++) {
-      if (r === c) continue
-      const f = m[r]![c]! / m[c]![c]!
-      if (f === 0) continue
-      for (let k = c; k <= n; k++) m[r]![k]! -= f * m[c]![k]!
-    }
-  }
-  return m.map((row, i) => row[n]! / row[i]!)
-}
-
-/** 加权网格的一个影响对不上基准绑定、要另开槽位的门槛(像素)。在 setup 下绑的网格,float32 舍入也有 1e-3 像素级的差 */
-const BIND_TOLERANCE = 0.05
 
 function key(time: number, value: number, stepped: boolean): UnityKeyframe {
   return {
@@ -846,98 +688,15 @@ export function exportToUnity(
     return [...times].sort((a, b) => a - b)
   }
 
-  /** 全部动画的采样姿势(含 setup):Spine 的真实姿势(目标)和 Unity 的 TRS 层级姿势(实际)成对 */
-  let posePairs: { spine: Affine[]; unity: Affine[] }[] | null = null
+  /** 全部动画的采样姿势(含 setup):Spine 的真实姿势(目标)和 Unity 的 TRS 层级姿势(实际)成对 —— 截断拟合用 */
+  let posePairs: PosePair[] | null = null
   const allPoses = () => {
     if (posePairs !== null) return posePairs
-    posePairs = [{ spine: setupSpine, unity: setupUnity }]
+    posePairs = [{ target: setupSpine, engine: setupUnity }]
     for (const anim of part.animations) {
-      for (const t of sampleTimesOf(anim)) posePairs.push({ spine: poseAt(part, anim, t), unity: poseAt(part, anim, t, { unityCompatible: true }) })
+      for (const t of sampleTimesOf(anim)) posePairs.push({ target: poseAt(part, anim, t), engine: poseAt(part, anim, t, { unityCompatible: true }) })
     }
     return posePairs
-  }
-
-  type Point = { x: number; y: number }
-  /** 一个槽位:骨骼 + 绑定矩阵(像素,骨骼局部 → 网格空间;bindpose 是它的逆)+ 相对基准的平移 */
-  type BindSlot = { bone: number; bind: Affine; offset: Point }
-
-  /**
-   * 加权网格的绑定:顶点放哪 + 每个影响用哪个槽位。
-   *
-   * Mesh 的 bindpose 按「骨骼槽位」存,**同一根骨骼可以在 m_Bones 里出现多次、各带一个 bindpose**
-   * (2026-10-08 实测 Unity 6000.3,BakeMesh 误差 0)。所以 Spine 每个影响各自的局部坐标都能原样表达:
-   * 槽位的绑定矩阵 K 满足 K · 局部坐标 = 顶点,任何姿势下 Unity 与 Spine 逐影响相同。绑完又在别的姿势下改过
-   * 顶点的网格(同一顶点各影响在 setup 下对不齐)也精确,不用逐帧修正。
-   *
-   * 每根骨骼先有一个「基准」槽位。顶点和基准有两种候选,取多出来的槽位少的:
-   * 1. setup:顶点 = 各影响在 setup 下的加权平均,基准 = 骨骼的 setup 矩阵。在 setup 下绑的网格一个不多,
-   *    产物与以前逐字节相同
-   * 2. 按贴图拟合:每根骨骼「局部坐标 → 图上位置」拟合一个仿射,顶点 = 图上位置(整体摆到 setup 附近)。
-   *    MX2_cat 的「第二套」网格是在别的姿势下照着图绑的,setup 下对不齐,按图拟合一个不多
-   * 对不上基准的影响(差 > BIND_TOLERANCE 像素)另开槽位:K = 平移(残差)· 基准,残差相近的共用一个。
-   *
-   * Unity 的骨骼是纯 TRS 层级(没有 shear),所以基准写 Unity 的 setup 矩阵、残差按 Spine 的算:
-   * K⁻¹ · 顶点 = Unity setup⁻¹ · Spine setup · 局部坐标,setup 姿势下与 Spine 重合(shear = 0 时就是局部坐标本身)。
-   */
-  const bindSkinned = (
-    verts: SpineVertices,
-    subset: readonly number[],
-    setupMean: readonly Point[],
-    image: readonly Point[],
-  ): { v: readonly Point[]; slots: BindSlot[]; slotOf: number[][]; base: (b: number) => Affine; fitted: boolean; spread: number } => {
-    const assign = (v: readonly Point[], unityBase: (b: number) => Affine, spineBase: (b: number) => Affine) => {
-      const slots: BindSlot[] = subset.map((b) => ({ bone: b, bind: unityBase(b), offset: { x: 0, y: 0 } }))
-      const slotOf = verts.weights.map((entry, j) =>
-        entry.map((w) => {
-          const p = applyPoint(spineBase(w.bone), w.x, w.y)
-          const offset = { x: v[j]!.x - p.x, y: v[j]!.y - p.y }
-          const found = slots.findIndex(
-            (s) => s.bone === w.bone && Math.hypot(s.offset.x - offset.x, s.offset.y - offset.y) <= BIND_TOLERANCE,
-          )
-          if (found >= 0) return found
-          slots.push({ bone: w.bone, bind: multiply({ a: 1, b: 0, c: 0, d: 1, x: offset.x, y: offset.y }, unityBase(w.bone)), offset })
-          return slots.length - 1
-        }),
-      )
-      return { v, slots, slotOf, base: unityBase }
-    }
-
-    let spread = 0
-    verts.weights.forEach((entry, j) => {
-      for (const w of entry) {
-        const p = applyPoint(setupSpine[w.bone]!, w.x, w.y)
-        spread = Math.max(spread, Math.hypot(p.x - setupMean[j]!.x, p.y - setupMean[j]!.y))
-      }
-    })
-    const atSetup = assign(setupMean, (b) => setupUnity[b]!, (b) => setupSpine[b]!)
-    if (atSetup.slots.length === subset.length) return { ...atSetup, fitted: false, spread }
-
-    // 按贴图拟合:图上的位置由 UV 给出(页像素,Unity 的 v 朝上,与骨架同向)
-    const byBone = new Map<number, { src: Point[]; dst: Point[] }>()
-    verts.weights.forEach((entry, j) => {
-      for (const w of entry) {
-        const g = byBone.get(w.bone) ?? { src: [], dst: [] }
-        byBone.set(w.bone, g)
-        g.src.push({ x: w.x, y: w.y })
-        g.dst.push(image[j]!)
-      }
-    })
-    // 图 → setup 附近:整体相似变换(只为编辑器里不蒙皮时看着在原处)
-    const place = fitSimilarity(image, setupMean).fit
-    const placeM = fitMatrix(place)
-    const fittedBind = new Map<number, Affine>()
-    for (const b of subset) {
-      const g = byBone.get(b)!
-      // 点太少或共线解不出仿射时退回相似变换
-      let m: Affine | null = fitAffine(g.src, g.dst)
-      if (m === null) {
-        const { fit, determined } = fitSimilarity(g.src, g.dst)
-        m = determined ? fitMatrix(fit) : { a: 1, b: 0, c: 0, d: 1, x: g.dst[0]!.x - g.src[0]!.x, y: g.dst[0]!.y - g.src[0]!.y }
-      }
-      fittedBind.set(b, multiply(placeM, m))
-    }
-    const fitted = assign(image.map((p) => applyFit(place, p.x, p.y)), (b) => fittedBind.get(b)!, (b) => fittedBind.get(b)!)
-    return fitted.slots.length < atSetup.slots.length ? { ...fitted, fitted: true, spread } : { ...atSetup, fitted: false, spread }
   }
 
   /** 把一个网格整理成 SkinnedMeshRenderer 要的几何(骨架根空间,Unity 单位) */
@@ -956,7 +715,7 @@ export function exportToUnity(
       const r = uvToRect(uvs[j * 2]!, uvs[j * 2 + 1]!, rect.region)
       return { u: (rect.x + r.x) / page.width, v: (rect.y + r.y) / page.height }
     })
-    const setupMean: Point[] = Array.from({ length: vertexCount }, (_, j) => {
+    const setupMean = Array.from({ length: vertexCount }, (_, j) => {
       if (!verts.weighted) return applyPoint(setupSpine[slotBone]!, verts.positions[j * 2]!, verts.positions[j * 2 + 1]!)
       let x = 0
       let y = 0
@@ -968,24 +727,10 @@ export function exportToUnity(
       return { x, y }
     })
 
-    let bound: { v: readonly Point[]; slots: BindSlot[]; slotOf: number[][]; base: (b: number) => Affine; fitted: boolean; spread: number }
-    if (verts.weighted) {
-      const image = uv.map((t) => ({ x: t.u * page.width, y: t.v * page.height }))
-      bound = bindSkinned(verts, subset, setupMean, image)
-    } else {
-      bound = { v: setupMean, slots: [{ bone: slotBone, bind: setupUnity[slotBone]!, offset: { x: 0, y: 0 } }], slotOf: [], base: () => setupUnity[slotBone]!, fitted: false, spread: 0 }
-    }
-
-    /** 这根骨骼上、Unity 局部坐标为 local 的影响,落到哪个槽位(没有就新开一个) */
-    const slotAt = (bone: number, local: Point, v: Point): number => {
-      const b = bound.base(bone)
-      const p = applyPoint(b, local.x, local.y)
-      const offset = { x: v.x - p.x, y: v.y - p.y }
-      const found = bound.slots.findIndex((s) => s.bone === bone && Math.hypot(s.offset.x - offset.x, s.offset.y - offset.y) <= BIND_TOLERANCE)
-      if (found >= 0) return found
-      bound.slots.push({ bone, bind: multiply({ a: 1, b: 0, c: 0, d: 1, x: offset.x, y: offset.y }, b), offset })
-      return bound.slots.length - 1
-    }
+    // 绑定:同一根骨骼可以占多个槽位,每个影响原样表达(skinSlots.ts)
+    const bound: BoundMesh = verts.weighted
+      ? bindSlots(verts.weights, subset, { engine: (b) => setupUnity[b]!, target: (b) => setupSpine[b]! }, uv.map((t) => ({ x: t.u * page.width, y: t.v * page.height })))
+      : { v: setupMean, slots: [{ bone: slotBone, bind: setupUnity[slotBone]!, offset: { x: 0, y: 0 } }], slotOf: [], base: () => setupUnity[slotBone]!, fitted: false, spread: 0, baseCount: 1, bindCount: 1 }
 
     const vertices: MeshVertex[] = []
     const weights: BoneInfluence[][] = []
@@ -999,30 +744,12 @@ export function exportToUnity(
         const sorted = list.filter((w) => w.weight > 0).sort((p, q) => q.weight - p.weight)
         over4 ||= sorted.length > 4
         if (skinQuality === 4 && sorted.length > 4) {
-          // Bone4 只用 4 根。剩下几根的影响分不出去,但留下的 4 个影响各有自己的槽位,局部坐标可以重新挑:
-          // 按全部动画的姿势(含 setup)最小二乘,让 Σ w'ₖ·Bₖ(P)·xₖ 最贴近 Spine 的位置。
-          // 留哪 4 根也挑:不一定是权重最大的 —— 权重小但在某些动画里摆得很开的骨骼,丢掉更伤
-          // (female_lead 的 nvzhu_st1:留权重最大的 4 根,adjusted_hat 整段差 9 像素)
-          let kept = sorted.slice(0, 4)
-          let fit: ReturnType<typeof fitTruncated> | null = null
-          for (const pick of combinations(sorted.slice(0, 8), 4)) {
-            const total = pick.reduce((n, w) => n + w.weight, 0)
-            const f = fitTruncated(
-              verts.weights[j]!,
-              pick.map((k) => ({ bone: bound.slots[k.slot]!.bone, weight: k.weight / total, local: applyPoint(invert(bound.slots[k.slot]!.bind) ?? IDENTITY, bound.v[j]!.x, bound.v[j]!.y) })),
-              allPoses(),
-            )
-            if (fit === null || f.error < fit.error - 1e-9) {
-              fit = f
-              kept = pick
-            }
-          }
-          fit = fit!
+          // Bone4 只用 4 根:挑留哪 4 根、按全部动画的姿势重新拟合它们的局部坐标和权重(skinSlots.ts)。
+          // Mesh 里也只写这 4 根 —— 完整权重用不上,写了反而和拟合过的坐标、权重对不上
+          const fit = truncateVertex(bound, j, verts.weights[j]!, allPoses())!
           truncated = Math.max(truncated, fit.error)
-          const slotsOfKept = kept.map((k, q) => slotAt(bound.slots[k.slot]!.bone, fit.locals[q]!, bound.v[j]!))
-          // Mesh 里也只写这 4 根:渲染器写死 Bone4,完整权重用不上;写了反而和拟合过的坐标、权重对不上
-          weights.push(kept.map((_, q) => ({ bone: slotsOfKept[q]!, weight: fit.weights[q]! })))
-          effective.push(kept.map((_, q) => ({ slot: slotsOfKept[q]!, weight: fit.weights[q]! })))
+          weights.push(fit.slots.map((slot, q) => ({ bone: slot, weight: fit.weights[q]! })))
+          effective.push(fit.slots.map((slot, q) => ({ slot, weight: fit.weights[q]! })))
           continue
         }
         weights.push(list.map((w) => ({ bone: w.slot, weight: w.weight })))
@@ -1037,15 +764,12 @@ export function exportToUnity(
       vertices.push({ x: bound.v[j]!.x * scale, y: bound.v[j]!.y * scale, u: uv[j]!.u, v: uv[j]!.v, color })
     }
 
-    // 截断拟合会让一些槽位没人用了 —— 压掉,m_Bones 里不留空槽(顺序不变)
-    const used = [...new Set(weights.flatMap((ws) => ws.map((w) => w.bone)))].sort((a, b) => a - b)
-    const renumber = new Map(used.map((old, i) => [old, i]))
-    const compact = used.map((i) => bound.slots[i]!)
+    // 截断拟合会让一些槽位没人用了 —— 压掉,m_Bones 里不留空槽
+    const { slots: compact, renumber, extra } = compactSlots(bound, weights.flatMap((ws) => ws.map((w) => w.bone)))
     for (const ws of weights) ws.forEach((w, k) => (ws[k] = { bone: renumber.get(w.bone)!, weight: w.weight }))
     for (const es of effective) es.forEach((w, k) => (es[k] = { slot: renumber.get(w.slot)!, weight: w.weight }))
 
     if (verts.weighted) {
-      const extra = compact.length - new Set(compact.map((s) => s.bone)).size
       if (extra > 0) {
         issues.add(
           'info',

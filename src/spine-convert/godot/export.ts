@@ -5,7 +5,7 @@ import type { Atlas, AtlasRegion } from '../../core/atlas.ts'
 import { encodePng, type Image } from '../../unity/png.ts'
 import { detectPremultiplied, unpremultiply } from '../unity/alpha.ts'
 import { resolveLinkedMeshes } from '../unity/linkedMesh.ts'
-import { fitAffine, fitSimilarity, applyFit, type Fit } from '../unity/mesh.ts'
+import { bindSlots, compactSlots, truncateVertex, type PosePair } from '../skinSlots.ts'
 import { toAbsoluteBezier } from '../../spine-format/bezier.ts'
 import { describeTimeline, DUPLICATE_TIMELINE_MESSAGE, lastPerProperty } from '../../spine-format/duplicateTimelines.ts'
 import { localsAt, setupLocals, valueBetween, type Affine, type BoneLocal } from '../../spine-eval/pose.ts'
@@ -145,12 +145,6 @@ function godotWorlds(part: SkeletonPart, locals: readonly GodotLocal[]): Affine[
     out[i] = bone.parent < 0 ? m : mul(out[bone.parent]!, m)
   })
   return out
-}
-
-function fitToAffine(f: Fit): Affine {
-  const c = Math.cos(DEG * f.rotation) * f.scale
-  const s = Math.sin(DEG * f.rotation) * f.scale
-  return { a: c, b: -s, c: s, d: c, x: f.x, y: f.y }
 }
 
 // ─── 名字 ────────────────────────────────────────────────────────────────────
@@ -397,14 +391,14 @@ interface AttachmentNode {
   readonly attachment: Attachment
   /** 相对场景根的节点路径 */
   readonly path: string
-  /** 蒙皮网格:参与的骨骼(骨架下标 → 绑定骨骼在 Skeleton2D 下的路径)与绑定矩阵(Godot 骨架空间) */
+  /**
+   * 蒙皮网格:骨骼槽位(骨架下标 + 绑定矩阵,Godot 骨架空间)。**同一根骨骼可以占多个槽位** —— 绑定矩阵不是骨骼 rest 的,
+   * 用一根辅助子骨骼表达(第 3 节)
+   */
   readonly skinned?: {
-    readonly bones: readonly number[]
-    readonly binds: readonly Affine[]
-    /** 每顶点 (骨骼在 bones 里的下标, 权重) */
-    readonly weights: readonly (readonly { index: number; weight: number }[])[]
-    /** 绑定不一致(bindWeighted 第 3 档):按 setup 绑,每条动画另加逐帧修正轨道 */
-    readonly inconsistent?: { readonly uncorrected: number }
+    readonly slots: readonly { readonly bone: number; readonly bind: Affine }[]
+    /** 每顶点 (槽位下标, 权重):Godot 实际用来蒙皮的,每顶点最多 4 个 */
+    readonly weights: readonly (readonly { slot: number; weight: number }[])[]
   }
   /** 不蒙皮时挂在哪根骨骼下;顶点在它的局部空间 */
   readonly parentBone?: number
@@ -581,18 +575,7 @@ export function exportToGodot(
         parent = '.'
         const bound = bindWeighted(verts, uv, restWorld, a.name, issues, checkPoses)
         polygon = bound.polygon
-        const bones: number[] = []
-        const indexOf = new Map<number, number>()
-        for (const e of verts.weights) for (const w of e) if (!indexOf.has(w.bone)) { indexOf.set(w.bone, bones.length); bones.push(w.bone) }
-        node = {
-          ...common, polygon,
-          skinned: {
-            bones,
-            binds: bones.map((b) => bound.binds.get(b) ?? restWorld[b]!),
-            weights: verts.weights.map((e) => e.map((w) => ({ index: indexOf.get(w.bone)!, weight: w.weight }))),
-            ...(bound.inconsistent === undefined ? {} : { inconsistent: bound.inconsistent }),
-          },
-        }
+        node = { ...common, polygon, skinned: { slots: bound.slots, weights: bound.weights } }
       }
     }
 
@@ -626,12 +609,13 @@ export function exportToGodot(
     if (finalNode.skinned !== undefined) {
       const s = finalNode.skinned
       const boneList: G.GodotValue[] = []
-      s.bones.forEach((b, k) => {
-        const bind = s.binds[k]!
+      s.slots.forEach(({ bone: b, bind }, k) => {
         let target = bonePath[b]!.slice('Skeleton2D/'.length)
         if (!sameAffine(bind, restWorld[b]!)) {
-          // 辅助子骨骼:局部变换恒为单位,rest = 父骨骼 rest⁻¹ · 绑定姿势(docs/GODOT.md 第 3 节)
-          const helperKey = `${b}/${skin.name}/${a.name}`
+          // 辅助子骨骼:局部变换恒为单位,rest = 父骨骼 rest⁻¹ · 绑定姿势(docs/GODOT.md 第 3 节)。
+          // 按「骨骼 + 绑定矩阵」共用:序列帧的各帧、绑定相同的网格用同一根。⚠️ 不能按附件名认 —— wave 有两个 slot
+          // 都挂着叫 tiao 的网格(一个是 linkedmesh,贴图区域不同,按贴图拟合出的绑定也不同),按名字共用的话后一个差 21 像素
+          const helperKey = [b, bind.a, bind.b, bind.c, bind.d].map((v) => v.toFixed(6)).join('/') + `/${bind.x.toFixed(4)}/${bind.y.toFixed(4)}`
           let helper = helperBones.get(helperKey)
           if (helper === undefined) {
             const hn = names.claim(bonePath[b]!, `${part.bones[b]!.name}_bind_${a.name}`)
@@ -644,7 +628,7 @@ export function exportToGodot(
           }
           target = helper.slice('Skeleton2D/'.length)
         }
-        boneList.push(target, G.packedFloat32(s.weights.map((ws) => ws.filter((w) => w.index === k).reduce((n, w) => n + w.weight, 0))))
+        boneList.push(target, G.packedFloat32(s.weights.map((ws) => ws.filter((w) => w.slot === k).reduce((n, w) => n + w.weight, 0))))
       })
       props.push(['bones', boneList])
     }
@@ -686,8 +670,6 @@ export function exportToGodot(
 
   // ── 动画 ──
   const animationIds: string[] = []
-  /** 绑定修正轨道在采样帧之间的最大偏差,节点路径 → 像素 */
-  const correctionError = new Map<string, number>()
   /** 每个被动画碰过的属性的 setup 值 —— 写进 RESET */
   const resetValues = new Map<string, { value: G.GodotValue; discrete: boolean }>()
   const setupOf = (node: AttachmentNode, property: string): G.GodotValue => {
@@ -708,7 +690,6 @@ export function exportToGodot(
       tracks.push(...boneTracks(part, anim, kept, bonePath, is38, issues))
       tracks.push(...slotTracks(part, anim, kept, nodesOfSlot, is38, issues))
       tracks.push(...deformTracks(part, anim, kept, attachmentNodes, timelineParents, is38, issues))
-      tracks.push(...bindCorrectionTracks(part, anim, kept, attachmentNodes, new Set(tracks.map((t) => t.path)), correctionError))
       if (kept.some((t) => t.kind === 'event')) issues.loss('events', 'Spine 事件没有转(Godot 的方法轨道要有脚本接)')
     })
     for (const t of tracks) {
@@ -726,13 +707,6 @@ export function exportToGodot(
     animationIds.push(id)
     subResources.push(animationResource(id, anim.name, durationOf(anim), true, tracks))
   })
-
-  for (const node of attachmentNodes) {
-    const inc = node.skinned?.inconsistent
-    if (inc === undefined) continue
-    const between = correctionError.get(node.path) ?? 0
-    if (between > 0.5) issues.add('approximated', `mesh.${node.attachment.name}`, `绑定姿势不一致,已逐帧修正;${SAMPLE_FPS} fps 采样帧之间最多偏 ${between.toFixed(1)} 像素(不修正是 ${inc.uncorrected.toFixed(1)})`)
-  }
 
   const reset: Track[] = [...resetValues.entries()].map(([path, r]) => ({ path, kind: 'value', discrete: r.discrete, times: [0], values: [r.value] }))
   subResources.push(animationResource('Animation_RESET', 'RESET', 0.001, false, reset))
@@ -804,15 +778,18 @@ function durationOf(anim: AnimationData): number {
 }
 
 /**
- * 加权网格的绑定姿势。Godot 的绑定是「每根骨骼一个矩阵、所有顶点共用」,与 Unity 的 SkinnedMeshRenderer 同构,
- * 所以只有当网格的各影响能被**同一组**逐骨骼矩阵解释时才精确。按 Unity 那边同样的顺序选:
+ * 加权网格的绑定。Godot 的绑定是「每根骨骼一个 rest、所有顶点共用」,而 Spine 加权网格每个影响各存一份局部坐标 ——
+ * 绑完又在别的姿势下改过顶点的网格,同一顶点各影响在 setup 下对不齐(wave 的 tiao、Female staff 的 arm-RD2)。
  *
- * 1. setup 姿势下绑的(每个顶点各影响算出的位置一致):顶点 = 该位置,绑定 = 骨骼 rest。精确
- * 2. 否则从网格自己的数据里解:每根骨骼「局部坐标 → 图上的位置」各拟合一个仿射(图上的位置由 UV 给出,
- *    绑定时网格就是照着图摆的 —— MX2_cat 的「第二套」就是这种),再整体挪到 setup 附近(只为编辑器里好看)。
- *    拟合得上(残差 < 0.5 像素)就用它,精确
- * 3. 两样都不行 —— 绑完又在别的姿势下改过顶点,各顶点对应的不是同一个绑定姿势(wave 的 tiao、Female staff 的
- *    arm-RD2)。退回 1:setup 姿势精确,动起来各影响之间的不一致会露出来。**实测**所有动画关键帧上最多偏多少,报 approximated
+ * 解法与 Unity 导出共用(skinSlots.ts):**同一根骨骼可以占多个槽位**,每个槽位一个绑定矩阵,对不上的影响另开槽位,
+ * 任何姿势下都与 Spine 逐影响相同。绑定矩阵不是骨骼 rest 的槽位,用一根辅助子骨骼表达(第 3 节)。
+ * 顶点和基准两种候选(setup / 按贴图拟合),取多出来的槽位少的。
+ *
+ * Polygon2D 每顶点只用权重最大的 4 根骨骼(源码里写死 4 个槽,再归一)。超过的顶点:挑留哪 4 根、按全部动画的姿势
+ * 重新拟合它们的局部坐标和权重,实测误差报出来 —— 之前一声不响地被 Godot 截掉。
+ *
+ * 之前(2026-09-28)是「两种绑定取实测偏差小的,还偏就每条动画逐帧加 polygon 修正轨道」:准是准,但轨道体积大,
+ * 在 Godot 里改骨骼动画修正也不跟着变。
  */
 function bindWeighted(
   verts: Vertices,
@@ -821,92 +798,44 @@ function bindWeighted(
   name: string,
   issues: IssueCollector,
   poses: () => readonly (readonly Affine[])[],
-): { polygon: number[]; binds: Map<number, Affine>; inconsistent?: { uncorrected: number } } {
-  const setupPositions: { x: number; y: number }[] = []
-  let spread = 0
-  verts.weights.forEach((entry) => {
-    const ps = entry.map((w) => apply(restWorld[w.bone]!, w.x, -w.y))
-    const mean = ps.reduce((acc, p, k) => ({ x: acc.x + p.x * entry[k]!.weight, y: acc.y + p.y * entry[k]!.weight }), { x: 0, y: 0 })
-    for (const p of ps) spread = Math.max(spread, Math.hypot(p.x - mean.x, p.y - mean.y))
-    setupPositions.push(mean)
-  })
-  // 顶点和骨骼都是 float32 存的,在 setup 下绑的网格也有 1e-3 像素级的舍入差
-  const atSetup = { polygon: setupPositions.flatMap((p) => [p.x, p.y]), binds: new Map<number, Affine>() }
-  if (spread < 0.05) return atSetup
-
+): { polygon: number[]; slots: { bone: number; bind: Affine }[]; weights: { slot: number; weight: number }[][] } {
+  // Spine 的局部坐标翻成 Godot 的(Y 朝下);Godot 的骨骼有 skew,setup 与 Spine 一致,两份基准是同一个
+  const influences = verts.weights.map((e) => e.map((w) => ({ bone: w.bone, x: w.x, y: -w.y, weight: w.weight })))
+  const subset: number[] = []
+  for (const e of verts.weights) for (const w of e) if (!subset.includes(w.bone)) subset.push(w.bone)
   // 图上的位置(页像素,Y 朝下,与 Godot 同向)
   const image = verts.weights.map((_, i) => ({ x: uv[i * 2]!, y: uv[i * 2 + 1]! }))
-  const byBone = new Map<number, { src: { x: number; y: number }[]; dst: { x: number; y: number }[] }>()
-  verts.weights.forEach((entry, i) => {
-    for (const w of entry) {
-      const g = byBone.get(w.bone) ?? { src: [], dst: [] }
-      byBone.set(w.bone, g)
-      g.src.push({ x: w.x, y: -w.y })
-      g.dst.push(image[i]!)
-    }
-  })
-  // 图 → setup 附近:整体相似变换(纯为编辑器里好看)
-  const place = fitSimilarity(image, setupPositions).fit
-  const placeM = fitToAffine(place)
-  const binds = new Map<number, Affine>()
-  for (const [bone, g] of byBone) {
-    // Spine 绑定时骨骼可以带缩放 / shear,「局部坐标 → 图上位置」一般是仿射;Godot 的 rest 是任意 Transform2D,
-    // 所以按仿射拟合。点太少或共线解不出仿射时退回相似变换
-    let m = fitAffine(g.src, g.dst)
-    if (m === null) {
-      const { fit, determined } = fitSimilarity(g.src, g.dst)
-      m = determined ? fitToAffine(fit) : { a: 1, b: 0, c: 0, d: 1, x: g.dst[0]!.x - g.src[0]!.x, y: g.dst[0]!.y - g.src[0]!.y }
-    }
-    binds.set(bone, mul(placeM, m))
-  }
-  const fitted = { polygon: image.flatMap((p) => { const q = applyFit(place, p.x, p.y); return [q.x, q.y] }), binds }
+  const bound = bindSlots(influences, subset, { engine: (b) => restWorld[b]!, target: (b) => restWorld[b]! }, image)
 
-  // 两种绑定各自在全部动画姿势上逐帧量**加权后**的实际偏差(和画面上看到的一致 —— 权重小的影响对不齐,
-  // 对画面的贡献也小;只看逐影响残差会判得过严,把本来拟合得很好的网格推到更差的一档),取小的那个
-  const driftOf = (c: { polygon: readonly number[]; binds: ReadonlyMap<number, Affine> }): number => {
-    let worst = 0
-    for (const W of poses()) {
-      verts.weights.forEach((entry, i) => {
-        let gx = 0, gy = 0, sx = 0, sy = 0
-        for (const w of entry) {
-          const bind = c.binds.get(w.bone) ?? restWorld[w.bone]!
-          const g = apply(mul(W[w.bone]!, inverse(bind)), c.polygon[i * 2]!, c.polygon[i * 2 + 1]!)
-          const sp = apply(W[w.bone]!, w.x, -w.y)
-          gx += g.x * w.weight; gy += g.y * w.weight; sx += sp.x * w.weight; sy += sp.y * w.weight
-        }
-        worst = Math.max(worst, Math.hypot(gx - sx, gy - sy))
-      })
-    }
-    return worst
-  }
-  const driftSetup = driftOf(atSetup)
-  const driftFitted = driftOf(fitted)
-  const chosen = driftFitted < driftSetup ? fitted : atSetup
-  const worst = Math.min(driftSetup, driftFitted)
-  const how = chosen === fitted ? '用辅助子骨骼表达它自己的绑定姿势' : '按 setup 绑定'
-  if (worst <= 0.5) {
-    if (chosen === fitted) issues.add('info', `mesh.${name}`, `绑定姿势不是 setup 姿势(各影响的位置最多差 ${spread.toFixed(1)} 像素),${how}`)
-    return chosen
-  }
-
-  // 3. 两种都偏:绑完又在别的姿势下改过顶点。取偏得少的那种,每条动画逐帧加修正(bindCorrectionTracks);
-  //    setup 姿势的顶点直接反解成精确值 —— Godot 的蒙皮对顶点是线性的,给定绑定就有唯一解
-  const polygon: number[] = []
-  verts.weights.forEach((entry) => {
-    let m00 = 0, m01 = 0, m10 = 0, m11 = 0, rx = 0, ry = 0
-    for (const w of entry) {
-      const D = mul(restWorld[w.bone]!, inverse(chosen.binds.get(w.bone) ?? restWorld[w.bone]!))
-      m00 += w.weight * D.a; m01 += w.weight * D.b; m10 += w.weight * D.c; m11 += w.weight * D.d
-      const sp = apply(restWorld[w.bone]!, w.x, -w.y)
-      rx += w.weight * (sp.x - D.x); ry += w.weight * (sp.y - D.y)
-    }
-    const det = m00 * m11 - m01 * m10
-    polygon.push((m11 * rx - m01 * ry) / det, (-m10 * rx + m00 * ry) / det)
+  let pairs: PosePair[] | null = null
+  let truncated = 0
+  let over4 = false
+  const raw = influences.map((entry, j) => {
+    const fit = truncateVertex(bound, j, entry, (pairs ??= poses().map((W) => ({ target: W, engine: W }))))
+    if (fit === null) return entry.map((w, i) => ({ slot: bound.slotOf[j]![i]!, weight: w.weight })).filter((w) => w.weight > 0)
+    over4 = true
+    truncated = Math.max(truncated, fit.error)
+    return fit.slots.map((slot, q) => ({ slot, weight: fit.weights[q]! }))
   })
-  issues.add('info', `mesh.${name}`,
-    `绑定姿势各顶点不一致(各影响最多差 ${spread.toFixed(1)} 像素),两种绑定都对不上 —— ${how},动画里逐帧加修正` +
-    `(不修正的话误差达 ${worst.toFixed(1)} 像素)`)
-  return { polygon, binds: chosen.binds, inconsistent: { uncorrected: worst } }
+  // 截断拟合会让一些槽位没人用了 —— 压掉,不留空的辅助骨骼
+  const compact = compactSlots(bound, raw.flatMap((ws) => ws.map((w) => w.slot)))
+  const slots = compact.slots.map((s) => ({ bone: s.bone, bind: s.bind }))
+  const weights = raw.map((ws) => ws.map((w) => ({ slot: compact.renumber.get(w.slot)!, weight: w.weight })))
+
+  const extra = compact.extra
+  if (extra > 0) {
+    issues.add('info', `mesh.${name}`,
+      `绑定姿势各顶点不一致(各影响的位置最多差 ${bound.spread.toFixed(1)} 像素,绑完又改过顶点):` +
+      `另配了 ${extra} 根辅助子骨骼${bound.fitted ? ',基准按贴图拟合' : ''},各影响与 Spine 逐个一致`)
+  } else if (bound.fitted) {
+    issues.add('info', `mesh.${name}`, `绑定姿势不是 setup 姿势(各影响的位置最多差 ${bound.spread.toFixed(1)} 像素),用辅助子骨骼表达它自己的绑定姿势`)
+  }
+  if (over4) {
+    issues.add(truncated > 0.5 ? 'approximated' : 'info', `mesh.${name}`,
+      `每顶点超过 4 根骨骼,Godot 的 Polygon2D 只用权重最大的 4 根:按全部动画的姿势挑留哪四根、重新拟合它们的局部坐标和权重,` +
+      `动画里最多偏 ${truncated.toFixed(1)} 像素`)
+  }
+  return { polygon: bound.v.flatMap((p) => [p.x, p.y]), slots, weights }
 }
 
 // ─── 各类时间轴 ──────────────────────────────────────────────────────────────
@@ -1206,101 +1135,42 @@ function deformTracks(
 /**
  * 蒙皮网格在 time 时刻、带 Spine 偏移 flat(逐影响,骨骼局部)时,Godot 的 polygon 应取什么值。
  *
- * 反解 M(P)·δ = Δ:`M(P) = Σ wᵢ · lin(Bᵢ(P) · Bindᵢ⁻¹)`,Δ = Spine 的完整位置 − Godot 不加形变时的位置。
- * 绑定一致时 Δ 就是 Σ wᵢ Bᵢ dᵢ;绑定不一致(bindWeighted 第 3 档)时顺带把那部分误差也消掉。求解的那一刻精确。
+ * 反解 M(P)·δ = Δ:`M(P) = Σ w'ₖ · lin(Bₖ(P) · Bindₖ⁻¹)`(Godot 实际用的槽位和权重),Δ = Spine 的完整位置(全部影响 + 偏移)
+ * − Godot 不加形变时的位置。每个影响原样表达时 Δ 就是 Σ wᵢ Bᵢ dᵢ;超过 4 根被截掉的顶点,顺带把截断误差也消掉。求解的那一刻精确。
  */
 function skinnedPolygonAt(part: SkeletonPart, anim: AnimationData, node: AttachmentNode, flat: readonly number[], time: number): number[] {
   const s = node.skinned!
   const verts = node.attachment.data['vertices'] as Vertices
   const worlds = godotWorlds(part, localsAt(part, anim, time).map(godotLocal))
+  const ms = s.slots.map((slot) => mul(worlds[slot.bone]!, inverse(slot.bind)))
   const out: number[] = []
   let k = 0
   verts.weights.forEach((entry, i) => {
-    let m00 = 0, m01 = 0, m10 = 0, m11 = 0, dx = 0, dy = 0
-    const vx = node.polygon[i * 2]!, vy = node.polygon[i * 2 + 1]!
+    // Spine:局部坐标 + 偏移(Y 上)→ Godot 局部 (x, −y) → 世界
+    let tx = 0, ty = 0
     for (const w of entry) {
-      const Bi = worlds[w.bone]!
-      const D = mul(Bi, inverse(s.binds[s.bones.indexOf(w.bone)]!))
-      m00 += w.weight * D.a; m01 += w.weight * D.b; m10 += w.weight * D.c; m11 += w.weight * D.d
-      // Spine 的局部坐标 + 偏移(Y 上)→ Godot 局部 (x, −y) → 世界
-      const spine = apply(Bi, w.x + (flat[k] ?? 0), -(w.y + (flat[k + 1] ?? 0)))
-      const base = apply(D, vx, vy)
-      dx += w.weight * (spine.x - base.x)
-      dy += w.weight * (spine.y - base.y)
+      const sp = apply(worlds[w.bone]!, w.x + (flat[k] ?? 0), -(w.y + (flat[k + 1] ?? 0)))
+      tx += w.weight * sp.x
+      ty += w.weight * sp.y
       k += 2
     }
+    // Godot:槽位蒙皮
+    let m00 = 0, m01 = 0, m10 = 0, m11 = 0, bx = 0, by = 0
+    const vx = node.polygon[i * 2]!, vy = node.polygon[i * 2 + 1]!
+    for (const e of s.weights[i]!) {
+      const D = ms[e.slot]!
+      m00 += e.weight * D.a; m01 += e.weight * D.b; m10 += e.weight * D.c; m11 += e.weight * D.d
+      const b = apply(D, vx, vy)
+      bx += e.weight * b.x
+      by += e.weight * b.y
+    }
     const det = m00 * m11 - m01 * m10
+    const dx = tx - bx
+    const dy = ty - by
     out.push(
       vx + (Math.abs(det) < 1e-12 ? 0 : (m11 * dx - m01 * dy) / det),
       vy + (Math.abs(det) < 1e-12 ? 0 : (-m10 * dx + m00 * dy) / det),
     )
-  })
-  return out
-}
-
-/**
- * 绑定不一致的蒙皮网格(bindWeighted 第 3 档)在没有 deform 的动画里也会偏 —— 按 SAMPLE_FPS 逐帧反解出
- * 修正量,打成 polygon 轨道。这条动画里偏不到 0.5 像素就不写。已有 polygon 轨道的(deform)那条自带修正。
- */
-function bindCorrectionTracks(
-  part: SkeletonPart,
-  anim: AnimationData,
-  timelines: readonly Timeline[],
-  nodes: readonly AttachmentNode[],
-  existing: ReadonlySet<string>,
-  between: Map<string, number>,
-): Track[] {
-  const out: Track[] = []
-  const kept = { ...anim, timelines: [...timelines] }
-  for (const node of nodes) {
-    if (node.skinned?.inconsistent === undefined || existing.has(`${node.path}:polygon`)) continue
-    const times = sampleTimes(durationOf(anim), timelines.filter((t) => BONE_KINDS.has(t.kind)))
-    const polygons = times.map((t) => skinnedPolygonAt(part, kept, node, [], t))
-    let worst = 0
-    for (const p of polygons) for (let i = 0; i < p.length; i += 2) worst = Math.max(worst, Math.hypot(p[i]! - node.polygon[i]!, p[i + 1]! - node.polygon[i + 1]!))
-    if (worst < 0.5) continue
-    // 采样帧之间 Godot 线性插值:拿中点的精确解和插值比。超过 0.5 像素就在中间插一帧,
-    // 直到够了或者密到 1/480 秒(动得很快的部件 30 fps 不够,实测 female_lead 的 nvzhu_t_gb6 帧间差 8 像素)
-    const midGap = (k: number): number => {
-      const mid = (times[k]! + times[k + 1]!) / 2
-      const exact = skinnedWorld(part, kept, node, skinnedPolygonAt(part, kept, node, [], mid), mid)
-      const lerped = skinnedWorld(part, kept, node, polygons[k]!.map((v, j) => (v + polygons[k + 1]![j]!) / 2), mid)
-      let g = 0
-      for (let j = 0; j < exact.length; j += 2) g = Math.max(g, Math.hypot(exact[j]! - lerped[j]!, exact[j + 1]! - lerped[j + 1]!))
-      return g
-    }
-    let gap = between.get(node.path) ?? 0
-    for (let k = 0; k + 1 < times.length;) {
-      const g = midGap(k)
-      if (g > 0.5 && times[k + 1]! - times[k]! > 2 / 480) {
-        const mid = (times[k]! + times[k + 1]!) / 2
-        times.splice(k + 1, 0, mid)
-        polygons.splice(k + 1, 0, skinnedPolygonAt(part, kept, node, [], mid))
-        continue
-      }
-      gap = Math.max(gap, g)
-      k++
-    }
-    between.set(node.path, gap)
-    out.push({ path: `${node.path}:polygon`, kind: 'value', times, values: polygons.map((p) => G.packedVector2(p)) })
-  }
-  return out
-}
-
-/** 蒙皮网格在 time 时刻、polygon 取 poly 时,Godot 画出来的顶点(骨架空间) */
-function skinnedWorld(part: SkeletonPart, anim: AnimationData, node: AttachmentNode, poly: readonly number[], time: number): number[] {
-  const s = node.skinned!
-  const worlds = godotWorlds(part, localsAt(part, anim, time).map(godotLocal))
-  const ms = s.bones.map((b, k) => mul(worlds[b]!, inverse(s.binds[k]!)))
-  const out: number[] = []
-  s.weights.forEach((ws, i) => {
-    let x = 0, y = 0
-    for (const w of ws) {
-      const p = apply(ms[w.index]!, poly[i * 2]!, poly[i * 2 + 1]!)
-      x += p.x * w.weight
-      y += p.y * w.weight
-    }
-    out.push(x, y)
   })
   return out
 }

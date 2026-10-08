@@ -343,7 +343,11 @@ Unity batchmode 自检 + `angry` 三套皮肤各渲两帧肉眼看(见下)。
 路线已定(2026-09-09,见 [DECISIONS.md](DECISIONS.md)):**Spine → Unity 先做正常动画,
 VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
-1. **Cocos 原生节点 + 动画剪辑**(用户定:不用 Cocos 自带的 Spine 组件)。Cocos 原生没有网格蒙皮,只能做刚性部件
+1. **Cocos 原生节点 + 动画剪辑**(用户定:不用 Cocos 自带的 Spine 组件)。**等用户装好 Cocos Creator 再开始**(2026-10-08)。
+   已定:目标 **3.8.x**(2.x 2023 年起停更);**先探针再定加权网格**。Cocos 2D 的 Sprite 没有骨骼蒙皮,而 MergeCooking2 的
+   535 个骨架里 **278 个(52%)有加权网格**、170 个有 deform,只有图片部件的 164 个 —— 只做刚性部件等于一半角色明显不对。
+   计划:图片部件 + 不加权网格走 2D 原生(Sprite、Sorting2D 管绘制顺序);同时实测 3D 的 SkinnedMeshRenderer(带 morph 形变)
+   放进 2D(UIMeshRenderer,或 3D 相机 + Sorting)行不行,行就像 Unity 那样让加权网格走它,不行再商量
 2. `.skel` 里往返验不出的区域:path 约束里同类型字段的语义顺序(字节布局已由 99 个真实文件确认,
    见 [SPINE-BINARY.md](SPINE-BINARY.md) 第 9 节)
 3. **VAT 出口** —— 极限性能时才需要。来源有两个:Spine 直出,以及 Unity 正常动画烘焙。
@@ -351,6 +355,9 @@ VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
 ~~跨度 < 64px 的加权网格不参与缩放分流~~ 查下来不是缺口,见上文。
 ~~Unity SkinnedMeshRenderer 的绑定误差~~ 已修(2026-10-08),见下文。
+~~Godot 的逐帧修正轨道~~ 已换成「同一根骨骼挂多根辅助子骨骼」(2026-10-08),顺带补上了**静默截断**:Polygon2D 每顶点只用
+4 根骨骼,之前导出不报、测试也看不出(MergeCooking2 里 90 个骨架,最大 11.2 像素);现在挑留哪 4 根并拟合,最大 2.9 像素且都报。
+见 [GODOT.md](GODOT.md) 第 6 节。
 ~~Unity 曲线帧之间的误差~~(运行时重采样带权切线,几像素)用户定不改(2026-10-08),见 DECISIONS.md。
 ~~工程 Quality 的 Skin Weights 没读~~ 已做(2026-10-08):导出时逐档查,截到走 SkinnedMeshRenderer 的网格就报。
 ~~Godot 导出~~ 中转模型 → Godot 已做完(2026-09-28),见下文。

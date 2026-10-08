@@ -140,12 +140,24 @@ class GodotScene {
       skin.push({ m: mul(this.world(bonePath, values), inverse(this.restWorld(bonePath))), w: args(bones[k + 1]) })
     }
     for (let i = 0; i < polygon.length / 2; i++) {
+      // Godot 的 Polygon2D(scene/2d/polygon_2d.cpp):按 bones 数组的顺序逐个插进 4 个槽,只留权重最大的 4 个
+      // (严格小于才挤掉,权重相同时先来的优先),再归一
+      const top: { s: number; w: number }[] = []
+      skin.forEach((sk, si) => {
+        const w = sk.w[i]!
+        if (w === 0) return
+        const at = top.findIndex((t) => t.w < w)
+        if (at >= 0) top.splice(at, 0, { s: si, w })
+        else if (top.length < 4) top.push({ s: si, w })
+        top.length = Math.min(top.length, 4)
+      })
+      const total = top.reduce((n, t) => n + t.w, 0)
       let x = 0
       let y = 0
-      for (const s of skin) {
-        const p = apply(s.m, polygon[i * 2]!, polygon[i * 2 + 1]!)
-        x += p.x * s.w[i]!
-        y += p.y * s.w[i]!
+      for (const t of top) {
+        const p = apply(skin[t.s]!.m, polygon[i * 2]!, polygon[i * 2 + 1]!)
+        x += (p.x * t.w) / total
+        y += (p.y * t.w) / total
       }
       out.push({ x, y })
     }
@@ -197,8 +209,8 @@ const SAMPLES: { label: string; skel: string; atlas: string }[] = [
   { label: 'Female staff(linkedmesh)', skel: `${MC2}/Customer12/Female staff.skel.bytes`, atlas: `${MC2}/Customer12/Female staff.atlas.txt` },
   { label: 'blackrichwoman(6 套皮肤)', skel: `${MC2}/Customer11/blackrichwoman.skel.bytes`, atlas: `${MC2}/Customer11/blackrichwoman.atlas.txt` },
   { label: 'BBQ_grill(100 个 region、换图)', skel: `${MC2}/BBQ/BBQ_grill.skel.bytes`, atlas: `${MC2}/BBQ/BBQ_grill.atlas.txt` },
-  // B_body2 的绑定姿势各顶点不一致、按图也拟合不上:不逐帧修正的话动画里差 127 像素
-  { label: 'whiteman_sit(绑定不一致,靠逐帧修正)', skel: `${MC2}/MapCharacters/whiteman_sit/whiteman_sit.skel.bytes`, atlas: `${MC2}/MapCharacters/whiteman_sit/whiteman_sit.atlas.txt` },
+  // B_body2 的绑定姿势各顶点不一致、按图也拟合不上:每根骨骼一个 rest 的话动画里差 127 像素,靠多配辅助子骨骼
+  { label: 'whiteman_sit(绑定不一致,靠辅助子骨骼)', skel: `${MC2}/MapCharacters/whiteman_sit/whiteman_sit.skel.bytes`, atlas: `${MC2}/MapCharacters/whiteman_sit/whiteman_sit.atlas.txt` },
 ]
 
 for (const sample of SAMPLES) {
@@ -229,7 +241,7 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
     })))
 
   /**
-   * 绑定姿势各影响不一致、又按图拟合不上的网格(bindWeighted 第 3 档):导出器自己逐帧实测了动画里最多偏多少并报出来。
+   * 每顶点超过 4 根骨骼的网格:Godot 只用 4 根,导出器挑了留哪 4 根、拟合了坐标,自己实测了动画里最多偏多少并报出来。
    * 这里核对「报出来的数兜得住实际偏差」—— 允许 20% 的余量,因为这里的取样时刻(关键帧 + 中点)与导出器的(30 fps)不同
    */
   const reported = new Map<string, number>()
@@ -249,7 +261,7 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
       const spine = attachmentVertices(part, atlas, a, skin, slot, pose, anim, t).map((p) => ({ x: p.x, y: -p.y }))
       const godot = scene.vertices(node, values)
       expect(godot.length, a.name).toBe(spine.length)
-      const allowed = anim === null ? tolerance : Math.max(tolerance, (reported.get(a.name) ?? 0) * 1.2 + 0.1)
+      const allowed = Math.max(tolerance, (reported.get(a.name) ?? 0) * 1.2 + 0.1)
       spine.forEach((p, i) => {
         const d = Math.hypot(p.x - godot[i]!.x, p.y - godot[i]!.y) - allowed
         if (d > excess) { excess = d; where = `${a.name} 第 ${i} 个顶点 @${anim?.name ?? 'setup'} ${t.toFixed(3)} 偏 ${(d + allowed).toFixed(2)} 像素(允许 ${allowed.toFixed(2)})` }
