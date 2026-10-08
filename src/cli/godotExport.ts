@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { basename, dirname, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { collectSkeletons, findAtlas, loadAtlas, readSkeleton, stemOf } from './skeletonInputs.ts'
+import { findGodotProject, godotResDir } from './godotProject.ts'
 import { exportToGodot } from '../spine-convert/godot/export.ts'
 import type { ConversionIssue } from '../spine-convert/types.ts'
 
@@ -58,18 +59,6 @@ function parseArgs(argv: readonly string[]): Options | string {
   }
 }
 
-/** 输出目录所在的 Godot 工程根(有 project.godot 的那层);不在工程里返回 null */
-function findGodotProject(outDir: string): string | null {
-  let dir = resolve(outDir)
-  for (let up = 0; up < 16; up++) {
-    if (existsSync(join(dir, 'project.godot'))) return dir
-    const parent = dirname(dir)
-    if (parent === dir) break
-    dir = parent
-  }
-  return null
-}
-
 const MARKS: Record<string, string> = { loss: '✗', approximated: '≈', info: 'ℹ' }
 const describe = (issue: ConversionIssue) => `    ${MARKS[issue.level] ?? '·'} ${issue.path}:${issue.message}`
 
@@ -108,7 +97,7 @@ function main(): void {
       const { atlas, sources } = loadAtlas(found.path)
 
       const dir = join(parsed.out, stem)
-      const resDir = project === null ? '' : `res://${relative(project, dir).split(sep).join('/')}`
+      const resDir = godotResDir(project, dir)
       const result = exportToGodot(part, atlas, sources, { name: stem, resDir, skipImages: parsed.dryRun, ...(parsed.skin === null ? {} : { skin: parsed.skin }) })
       if (!parsed.dryRun) {
         mkdirSync(dir, { recursive: true })

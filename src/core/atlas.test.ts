@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { packedSize, parseAtlas, regionUVs } from './atlas.ts'
+import { packedSize, parseAtlas, regionUVs, writeAtlas } from './atlas.ts'
 
 /**
  * 语义提醒(见 atlas.ts 顶部):
@@ -204,6 +204,19 @@ describe.skipIf(!existsSync(REAL_ATLAS))('真实图集不变量', () => {
         expect(uv).toBeGreaterThanOrEqual(0)
         expect(uv).toBeLessThanOrEqual(1)
       }
+    }
+  })
+})
+
+describe('writeAtlas', () => {
+  it('真实图集读 → 写 → 再读,区域逐项相等(含旋转与裁剪)', () => {
+    for (const path of ['res/spine/4.1/MX2_cat.atlas.txt', 'res/spine/3.8/MX2_cat.atlas.txt']) {
+      if (!existsSync(path)) continue
+      const atlas = parseAtlas(readFileSync(path, 'utf8'))
+      const again = parseAtlas(writeAtlas(atlas))
+      expect(again.pages.map((p) => [p.name, p.width, p.height])).toEqual(atlas.pages.map((p) => [p.name, p.width, p.height]))
+      expect([...again.regions.values()].sort((a, b) => a.name.localeCompare(b.name))).toEqual([...atlas.regions.values()].sort((a, b) => a.name.localeCompare(b.name)))
+      expect([...atlas.regions.values()].some((r) => r.rotate === 90)).toBe(true)
     }
   })
 })

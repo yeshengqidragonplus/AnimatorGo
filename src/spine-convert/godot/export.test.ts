@@ -1,11 +1,11 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { readSkeletonPart, type SkeletonPart } from '../../spine-format/binary/readSkeleton.ts'
-import type { Attachment, Vertices } from '../../spine-format/binary/readSkins.ts'
+import { readSkeletonPart } from '../../spine-format/binary/readSkeleton.ts'
 import type { AnimationData } from '../../spine-format/binary/readAnimations.ts'
-import { parseAtlas, type Atlas } from '../../core/atlas.ts'
+import { parseAtlas } from '../../core/atlas.ts'
 import { decodePng, type Image } from '../../unity/png.ts'
-import { poseAt, setupPose, valueBetween, type Affine } from '../../spine-eval/pose.ts'
+import { poseAt, setupPose, type Affine } from '../../spine-eval/pose.ts'
+import { attachmentVertices } from '../../spine-eval/vertices.ts'
 import { lastPerProperty } from '../../spine-format/duplicateTimelines.ts'
 import { parseScene, type ParsedSection, type ParsedValue } from '../../godot/tscn.ts'
 import { exportToGodot } from './export.ts'
@@ -29,7 +29,6 @@ import { exportToGodot } from './export.ts'
 const SKELETON = 'res/spine/4.1/MX2_cat.skel.bytes'
 const ATLAS = 'res/spine/4.1/MX2_cat.atlas.txt'
 const PAGE = 'res/spine/4.1/MX2_cat.png'
-const DEG = Math.PI / 180
 const hasAssets = [SKELETON, ATLAS, PAGE].every(existsSync)
 
 // ─── 按 Godot 的规则求值 ─────────────────────────────────────────────────────
@@ -183,69 +182,6 @@ function evalTrack(type: string, keys: Record<string, ParsedValue>, t: number): 
   return { $: (a as { $: string }).$, args: aa.map((v, k) => v + (bb[k]! - v) * f) }
 }
 
-// ─── 按 Spine 的规则求值 ─────────────────────────────────────────────────────
-
-function spineVertices(part: SkeletonPart, atlas: Atlas, a: Attachment, skinName: string, slotIndex: number, pose: readonly Affine[], anim: AnimationData | null, t: number): { x: number; y: number }[] {
-  const slot = part.slots[slotIndex]!
-  const flip = (p: { x: number; y: number }) => ({ x: p.x, y: -p.y })
-  if (a.type === 'region') {
-    const d = a.data as Record<string, number>
-    const region = atlas.regions.get((a.data['path'] as string | null) ?? a.name)!
-    const w = d['width']!, h = d['height']!
-    const lx = (-w / 2 + (region.offsetX / region.originalWidth) * w) * d['scaleX']!
-    const ly = (-h / 2 + (region.offsetY / region.originalHeight) * h) * d['scaleY']!
-    const lx2 = (w / 2 - ((region.originalWidth - region.offsetX - region.width) / region.originalWidth) * w) * d['scaleX']!
-    const ly2 = (h / 2 - ((region.originalHeight - region.offsetY - region.height) / region.originalHeight) * h) * d['scaleY']!
-    const cos = Math.cos(DEG * d['rotation']!), sin = Math.sin(DEG * d['rotation']!)
-    const bone = pose[slot.bone]!
-    return [[lx, ly], [lx2, ly], [lx2, ly2], [lx, ly2]].map(([x, y]) => flip(apply(bone, x! * cos - y! * sin + d['x']!, y! * cos + x! * sin + d['y']!)))
-  }
-  const verts = a.data['vertices'] as Vertices
-  const count = a.data['vertexCount'] as number
-  const flatLength = verts.weighted ? verts.weights.reduce((n, w) => n + w.length * 2, 0) : count * 2
-  const offsets = new Array<number>(flatLength).fill(0)
-  if (anim !== null) {
-    for (const tl of lastPerProperty(anim.timelines).kept) {
-      if (tl.kind !== 'deform' || tl.owner !== slotIndex) continue
-      const rec = tl.frames[0] as { skin: number | string; attachment: string; frames: Record<string, unknown>[] }
-      // deform 按「皮肤 + slot + 键名」认目标:几套皮肤同键名的围巾各有各的
-      const recSkin = typeof rec.skin === 'number' ? part.skins[rec.skin]?.name : rec.skin
-      if (recSkin !== skinName || (rec.attachment !== a.key && rec.attachment !== a.name)) continue
-      const frames = rec.frames
-      if (t < Number(frames[0]!['time'] ?? 0)) continue
-      let i = frames.length - 1
-      for (let k = 0; k < frames.length - 1; k++) if (t < Number(frames[k + 1]!['time'])) { i = k; break }
-      const flat = (f: Record<string, unknown>) => {
-        const out = new Array<number>(flatLength).fill(0)
-        const v = (f['vertices'] as number[] | undefined) ?? []
-        v.forEach((x, k) => { out[Number(f['start'] ?? 0) + k] = x })
-        return out
-      }
-      const f0 = flat(frames[i]!)
-      const f1 = i + 1 < frames.length ? flat(frames[i + 1]!) : f0
-      const p = i + 1 < frames.length ? valueBetween([{ ...frames[i]!, v: 0 }, { ...frames[i + 1]!, v: 1 }], 0, 'v', t, part.header.major === '3.8') : 0
-      f0.forEach((x, k) => { offsets[k] = x + (f1[k]! - x) * p })
-    }
-  }
-  if (!verts.weighted) {
-    const bone = pose[slot.bone]!
-    return Array.from({ length: count }, (_, i) => flip(apply(bone, verts.positions[i * 2]! + offsets[i * 2]!, verts.positions[i * 2 + 1]! + offsets[i * 2 + 1]!)))
-  }
-  const out: { x: number; y: number }[] = []
-  let k = 0
-  for (const entry of verts.weights) {
-    let x = 0, y = 0
-    for (const w of entry) {
-      const p = apply(pose[w.bone]!, w.x + offsets[k]!, w.y + offsets[k + 1]!)
-      x += p.x * w.weight
-      y += p.y * w.weight
-      k += 2
-    }
-    out.push(flip({ x, y }))
-  }
-  return out
-}
-
 // ─── 用例 ────────────────────────────────────────────────────────────────────
 
 const MC2 = 'E:/UnityProject/MergeCooking2/MergeCooking2/Assets/Export/Spine/NewSpine'
@@ -309,7 +245,8 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
     let excess = -Infinity
     let where = ''
     for (const { a, skin, slot, node } of pairs) {
-      const spine = spineVertices(part, atlas, a, skin, slot, pose, anim, t)
+      // Spine 的顶点(Y 朝上)翻成 Godot 坐标
+      const spine = attachmentVertices(part, atlas, a, skin, slot, pose, anim, t).map((p) => ({ x: p.x, y: -p.y }))
       const godot = scene.vertices(node, values)
       expect(godot.length, a.name).toBe(spine.length)
       const allowed = anim === null ? tolerance : Math.max(tolerance, (reported.get(a.name) ?? 0) * 1.2 + 0.1)

@@ -1,4 +1,4 @@
-# 开发进度与交接(2026-09-28)
+# 开发进度与交接(2026-10-08)
 
 ## 产品定位
 
@@ -342,16 +342,47 @@ Unity batchmode 自检 + `angry` 三套皮肤各渲两帧肉眼看(见下)。
 路线已定(2026-09-09,见 [DECISIONS.md](DECISIONS.md)):**Spine → Unity 先做正常动画,
 VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
-1. **Unity 产物 → 中转模型**(读回我们导出、又在 Unity 里改过的角色)—— 接上下面的 Godot 写出器就是 Unity → Godot(2026-09-28 用户定的方向)
-2. **Cocos 原生节点 + 动画剪辑**(用户定:不用 Cocos 自带的 Spine 组件)。Cocos 原生没有网格蒙皮,只能做刚性部件
-3. **Unity SkinnedMeshRenderer 的绑定误差**:见下文「Unity 导出里之前没报的绑定误差」,现在只报不修
-4. `.skel` 里往返验不出的区域:path 约束里同类型字段的语义顺序(字节布局已由 99 个真实文件确认,
+1. **Cocos 原生节点 + 动画剪辑**(用户定:不用 Cocos 自带的 Spine 组件)。Cocos 原生没有网格蒙皮,只能做刚性部件
+2. **Unity SkinnedMeshRenderer 的绑定误差**:见下文「Unity 导出里之前没报的绑定误差」,现在只报不修
+3. `.skel` 里往返验不出的区域:path 约束里同类型字段的语义顺序(字节布局已由 99 个真实文件确认,
    见 [SPINE-BINARY.md](SPINE-BINARY.md) 第 9 节)
-5. **VAT 出口** —— 极限性能时才需要。来源有两个:Spine 直出,以及 Unity 正常动画烘焙。
+4. **VAT 出口** —— 极限性能时才需要。来源有两个:Spine 直出,以及 Unity 正常动画烘焙。
    求值器按「(数据, 时间) → 顶点数组」设计,让两边共用
 
 ~~跨度 < 64px 的加权网格不参与缩放分流~~ 查下来不是缺口,见上文。
 ~~Godot 导出~~ 中转模型 → Godot 已做完(2026-09-28),见下文。
+~~Unity 产物 → 中转模型~~ 已做完(2026-10-08),接上 Godot 写出器就是 Unity → Godot,见下文。
+
+### ✅ Unity 产物 → 中转模型 → Godot(2026-10-08)
+
+```bash
+pnpm from-unity <Unity 产物目录> --to godot|json [--out 目录] [--ppu 100] [--skin 初始皮肤]
+```
+
+读我们导到 Unity、**又在 Unity 里改过**的角色(prefab + `.anim` + controller + 贴图 / Mesh / 材质及 `.meta`),写成 Spine 4.1 JSON,
+过 `fromJson` 进中转模型,再接 Godot 写出器;`--to json` 顺带就是 Unity → Spine。规则与会报的东西见 [UNITY-2D.md](UNITY-2D.md) 第 16 节。
+
+几何(SpriteRenderer / SpriteSkin / SkinnedMeshRenderer)和曲线(Hermite → 贝塞尔、Blend Shape → deform)都是**精确**换算,
+只有「阶梯与非阶梯混在一帧」和「在 Unity 里改过的 Blend Shape 权重曲线」两处近似,都报出来。
+
+验证:
+
+| 层 | 结果 |
+|---|---|
+| 与 **Unity 的规则**逐点比(`unityEval.ts` 独立求值) | 7 个样本(MX2_cat 3.8 / 4.1、加权 deform、全靠 deform、linkedmesh、6 套皮肤、100 个 region):setup + 每条动画的关键帧 / 四分点 / 中点,0.05 像素全过;slot 颜色差 < 1/255 |
+| 在 Unity 里改过 | 改关键帧值、插新关键帧、挪 prefab 里的骨骼:改动落在对应时间轴 / 骨骼上,逐点仍符合 Unity 的规则 |
+| 与原 Spine 粗检 | setup 在 Unity 导出自己的分流判据内 |
+| Unity YAML 解析器 | 3000 个真实 Unity 文件(45975 个对象)0 异常 |
+| Unity → Godot 渲染 | MX2_cat 与 Spine 直出 Godot 的渲染一致 |
+
+### ⚠️ 做读取器时查出的 Unity 导出问题(2026-10-08)
+
+两处都是**一声不响**丢东西,现在都报:
+
+- **setup 的 shear**:动画里的 shear 时间轴一直报丢,setup 带 shear 的骨骼却没报 —— BBQ_grill 的 smoke3 / smoke4
+  (17.8° / −9.5°)烟雾整块歪 5 像素。MergeCooking2 + res 共 537 个骨架里 **6 个骨架、10 根骨骼**
+- **3.8 的 `twoColor` 时间轴整条没转**(连亮色一起):颜色分支只认 `color` / `slotColor*`。现在亮色照转、暗色报丢。
+  全盘 537 个骨架里 0 个用到,实际影响为 0
 
 ### ✅ Spine(中转模型)→ Godot 4(2026-09-28)
 
@@ -484,3 +515,7 @@ JSON 这几处的根因是**只做过「我们写 → 我们读」的自洽往�
 验收要有一条硬指标(读到精确 EOF、逐字节往返、亚像素偏差),
 而不是「看起来对」。**近似/有损的计数异常本身就是最好的报警器** ——
 上面四条里有三条是靠「这个数字不该这么大」发现的。
+
+**标准答案本身也要选对。** Unity 读取器第一版拿原 Spine 当标准答案,误差全是导出器的近似(shear、贝塞尔退化、
+Blend Shape 帧间分歧),读取器对不对反而看不出来;改成按 Unity 规则独立求值的参照物后 0.05 像素,
+还顺带揪出两处导出器一声不响的丢失(setup shear、3.8 twoColor)。

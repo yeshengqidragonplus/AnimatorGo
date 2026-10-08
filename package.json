@@ -15,7 +15,8 @@
     "dev:web": "vite",
     "convert": "node --experimental-strip-types --no-warnings src/cli/spineConvert.ts",
     "unity": "node --experimental-strip-types --no-warnings src/cli/unityExport.ts",
-    "godot": "node --experimental-strip-types --no-warnings src/cli/godotExport.ts"
+    "godot": "node --experimental-strip-types --no-warnings src/cli/godotExport.ts",
+    "from-unity": "node --experimental-strip-types --no-warnings src/cli/fromUnity.ts"
   },
   "dependencies": {
     "maxrects-packer": "^2.7.3",

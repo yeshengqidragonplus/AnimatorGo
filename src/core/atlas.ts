@@ -288,3 +288,25 @@ export function regionUVs(region: AtlasRegion, page: AtlasPage): Float32Array {
     u0, v0, // 左上
   ])
 }
+
+// ─── 写出 ────────────────────────────────────────────────────────────────────
+
+/** Atlas → Spine 4.x 风格的 `.atlas` 文本,parseAtlas 可原样读回。区域按名字排序,输出稳定 */
+export function writeAtlas(atlas: Atlas): string {
+  const lines: string[] = []
+  atlas.pages.forEach((page, i) => {
+    if (i > 0) lines.push('')
+    lines.push(page.name, `size: ${page.width},${page.height}`, 'filter: Linear,Linear', `pma: ${page.pma ? 'true' : 'false'}`)
+    const regions = [...atlas.regions.values()].filter((r) => r.page === page.name).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+    for (const r of regions) {
+      // bounds 的宽高是**摆正后**的尺寸(与 parseAtlas 同一个理解,见文件开头的实测说明),旋转的不交换
+      lines.push(r.name, `  bounds: ${r.x},${r.y},${r.width},${r.height}`)
+      if (r.offsetX !== 0 || r.offsetY !== 0 || r.width !== r.originalWidth || r.height !== r.originalHeight) {
+        lines.push(`  offsets: ${r.offsetX},${r.offsetY},${r.originalWidth},${r.originalHeight}`)
+      }
+      if (r.rotate === 90) lines.push('  rotate: 90')
+      if (r.index >= 0) lines.push(`  index: ${r.index}`)
+    }
+  })
+  return lines.join('\n') + '\n'
+}

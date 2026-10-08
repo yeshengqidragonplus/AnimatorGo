@@ -686,7 +686,68 @@ mesh 各帧的顶点、pivot、绑定都跟着图走,换 sprite 换不动网格;
   换图关键帧的那一刻 —— `.anim` 的时间写 7 位小数,0.53333336 写成了 0.5333334(晚 4×10⁻⁸ 秒),肉眼不可见。
   ⚠️ 比对时采样时刻要按 C# 的 float 算(`clip.length * i / steps`),用 double 算会在关键帧边界上多出几个假的不一致
 
-## 16. 待确认
+## 16. 读回:Unity 产物 → Spine / Godot(`src/spine-convert/unity-import/`)
+
+用途:角色导到 Unity、**在 Unity 里改过之后**再转到 Godot(或 Spine JSON)。这不是往返编辑 —— 读回来的是 Unity 那一份,
+Spine 有而 Unity 没有的东西(约束、shear、两色染色……)导出时已经报过丢失,读回来也不会有。
+
+**只认我们自己导出的结构**(本文 1~15 节):根物体下不带渲染器的 Transform 是骨骼;挂图节点名 `<slot>[__键名][#帧][@皮肤]`;
+`m_SortingOrder` 是绘制顺序;controller 里的状态顺序是动画顺序,`@skin@` 皮肤 clip 跳过。别的工具做的 Unity 2D 角色
+(PSB 导入之类)不在范围内。`--ppu` 要与导出时一致。
+
+输出 Spine 4.1 JSON,再过 `fromJson` 进中转模型 —— 字符串表、写法细节交给已经拿真实文件对过的读取器,顺带就有了 Unity → Spine。
+
+### 16.1 几何:全部转成 Spine 的 mesh,都是精确的
+
+| Unity | Spine |
+|---|---|
+| SpriteRenderer(无 SpriteSkin) | 不加权 mesh:`骨骼局部 = 骨骼世界⁻¹ · 节点世界 · (顶点 − pivot)/ppu` |
+| SpriteRenderer + SpriteSkin | 加权 mesh:sprite 骨骼按 Unity 的规则算绑定(**根骨骼减 pivot,子骨骼不减**),`lᵢ = bindᵢ⁻¹ · v` |
+| SkinnedMeshRenderer | 加权 mesh:`lᵢ = bindposeᵢ · v` |
+
+region 也读成四顶点 mesh。图集每个 sprite 一个区域(Unity 的矩形原点在左下,换成左上);SkinnedMeshRenderer 用整页做区域。
+
+### 16.2 曲线:Hermite → 贝塞尔是精确的
+
+- Unity 的一段 Hermite(含加权切线)本来就是一条三次贝塞尔:`cx1 = t₀ + w_out·Δt`,`cy1 = v₀ + outSlope·(cx1 − t₀)`,
+  另一端对称;不加权时 w = 1/3。切线为 Infinity 就是阶梯
+- Spine 4.x 一帧的几个分量(x / y、r / g / b / a)**共用一种曲线类型**,各有各的控制点;Unity 每个分量的关键帧时刻可以不同 →
+  取并集,在新时刻用 de Casteljau 精确切开
+- 全是直线 → 不写 curve;全是阶梯 → `stepped`;否则贝塞尔,直线分量写成弦的三等分点(仍精确);
+  **只有阶梯与非阶梯混在同一帧**才近似,报 approximated
+- ⚠️ **时间要吸附到 `m_SampleRate` 的帧格**:`.anim` 的时间只存 7 位有效数字(31/30 写成 1.0333334)。不吸附的话,
+  不同曲线上「同一帧」差 1e-7 秒,对不上帧,阶梯跳变也会早晚一点
+
+### 16.3 Blend Shape → deform
+
+每一刻 `δ = Σ (w/100)·Δ`,换成逐影响偏移 `dᵢ = lin(bindposeᵢ)·δ` —— Unity 是「加完再蒙皮」(11.4),任何姿势下都精确。
+关键帧取所有目标关键帧时刻的并集。段内:导出时的写法是「相邻两个目标此消彼长、共用一条进度曲线」,Spine 的一段就是那条曲线,
+精确;认不出这种写法(在 Unity 里改过权重曲线)就按 30 fps 采样成直线,报 approximated。
+
+### 16.4 会报出来的
+
+| 情况 | 级别 |
+|---|---|
+| prefab 里嵌套了别的 prefab 实例(没展开) | loss |
+| 四元数旋转曲线 `m_RotationCurves`(导出写的是欧拉;在 Animation 窗口把插值改成 Quaternion 才会出现) | loss |
+| 换 sprite 的 `m_PPtrCurves`(导出换图用的是节点显隐) | loss |
+| 曲线指向的物体不是骨骼 / 挂图节点,或属性不认识 | loss |
+| 引用的贴图 / sprite / Mesh 不在目录里 | loss |
+| 绕 x / y 的旋转(只取绕 z 的部分) | approximated |
+| 同一时刻同一 slot 亮着几个挂图节点(Spine 一个 slot 只挂一个) | approximated |
+| SpriteSkin 节点不在根物体原点 | approximated |
+
+### 16.5 ⚠️ 验收的参照物是 Unity 的规则,不是原 Spine
+
+第一版拿原 Spine 当标准答案,测出来的全是**导出器**的近似(shear、贝塞尔退化、Blend Shape 帧间分歧、>4 根骨骼),
+读取器自己对不对反而看不出。改成 `unityEval.ts`:**独立**按 Unity 的规则求值(Hermite / 加权切线直接求值、正向蒙皮、
+Blend Shape 加完再蒙皮),与读回来的 Spine 在同一时刻逐点比 —— setup、每条动画的关键帧、相邻关键帧的四分点和中点,0.05 像素;
+slot 颜色 1/255。原 Spine 只做 setup 粗检,容差按导出自己的分流判据(第 11 节)。
+
+另有一组「在 Unity 里改过」的用例:直接改文本(改关键帧值、插一个 Unity 默认切线的新关键帧、挪 prefab 里骨骼的位置),
+改动要落在对应的时间轴 / 骨骼上,逐点仍符合 Unity 的规则。
+
+## 17. 待确认
 
 - `.anim` 里驱动 `SpriteResolver` 的曲线具体形态(尚无样本)。
   目前换 attachment 走的是**一个 attachment 一个物体 + `m_IsActive` 阶梯曲线**,

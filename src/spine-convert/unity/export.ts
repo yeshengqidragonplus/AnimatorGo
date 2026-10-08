@@ -418,6 +418,18 @@ export function exportToUnity(
       )
     }
   }
+  // Unity 的 Transform 只有 TRS,没有 shear —— 之前一声不响地丢了(BBQ_grill 的 smoke3 / smoke4 带 17.8° / −9.5°,
+  // 烟雾整块歪 5 像素)。setup 带 shear 或动画里有 shear 时间轴的骨骼都报出来
+  const shearAnimated = new Set<number>()
+  for (const anim of part.animations) for (const t of anim.timelines) if (t.kind.startsWith('shear')) shearAnimated.add(t.owner)
+  part.bones.forEach((bone, i) => {
+    if (bone.shearX === 0 && bone.shearY === 0 && !shearAnimated.has(i)) return
+    issues.add(
+      'approximated',
+      `bone.${bone.name}`,
+      `Unity 的 Transform 没有 shear${bone.shearX !== 0 || bone.shearY !== 0 ? `(setup 是 ${bone.shearX.toFixed(1)}° / ${bone.shearY.toFixed(1)}°)` : ''}${shearAnimated.has(i) ? ',动画里的 shear 也没转' : ''},已忽略 —— 挂在它下面的部件会歪`,
+    )
+  })
 
   // ── 皮肤:全部导进一个 prefab,运行时靠 Animator 的皮肤层切 ──
   //
@@ -1557,8 +1569,9 @@ export function exportToUnity(
           continue
         }
 
-        // slot 颜色 → SpriteRenderer.m_Color
-        if (t.kind === 'color' || t.kind.startsWith('slotColor')) {
+        // slot 颜色 → SpriteRenderer.m_Color。⚠️ 3.8 的 twoColor(两色染色)也要进来:亮色照转、暗色报丢弃 ——
+        // 之前条件里漏了它,整条时间轴连亮色带报告被静默跳过(wave 的 shadow)
+        if (t.kind === 'color' || t.kind === 'twoColor' || t.kind.startsWith('slotColor')) {
           const slot = part.slots[t.owner]
           const list = slotNodes.get(t.owner)
           if (slot === undefined || list === undefined) continue
