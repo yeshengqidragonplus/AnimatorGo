@@ -152,6 +152,166 @@ function unpackColor(packed: number): { r: number; g: number; b: number; a: numb
 /** 逐帧修正里,阶梯跳变前补的那个采样离跳变多远(秒) */
 const STEP_EPSILON = 1e-4
 
+/**
+ * Bone4 截断的顶点:留下 4 个影响,重新挑它们的局部坐标(Unity 骨骼局部,像素)和权重,让全部姿势上
+ * Σ w'ₖ·Uₖ(P)·xₖ 与 Spine 的 Σ wᵢ·Sᵢ(P)·lᵢ 的平方差之和最小。
+ *
+ * 未知数取 yₖ = w'ₖ·xₖ 和 w'ₖ,位置 = Σ lin(Uₖ)·yₖ + Σ w'ₖ·平移(Uₖ),对它们是线性的;Σ w'ₖ = 1 消掉最后一个权重。
+ * 解出来有权重 < 1% 的(Unity 的权重不能为负,太小的除回 xₖ 会放大误差)就退回「权重固定、只挑坐标」,两种取最大误差小的。
+ * 加一点向原值的岭项 —— 几根骨骼总是一起动时方程是奇异的,那时取离原值最近的解。
+ */
+function fitTruncated(
+  all: readonly { bone: number; x: number; y: number; weight: number }[],
+  kept: readonly { bone: number; weight: number; local: { x: number; y: number } }[],
+  poses: readonly { spine: readonly Affine[]; unity: readonly Affine[] }[],
+): { locals: { x: number; y: number }[]; weights: number[]; error: number } {
+  const K = kept.length
+  const target = (spine: readonly Affine[]) => {
+    let x = 0
+    let y = 0
+    for (const w of all) {
+      const p = applyPoint(spine[w.bone]!, w.x, w.y)
+      x += w.weight * p.x
+      y += w.weight * p.y
+    }
+    return { x, y }
+  }
+  const targets = poses.map((pose) => target(pose.spine))
+  const errorOf = (locals: readonly { x: number; y: number }[], weights: readonly number[]) => {
+    let error = 0
+    poses.forEach((pose, i) => {
+      let x = 0
+      let y = 0
+      kept.forEach((k, q) => {
+        const p = applyPoint(pose.unity[k.bone]!, locals[q]!.x, locals[q]!.y)
+        x += weights[q]! * p.x
+        y += weights[q]! * p.y
+      })
+      error = Math.max(error, Math.hypot(x - targets[i]!.x, y - targets[i]!.y))
+    })
+    return error
+  }
+
+  /** 按行累加正规方程,加岭项后解 */
+  const leastSquares = (n: number, rowsOf: (pose: (typeof poses)[number], t: { x: number; y: number }) => { r: number[]; b: number }[], prior: readonly number[]) => {
+    const ata = Array.from({ length: n }, () => new Array<number>(n).fill(0))
+    const atb = new Array<number>(n).fill(0)
+    poses.forEach((pose, i) => {
+      for (const { r, b } of rowsOf(pose, targets[i]!)) {
+        for (let a = 0; a < n; a++) {
+          if (r[a] === 0) continue
+          for (let c = 0; c < n; c++) ata[a]![c]! += r[a]! * r[c]!
+          atb[a]! += r[a]! * b
+        }
+      }
+    })
+    const ridge = 1e-6 * Math.max(1, ...ata.map((row, i) => row[i]!))
+    for (let a = 0; a < n; a++) {
+      ata[a]![a]! += ridge
+      atb[a]! += ridge * prior[a]!
+    }
+    return solveLinear(ata, atb)
+  }
+
+  // 权重固定,只挑坐标
+  const fixedWeights = kept.map((k) => k.weight)
+  const fixed = leastSquares(
+    K * 2,
+    (pose, t) => {
+      const rx = new Array<number>(K * 2).fill(0)
+      const ry = new Array<number>(K * 2).fill(0)
+      let cx = 0
+      let cy = 0
+      kept.forEach((k, q) => {
+        const m = pose.unity[k.bone]!
+        rx[q * 2] = k.weight * m.a
+        rx[q * 2 + 1] = k.weight * m.b
+        ry[q * 2] = k.weight * m.c
+        ry[q * 2 + 1] = k.weight * m.d
+        cx += k.weight * m.x
+        cy += k.weight * m.y
+      })
+      return [{ r: rx, b: t.x - cx }, { r: ry, b: t.y - cy }]
+    },
+    kept.flatMap((k) => [k.local.x, k.local.y]),
+  )
+  let best = {
+    locals: fixed === null ? kept.map((k) => k.local) : kept.map((_, q) => ({ x: fixed[q * 2]!, y: fixed[q * 2 + 1]! })),
+    weights: fixedWeights,
+  }
+  let bestError = errorOf(best.locals, best.weights)
+
+  // 坐标和权重一起挑
+  const n = K * 2 + K - 1
+  const last = K - 1
+  const free = leastSquares(
+    n,
+    (pose, t) => {
+      const rx = new Array<number>(n).fill(0)
+      const ry = new Array<number>(n).fill(0)
+      const tl = pose.unity[kept[last]!.bone]!
+      kept.forEach((k, q) => {
+        const m = pose.unity[k.bone]!
+        rx[q * 2] = m.a
+        rx[q * 2 + 1] = m.b
+        ry[q * 2] = m.c
+        ry[q * 2 + 1] = m.d
+        if (q < last) {
+          rx[K * 2 + q] = m.x - tl.x
+          ry[K * 2 + q] = m.y - tl.y
+        }
+      })
+      return [{ r: rx, b: t.x - tl.x }, { r: ry, b: t.y - tl.y }]
+    },
+    [...kept.flatMap((k) => [k.weight * k.local.x, k.weight * k.local.y]), ...kept.slice(0, last).map((k) => k.weight)],
+  )
+  if (free !== null) {
+    const weights = kept.map((_, q) => (q < last ? free[K * 2 + q]! : 0))
+    weights[last] = 1 - weights.reduce((a, b) => a + b, 0)
+    if (weights.every((w) => w >= 0.01)) {
+      const locals = kept.map((_, q) => ({ x: free[q * 2]! / weights[q]!, y: free[q * 2 + 1]! / weights[q]! }))
+      const error = errorOf(locals, weights)
+      if (error < bestError) {
+        best = { locals, weights }
+        bestError = error
+      }
+    }
+  }
+  return { ...best, error: bestError }
+}
+
+/** 从 items 里取 k 个的全部组合(保持原顺序) */
+function combinations<T>(items: readonly T[], k: number): T[][] {
+  if (k === 0) return [[]]
+  const out: T[][] = []
+  items.forEach((item, i) => {
+    for (const rest of combinations(items.slice(i + 1), k - 1)) out.push([item, ...rest])
+  })
+  return out
+}
+
+/** 高斯消元(部分选主元);奇异返回 null */
+function solveLinear(a: number[][], b: number[]): number[] | null {
+  const n = b.length
+  const m = a.map((row, i) => [...row, b[i]!])
+  for (let c = 0; c < n; c++) {
+    let pivot = c
+    for (let r = c + 1; r < n; r++) if (Math.abs(m[r]![c]!) > Math.abs(m[pivot]![c]!)) pivot = r
+    if (Math.abs(m[pivot]![c]!) < 1e-12) return null
+    ;[m[c], m[pivot]] = [m[pivot]!, m[c]!]
+    for (let r = 0; r < n; r++) {
+      if (r === c) continue
+      const f = m[r]![c]! / m[c]![c]!
+      if (f === 0) continue
+      for (let k = c; k <= n; k++) m[r]![k]! -= f * m[c]![k]!
+    }
+  }
+  return m.map((row, i) => row[n]! / row[i]!)
+}
+
+/** 加权网格的一个影响对不上基准绑定、要另开槽位的门槛(像素)。在 setup 下绑的网格,float32 舍入也有 1e-3 像素级的差 */
+const BIND_TOLERANCE = 0.05
+
 function key(time: number, value: number, stepped: boolean): UnityKeyframe {
   return {
     time,
@@ -270,24 +430,21 @@ interface DeformRecord {
 interface SkinnedGeometry {
   readonly item: SlotAttachment
   readonly page: number
-  /** 参与蒙皮的骨骼(骨架下标),顺序即 bindposes 顺序 */
-  readonly subset: readonly number[]
-  /** 网格空间(= 骨架根空间,Unity 单位)的顶点;换绑定姿势时会改 */
-  vertices: MeshVertex[]
+  /**
+   * 骨骼槽位,顺序即 m_Bones / bindposes 的顺序。**同一根骨骼可以出现多次**,各带一个 bindpose(Unity 单位)——
+   * 绑完又改过顶点的网格,各影响的局部坐标对不齐,靠多开槽位原样表达(bindSkinned)
+   */
+  readonly slots: readonly { readonly bone: number; readonly bindpose: Affine }[]
+  /** 网格空间(= 骨架根空间,Unity 单位)的顶点 */
+  readonly vertices: MeshVertex[]
   readonly triangles: readonly number[]
-  /** Spine 的完整权重,骨骼用 subset 下标 —— 写进 Mesh */
+  /** Spine 的完整权重,骨骼用槽位下标 —— 写进 Mesh */
   readonly weights: readonly (readonly BoneInfluence[])[]
-  /** Unity 实际用来蒙皮的权重(Bone4 时是前 4 根归一),骨骼用**骨架**下标 —— 反解增量用 */
-  readonly effective: readonly (readonly { bone: number; weight: number }[])[]
+  /** Unity 实际用来蒙皮的权重(Bone4 时是前 4 根归一),用槽位下标 —— 反解增量用 */
+  readonly effective: readonly (readonly { slot: number; weight: number }[])[]
   /** 原始的逐影响局部坐标,算 Spine 那边的世界偏移用 */
   readonly localVerts: SpineVertices
   readonly slotBone: number
-  /** 与 subset 同序;默认是 setup 的逆,绑定姿势不一致的网格换成实测更好的那种(rebindSkinned) */
-  bindposes: Affine[]
-  /** 骨架下标 → bindpose(Unity 单位) —— 反解 Blend Shape 增量用 */
-  bindOf: Map<number, Affine>
-  /** 两种绑定都对不上:每条动画逐帧加修正 Blend Shape(连 deform 一起解) */
-  correction: { readonly uncorrected: number } | null
   readonly shapes: BlendShape[]
   readonly shapeNames: Set<string>
   nodeIndex: number
@@ -673,105 +830,6 @@ export function exportToUnity(
   }
   const sprites = new Map<string, SpriteInfo>()
 
-  /** 把一个网格整理成 SkinnedMeshRenderer 要的几何(骨架根空间,Unity 单位) */
-  const buildSkinnedGeometry = (item: SlotAttachment, rect: BakedRect, slotBone: number, reasons: string[]): SkinnedGeometry => {
-    const data = item.attachment.data
-    const verts = data['vertices'] as SpineVertices
-    const vertexCount = data['vertexCount'] as number
-    const uvs = data['uvs'] as number[]
-    const triangles = data['triangles'] as number[]
-    const page = baked.pages[rect.page]!
-    const color = unpackColor(part.slots[item.slot]!.color)
-    const subset = verts.weighted ? boneSubset(verts.weights) : [slotBone]
-    const subsetIndex = new Map<number, number>()
-    subset.forEach((b, i) => subsetIndex.set(b, i))
-
-    const vertices: MeshVertex[] = []
-    const weights: BoneInfluence[][] = []
-    const effective: { bone: number; weight: number }[][] = []
-    let over4 = false
-    for (let j = 0; j < vertexCount; j++) {
-      let px = 0
-      let py = 0
-      if (verts.weighted) {
-        const list: BoneInfluence[] = []
-        for (const w of verts.weights[j]!) {
-          const p = applyPoint(setupSpine[w.bone]!, w.x, w.y)
-          px += w.weight * p.x
-          py += w.weight * p.y
-          list.push({ bone: subsetIndex.get(w.bone)!, weight: w.weight })
-        }
-        weights.push(list)
-        const sorted = verts.weights[j]!.filter((w) => w.weight > 0).sort((p, q) => q.weight - p.weight)
-        over4 ||= sorted.length > 4
-        const kept = skinQuality === 4 ? sorted.slice(0, 4) : sorted
-        const total = kept.reduce((n, w) => n + w.weight, 0) || 1
-        effective.push(kept.map((w) => ({ bone: w.bone, weight: w.weight / total })))
-      } else {
-        const p = applyPoint(setupSpine[slotBone]!, verts.positions[j * 2]!, verts.positions[j * 2 + 1]!)
-        px = p.x
-        py = p.y
-        weights.push([{ bone: 0, weight: 1 }])
-        effective.push([{ bone: slotBone, weight: 1 }])
-      }
-      // UV:Spine 的 uv 相对未裁剪原图 → 裁剪矩形内像素 → 烘焙页上的像素 → 归一化
-      const r = uvToRect(uvs[j * 2]!, uvs[j * 2 + 1]!, rect.region)
-      vertices.push({
-        x: px * scale,
-        y: py * scale,
-        u: (rect.x + r.x) / page.width,
-        v: (rect.y + r.y) / page.height,
-        color,
-      })
-    }
-
-    if (over4) {
-      if (skinQuality === 4) {
-        issues.add(
-          'approximated',
-          `mesh.${item.spriteName}`,
-          '每顶点超过 4 根骨骼,SkinnedMeshRenderer 写 Bone4,取权重最大的四根并重新归一化' +
-            '(完整权重已写入 Mesh;工程 Quality 全部档位设 Unlimited 并加 --skin-quality auto 可用满)',
-        )
-      } else {
-        issues.add(
-          'info',
-          `mesh.${item.spriteName}`,
-          '每顶点超过 4 根骨骼,完整权重已写入 Mesh;只有工程 Quality **所有**档位都是 Unlimited 时才会全部生效',
-        )
-      }
-    }
-
-    const bindposes = subset.map((b) => {
-      const inv = invert(toUnits(setupUnity[b]!))
-      if (inv === null) {
-        issues.loss(`mesh.${item.spriteName}`, `骨骼 "${part.bones[b]!.name}" 在绑定姿势下缩放为 0,绑定矩阵不可逆,该骨骼按单位矩阵处理`)
-        return IDENTITY
-      }
-      return inv
-    })
-    issues.add('info', `mesh.${item.spriteName}`, `走 SkinnedMeshRenderer:${reasons.join('、')}`)
-
-    return {
-      item,
-      page: rect.page,
-      subset,
-      vertices,
-      triangles: [...triangles],
-      weights,
-      effective,
-      localVerts: verts,
-      slotBone,
-      bindposes,
-      bindOf: new Map(subset.map((b, i) => [b, bindposes[i]!])),
-      correction: null,
-      shapes: [],
-      shapeNames: new Set(),
-      nodeIndex: -1,
-    }
-  }
-  const metaSprites: MetaSprite[][] = baked.pages.map(() => [])
-
   /** 一条动画要采样的时刻:0、所有关键帧(含 deform 的)、30 fps 帧格 */
   const sampleTimesOf = (anim: AnimationData): number[] => {
     const times = new Set<number>([0])
@@ -787,52 +845,75 @@ export function exportToUnity(
     for (let i = 1; i / 30 < end; i++) times.add(i / 30)
     return [...times].sort((a, b) => a - b)
   }
-  /** 全部动画的采样姿势:Spine 的真实姿势(目标)和 Unity 的 TRS 层级姿势(实际)成对 */
+
+  /** 全部动画的采样姿势(含 setup):Spine 的真实姿势(目标)和 Unity 的 TRS 层级姿势(实际)成对 */
   let posePairs: { spine: Affine[]; unity: Affine[] }[] | null = null
   const allPoses = () => {
     if (posePairs !== null) return posePairs
-    posePairs = []
+    posePairs = [{ spine: setupSpine, unity: setupUnity }]
     for (const anim of part.animations) {
       for (const t of sampleTimesOf(anim)) posePairs.push({ spine: poseAt(part, anim, t), unity: poseAt(part, anim, t, { unityCompatible: true }) })
     }
     return posePairs
   }
 
-  /**
-   * 加权网格的绑定姿势。SkinnedMeshRenderer 是「每根骨骼一个 bindpose、所有顶点共用」(与 Godot 的 Bone2D.rest 同构),
-   * 只有当网格的各影响能被**同一组**逐骨骼矩阵解释时才精确。照 Godot 导出验证过的三档(docs/GODOT.md 第 6 节):
-   *
-   * 1. setup 姿势下绑的(每个顶点各影响算出的位置一致):bindpose = setup 的逆,顶点 = 该位置。精确,什么都不改
-   * 2. 不一致:再算一种「按贴图拟合」—— 每根骨骼「局部坐标 → 图上位置」拟合一个仿射(绑定时网格就是照着图摆的),
-   *    bindpose 本来就是任意 4×4,放得下仿射。两种绑定各自在全部动画姿势上逐帧实测**加权后**的偏差,取小的
-   * 3. 两种都偏 0.5 像素以上(绑完又在别的姿势下改过顶点):setup 姿势的顶点反解成精确值,
-   *    每条动画逐帧加修正 Blend Shape(correctionShapes)
-   *
-   * 之前一律按 setup 绑:setup 精确,一动就偏(MergeCooking2 25 处,female_lead 的 nvzhu_t_gb1 最大 77 像素)。
-   */
-  const rebindSkinned = (geo: SkinnedGeometry): void => {
-    const verts = geo.localVerts
-    if (!verts.weighted) return
-    type P = { x: number; y: number }
-    const setupMean: P[] = []
-    let spread = 0
-    for (const entry of verts.weights) {
-      const ps = entry.map((w) => applyPoint(setupSpine[w.bone]!, w.x, w.y))
-      const m = ps.reduce((acc, p, i) => ({ x: acc.x + p.x * entry[i]!.weight, y: acc.y + p.y * entry[i]!.weight }), { x: 0, y: 0 })
-      for (const p of ps) spread = Math.max(spread, Math.hypot(p.x - m.x, p.y - m.y))
-      setupMean.push(m)
-    }
-    // 顶点和骨骼都是 float32 存的,在 setup 下绑的网格也有 1e-3 像素级的舍入差
-    if (spread < 0.05) return
+  type Point = { x: number; y: number }
+  /** 一个槽位:骨骼 + 绑定矩阵(像素,骨骼局部 → 网格空间;bindpose 是它的逆)+ 相对基准的平移 */
+  type BindSlot = { bone: number; bind: Affine; offset: Point }
 
-    /** 一种绑定:顶点(像素,骨架根空间)+ 每根骨骼的绑定矩阵(像素,bindpose 是它的逆) */
-    interface Candidate { readonly v: readonly P[]; readonly bind: ReadonlyMap<number, Affine> }
-    const atSetup: Candidate = { v: setupMean, bind: new Map(geo.subset.map((b) => [b, setupUnity[b]!])) }
+  /**
+   * 加权网格的绑定:顶点放哪 + 每个影响用哪个槽位。
+   *
+   * Mesh 的 bindpose 按「骨骼槽位」存,**同一根骨骼可以在 m_Bones 里出现多次、各带一个 bindpose**
+   * (2026-10-08 实测 Unity 6000.3,BakeMesh 误差 0)。所以 Spine 每个影响各自的局部坐标都能原样表达:
+   * 槽位的绑定矩阵 K 满足 K · 局部坐标 = 顶点,任何姿势下 Unity 与 Spine 逐影响相同。绑完又在别的姿势下改过
+   * 顶点的网格(同一顶点各影响在 setup 下对不齐)也精确,不用逐帧修正。
+   *
+   * 每根骨骼先有一个「基准」槽位。顶点和基准有两种候选,取多出来的槽位少的:
+   * 1. setup:顶点 = 各影响在 setup 下的加权平均,基准 = 骨骼的 setup 矩阵。在 setup 下绑的网格一个不多,
+   *    产物与以前逐字节相同
+   * 2. 按贴图拟合:每根骨骼「局部坐标 → 图上位置」拟合一个仿射,顶点 = 图上位置(整体摆到 setup 附近)。
+   *    MX2_cat 的「第二套」网格是在别的姿势下照着图绑的,setup 下对不齐,按图拟合一个不多
+   * 对不上基准的影响(差 > BIND_TOLERANCE 像素)另开槽位:K = 平移(残差)· 基准,残差相近的共用一个。
+   *
+   * Unity 的骨骼是纯 TRS 层级(没有 shear),所以基准写 Unity 的 setup 矩阵、残差按 Spine 的算:
+   * K⁻¹ · 顶点 = Unity setup⁻¹ · Spine setup · 局部坐标,setup 姿势下与 Spine 重合(shear = 0 时就是局部坐标本身)。
+   */
+  const bindSkinned = (
+    verts: SpineVertices,
+    subset: readonly number[],
+    setupMean: readonly Point[],
+    image: readonly Point[],
+  ): { v: readonly Point[]; slots: BindSlot[]; slotOf: number[][]; base: (b: number) => Affine; fitted: boolean; spread: number } => {
+    const assign = (v: readonly Point[], unityBase: (b: number) => Affine, spineBase: (b: number) => Affine) => {
+      const slots: BindSlot[] = subset.map((b) => ({ bone: b, bind: unityBase(b), offset: { x: 0, y: 0 } }))
+      const slotOf = verts.weights.map((entry, j) =>
+        entry.map((w) => {
+          const p = applyPoint(spineBase(w.bone), w.x, w.y)
+          const offset = { x: v[j]!.x - p.x, y: v[j]!.y - p.y }
+          const found = slots.findIndex(
+            (s) => s.bone === w.bone && Math.hypot(s.offset.x - offset.x, s.offset.y - offset.y) <= BIND_TOLERANCE,
+          )
+          if (found >= 0) return found
+          slots.push({ bone: w.bone, bind: multiply({ a: 1, b: 0, c: 0, d: 1, x: offset.x, y: offset.y }, unityBase(w.bone)), offset })
+          return slots.length - 1
+        }),
+      )
+      return { v, slots, slotOf, base: unityBase }
+    }
+
+    let spread = 0
+    verts.weights.forEach((entry, j) => {
+      for (const w of entry) {
+        const p = applyPoint(setupSpine[w.bone]!, w.x, w.y)
+        spread = Math.max(spread, Math.hypot(p.x - setupMean[j]!.x, p.y - setupMean[j]!.y))
+      }
+    })
+    const atSetup = assign(setupMean, (b) => setupUnity[b]!, (b) => setupSpine[b]!)
+    if (atSetup.slots.length === subset.length) return { ...atSetup, fitted: false, spread }
 
     // 按贴图拟合:图上的位置由 UV 给出(页像素,Unity 的 v 朝上,与骨架同向)
-    const page = baked.pages[geo.page]!
-    const image = geo.vertices.map((v) => ({ x: v.u * page.width, y: v.v * page.height }))
-    const byBone = new Map<number, { src: P[]; dst: P[] }>()
+    const byBone = new Map<number, { src: Point[]; dst: Point[] }>()
     verts.weights.forEach((entry, j) => {
       for (const w of entry) {
         const g = byBone.get(w.bone) ?? { src: [], dst: [] }
@@ -845,12 +926,8 @@ export function exportToUnity(
     const place = fitSimilarity(image, setupMean).fit
     const placeM = fitMatrix(place)
     const fittedBind = new Map<number, Affine>()
-    for (const b of geo.subset) {
-      const g = byBone.get(b)
-      if (g === undefined) {
-        fittedBind.set(b, setupUnity[b]!)
-        continue
-      }
+    for (const b of subset) {
+      const g = byBone.get(b)!
       // 点太少或共线解不出仿射时退回相似变换
       let m: Affine | null = fitAffine(g.src, g.dst)
       if (m === null) {
@@ -859,70 +936,176 @@ export function exportToUnity(
       }
       fittedBind.set(b, multiply(placeM, m))
     }
-    const fitted: Candidate = { v: image.map((p) => applyFit(place, p.x, p.y)), bind: fittedBind }
-
-    /** 全部动画姿势上,Unity 实际画出的位置与 Spine 的最大差(像素)—— 加权后的,和画面上看到的一致 */
-    const driftOf = (c: Candidate): number => {
-      const inv = new Map([...c.bind].map(([b, m]) => [b, invert(m)]))
-      let worst = 0
-      for (const { spine, unity } of allPoses()) {
-        verts.weights.forEach((entry, j) => {
-          let sx = 0, sy = 0, ux = 0, uy = 0
-          for (const w of entry) {
-            const p = applyPoint(spine[w.bone]!, w.x, w.y)
-            sx += w.weight * p.x
-            sy += w.weight * p.y
-          }
-          for (const w of geo.effective[j]!) {
-            const bi = inv.get(w.bone)
-            if (bi === null || bi === undefined) continue
-            const p = applyPoint(multiply(unity[w.bone]!, bi), c.v[j]!.x, c.v[j]!.y)
-            ux += w.weight * p.x
-            uy += w.weight * p.y
-          }
-          worst = Math.max(worst, Math.hypot(ux - sx, uy - sy))
-        })
-      }
-      return worst
-    }
-    const driftSetup = driftOf(atSetup)
-    const driftFitted = driftOf(fitted)
-    let chosen = driftFitted < driftSetup ? fitted : atSetup
-    const worst = Math.min(driftSetup, driftFitted)
-    const how = chosen === fitted ? '按贴图拟合每根骨骼的绑定矩阵' : '按 setup 绑定'
-    if (worst > 0.5) {
-      // setup 姿势的顶点反解成精确值 —— 蒙皮对顶点是线性的,给定绑定就有唯一解
-      const v = verts.weights.map((_, j) => {
-        let m00 = 0, m01 = 0, m10 = 0, m11 = 0, rx = setupMean[j]!.x, ry = setupMean[j]!.y
-        for (const w of geo.effective[j]!) {
-          const bi = invert(chosen.bind.get(w.bone)!)
-          if (bi === null) continue
-          const D = multiply(setupUnity[w.bone]!, bi)
-          m00 += w.weight * D.a; m01 += w.weight * D.b; m10 += w.weight * D.c; m11 += w.weight * D.d
-          rx -= w.weight * D.x
-          ry -= w.weight * D.y
-        }
-        const det = m00 * m11 - m01 * m10
-        return Math.abs(det) < 1e-12 ? setupMean[j]! : { x: (m11 * rx - m01 * ry) / det, y: (-m10 * rx + m00 * ry) / det }
-      })
-      chosen = { v, bind: chosen.bind }
-      geo.correction = { uncorrected: worst }
-      issues.add(
-        'info',
-        `mesh.${geo.item.spriteName}`,
-        `绑定姿势各顶点不一致(各影响最多差 ${spread.toFixed(1)} 像素),两种绑定都对不上 —— ${how},` +
-          `动画里逐帧加修正 Blend Shape(不修正的话误差达 ${worst.toFixed(1)} 像素)`,
-      )
-    } else if (chosen === fitted) {
-      issues.add('info', `mesh.${geo.item.spriteName}`, `绑定姿势不是 setup 姿势(各影响的位置最多差 ${spread.toFixed(1)} 像素),${how}`)
-    }
-    if (chosen === atSetup) return
-    chosen.v.forEach((p, j) => {
-      geo.vertices[j] = { ...geo.vertices[j]!, x: p.x * scale, y: p.y * scale }
-    })
-    geo.bindposes = geo.subset.map((b) => invert(toUnits(chosen.bind.get(b)!)) ?? IDENTITY)
-    geo.bindOf = new Map(geo.subset.map((b, i) => [b, geo.bindposes[i]!]))
+    const fitted = assign(image.map((p) => applyFit(place, p.x, p.y)), (b) => fittedBind.get(b)!, (b) => fittedBind.get(b)!)
+    return fitted.slots.length < atSetup.slots.length ? { ...fitted, fitted: true, spread } : { ...atSetup, fitted: false, spread }
   }
+
+  /** 把一个网格整理成 SkinnedMeshRenderer 要的几何(骨架根空间,Unity 单位) */
+  const buildSkinnedGeometry = (item: SlotAttachment, rect: BakedRect, slotBone: number, reasons: string[]): SkinnedGeometry => {
+    const data = item.attachment.data
+    const verts = data['vertices'] as SpineVertices
+    const vertexCount = data['vertexCount'] as number
+    const uvs = data['uvs'] as number[]
+    const triangles = data['triangles'] as number[]
+    const page = baked.pages[rect.page]!
+    const color = unpackColor(part.slots[item.slot]!.color)
+    const subset = verts.weighted ? boneSubset(verts.weights) : [slotBone]
+
+    // UV:Spine 的 uv 相对未裁剪原图 → 裁剪矩形内像素 → 烘焙页上的像素 → 归一化
+    const uv = Array.from({ length: vertexCount }, (_, j) => {
+      const r = uvToRect(uvs[j * 2]!, uvs[j * 2 + 1]!, rect.region)
+      return { u: (rect.x + r.x) / page.width, v: (rect.y + r.y) / page.height }
+    })
+    const setupMean: Point[] = Array.from({ length: vertexCount }, (_, j) => {
+      if (!verts.weighted) return applyPoint(setupSpine[slotBone]!, verts.positions[j * 2]!, verts.positions[j * 2 + 1]!)
+      let x = 0
+      let y = 0
+      for (const w of verts.weights[j]!) {
+        const p = applyPoint(setupSpine[w.bone]!, w.x, w.y)
+        x += w.weight * p.x
+        y += w.weight * p.y
+      }
+      return { x, y }
+    })
+
+    let bound: { v: readonly Point[]; slots: BindSlot[]; slotOf: number[][]; base: (b: number) => Affine; fitted: boolean; spread: number }
+    if (verts.weighted) {
+      const image = uv.map((t) => ({ x: t.u * page.width, y: t.v * page.height }))
+      bound = bindSkinned(verts, subset, setupMean, image)
+    } else {
+      bound = { v: setupMean, slots: [{ bone: slotBone, bind: setupUnity[slotBone]!, offset: { x: 0, y: 0 } }], slotOf: [], base: () => setupUnity[slotBone]!, fitted: false, spread: 0 }
+    }
+
+    /** 这根骨骼上、Unity 局部坐标为 local 的影响,落到哪个槽位(没有就新开一个) */
+    const slotAt = (bone: number, local: Point, v: Point): number => {
+      const b = bound.base(bone)
+      const p = applyPoint(b, local.x, local.y)
+      const offset = { x: v.x - p.x, y: v.y - p.y }
+      const found = bound.slots.findIndex((s) => s.bone === bone && Math.hypot(s.offset.x - offset.x, s.offset.y - offset.y) <= BIND_TOLERANCE)
+      if (found >= 0) return found
+      bound.slots.push({ bone, bind: multiply({ a: 1, b: 0, c: 0, d: 1, x: offset.x, y: offset.y }, b), offset })
+      return bound.slots.length - 1
+    }
+
+    const vertices: MeshVertex[] = []
+    const weights: BoneInfluence[][] = []
+    const effective: { slot: number; weight: number }[][] = []
+    let over4 = false
+    /** 截断拟合后,全部动画姿势上与 Spine 的最大差(像素) */
+    let truncated = 0
+    for (let j = 0; j < vertexCount; j++) {
+      if (verts.weighted) {
+        const list = verts.weights[j]!.map((w, i) => ({ slot: bound.slotOf[j]![i]!, weight: w.weight }))
+        const sorted = list.filter((w) => w.weight > 0).sort((p, q) => q.weight - p.weight)
+        over4 ||= sorted.length > 4
+        if (skinQuality === 4 && sorted.length > 4) {
+          // Bone4 只用 4 根。剩下几根的影响分不出去,但留下的 4 个影响各有自己的槽位,局部坐标可以重新挑:
+          // 按全部动画的姿势(含 setup)最小二乘,让 Σ w'ₖ·Bₖ(P)·xₖ 最贴近 Spine 的位置。
+          // 留哪 4 根也挑:不一定是权重最大的 —— 权重小但在某些动画里摆得很开的骨骼,丢掉更伤
+          // (female_lead 的 nvzhu_st1:留权重最大的 4 根,adjusted_hat 整段差 9 像素)
+          let kept = sorted.slice(0, 4)
+          let fit: ReturnType<typeof fitTruncated> | null = null
+          for (const pick of combinations(sorted.slice(0, 8), 4)) {
+            const total = pick.reduce((n, w) => n + w.weight, 0)
+            const f = fitTruncated(
+              verts.weights[j]!,
+              pick.map((k) => ({ bone: bound.slots[k.slot]!.bone, weight: k.weight / total, local: applyPoint(invert(bound.slots[k.slot]!.bind) ?? IDENTITY, bound.v[j]!.x, bound.v[j]!.y) })),
+              allPoses(),
+            )
+            if (fit === null || f.error < fit.error - 1e-9) {
+              fit = f
+              kept = pick
+            }
+          }
+          fit = fit!
+          truncated = Math.max(truncated, fit.error)
+          const slotsOfKept = kept.map((k, q) => slotAt(bound.slots[k.slot]!.bone, fit.locals[q]!, bound.v[j]!))
+          // Mesh 里也只写这 4 根:渲染器写死 Bone4,完整权重用不上;写了反而和拟合过的坐标、权重对不上
+          weights.push(kept.map((_, q) => ({ bone: slotsOfKept[q]!, weight: fit.weights[q]! })))
+          effective.push(kept.map((_, q) => ({ slot: slotsOfKept[q]!, weight: fit.weights[q]! })))
+          continue
+        }
+        weights.push(list.map((w) => ({ bone: w.slot, weight: w.weight })))
+        const total = sorted.reduce((n, w) => n + w.weight, 0) || 1
+        effective.push(sorted.map((w) => ({ slot: w.slot, weight: w.weight / total })))
+      } else {
+        weights.push([{ bone: 0, weight: 1 }])
+        effective.push([{ slot: 0, weight: 1 }])
+      }
+    }
+    for (let j = 0; j < vertexCount; j++) {
+      vertices.push({ x: bound.v[j]!.x * scale, y: bound.v[j]!.y * scale, u: uv[j]!.u, v: uv[j]!.v, color })
+    }
+
+    // 截断拟合会让一些槽位没人用了 —— 压掉,m_Bones 里不留空槽(顺序不变)
+    const used = [...new Set(weights.flatMap((ws) => ws.map((w) => w.bone)))].sort((a, b) => a - b)
+    const renumber = new Map(used.map((old, i) => [old, i]))
+    const compact = used.map((i) => bound.slots[i]!)
+    for (const ws of weights) ws.forEach((w, k) => (ws[k] = { bone: renumber.get(w.bone)!, weight: w.weight }))
+    for (const es of effective) es.forEach((w, k) => (es[k] = { slot: renumber.get(w.slot)!, weight: w.weight }))
+
+    if (verts.weighted) {
+      const extra = compact.length - new Set(compact.map((s) => s.bone)).size
+      if (extra > 0) {
+        issues.add(
+          'info',
+          `mesh.${item.spriteName}`,
+          `绑定姿势各顶点不一致(各影响的位置最多差 ${bound.spread.toFixed(1)} 像素,绑完又改过顶点):` +
+            `另配了 ${extra} 个绑定矩阵(同一根骨骼在 m_Bones 里重复出现)${bound.fitted ? ',基准按贴图拟合' : ''},各影响与 Spine 逐个一致`,
+        )
+      } else if (bound.fitted) {
+        issues.add('info', `mesh.${item.spriteName}`, `绑定姿势不是 setup 姿势(各影响的位置最多差 ${bound.spread.toFixed(1)} 像素),按贴图拟合每根骨骼的绑定矩阵`)
+      }
+    }
+
+    if (over4) {
+      if (skinQuality === 4) {
+        issues.add(
+          truncated > 0.5 ? 'approximated' : 'info',
+          `mesh.${item.spriteName}`,
+          `每顶点超过 4 根骨骼,SkinnedMeshRenderer 写 Bone4:按全部动画的姿势挑留哪四根、重新拟合它们的局部坐标和权重,` +
+            `与 Spine 最多差 ${truncated.toFixed(1)} 像素(工程 Quality 全部档位设 Unlimited 并加 --skin-quality auto 可用满)`,
+        )
+      } else {
+        issues.add(
+          'info',
+          `mesh.${item.spriteName}`,
+          '每顶点超过 4 根骨骼,完整权重已写入 Mesh;只有工程 Quality **所有**档位都是 Unlimited 时才会全部生效',
+        )
+      }
+    }
+
+    const singular = new Set<number>()
+    const slots = compact.map((s) => {
+      const inv = invert(toUnits(s.bind))
+      if (inv === null) {
+        if (!singular.has(s.bone)) {
+          singular.add(s.bone)
+          issues.loss(`mesh.${item.spriteName}`, `骨骼 "${part.bones[s.bone]!.name}" 在绑定姿势下缩放为 0,绑定矩阵不可逆,该骨骼按单位矩阵处理`)
+        }
+        return { bone: s.bone, bindpose: IDENTITY }
+      }
+      return { bone: s.bone, bindpose: inv }
+    })
+    issues.add('info', `mesh.${item.spriteName}`, `走 SkinnedMeshRenderer:${reasons.join('、')}`)
+
+    return {
+      item,
+      page: rect.page,
+      slots,
+      vertices,
+      triangles: [...triangles],
+      weights,
+      effective,
+      localVerts: verts,
+      slotBone,
+      shapes: [],
+      shapeNames: new Set(),
+      nodeIndex: -1,
+    }
+  }
+  const metaSprites: MetaSprite[][] = baked.pages.map(() => [])
+
   const seenSprite = new Set<string>()
 
   for (const item of used) {
@@ -991,7 +1174,6 @@ export function exportToUnity(
     }
     if (reasons.length > 0) {
       const geo = buildSkinnedGeometry(item, rect, slotBone, reasons)
-      rebindSkinned(geo)
       skinned.push(geo)
       skinnedByItem.set(item, geo)
       for (const k of new Set(deformKeysOf(item))) {
@@ -1152,8 +1334,8 @@ export function exportToUnity(
           material: scriptMode && !isDefaultSkin(item.skin) ? null : { fileID: MATERIAL_FILE_ID, guid: materialGuids[info.page]! },
           // 换图那一维:setup pose 只亮 attachmentName 那一个(序列帧只亮 setup 帧)
           enabled: enabledAtSetup(item),
-          bones: geo.subset.map((b) => boneNode[b]!),
-          rootBone: boneNode[geo.subset[0]!]!,
+          bones: geo.slots.map((s) => boneNode[s.bone]!),
+          rootBone: boneNode[geo.slots[0]!.bone]!,
           blendShapeCount: 0, // 动画转完再补
           sortingOrder: item.slot,
           quality: skinQuality,
@@ -1276,9 +1458,8 @@ export function exportToUnity(
     let c = 0
     let d = 0
     for (const w of geo.effective[j]!) {
-      const bindpose = geo.bindOf.get(w.bone)
-      if (bindpose === undefined) continue
-      const m = multiply(linear(poseU[w.bone]!), linear(bindpose))
+      const s = geo.slots[w.slot]!
+      const m = multiply(linear(poseU[s.bone]!), linear(s.bindpose))
       a += w.weight * m.a
       b += w.weight * m.b
       c += w.weight * m.c
@@ -1469,9 +1650,9 @@ export function exportToUnity(
   }
 
   /**
-   * 两种绑定都对不上的网格(rebindSkinned 第 3 档):这条动画里逐帧解出让 Unity 与 Spine 完全重合的网格增量,
+   * deform 在关键帧之间与 Spine 差 0.5 像素以上的网格(deformGap):这条动画里逐帧解出让 Unity 与 Spine 完全重合的网格增量,
    * 每个采样时刻一个形变目标,权重是「前一刻 0 → 这一刻 100 → 后一刻 0」的三角,相邻目标此消彼长 —— 增量在帧间线性插值。
-   * deform 一并算进去(这类网格不再单独转 deform)。帧间与 Spine 差得多的段自适应加密到 1/480 秒。
+   * 这条动画的 deform 就不再单独转。帧间与 Spine 差得多的段自适应加密到 1/480 秒。
    *
    *     Unity:Σ w'ᵢ · Bᵢ(t) · bindposeᵢ · (v + δ)    Spine:Σ wᵢ · Bᵢ(t) · (lᵢ + dᵢ(t))
    *     令两者相等:M(t)·δ = Spine − Σ w'ᵢ · Bᵢ(t) · bindposeᵢ · v,M(t) = Σ w'ᵢ · lin(Bᵢ(t) · bindposeᵢ)
@@ -1515,9 +1696,8 @@ export function exportToUnity(
         let ux = 0, uy = 0
         const v = geo.vertices[j]!
         for (const w of geo.effective[j]!) {
-          const bindpose = geo.bindOf.get(w.bone)
-          if (bindpose === undefined) continue
-          const p = applyPoint(multiply(toUnits(poseU[w.bone]!), bindpose), v.x, v.y)
+          const s = geo.slots[w.slot]!
+          const p = applyPoint(multiply(toUnits(poseU[s.bone]!), s.bindpose), v.x, v.y)
           ux += w.weight * p.x
           uy += w.weight * p.y
         }
@@ -1571,6 +1751,18 @@ export function exportToUnity(
       const mid = a.delta.map((p, j) => ({ x: (p.x + b.delta[j]!.x) / 2, y: (p.y + b.delta[j]!.y) / 2 }))
       const err = errorOf(state, mid)
       if (err <= 0.25 || b.t - a.t <= 1 / 480 + 1e-9) {
+        if (err > 0.25 && b.t - a.t > 2 * STEP_EPSILON) {
+          // 加密到底还对不上:是没标成阶梯的瞬间跳变(同一时刻两个关键帧之类,Female staff 的 paperB 在 0.6 秒跳 118 像素)。
+          // 关键帧都在采样里,跳变就落在 b —— 和阶梯帧一样在它前面 STEP_EPSILON 补一个采样,
+          // 否则 Unity 会把跳变抹成 1/480 秒长的斜坡
+          const pre = b.t - STEP_EPSILON
+          const ps = stateAt(pre)
+          const m = { t: pre, state: ps, delta: solve(ps) }
+          const half = stateAt((a.t + pre) / 2)
+          residual = Math.max(residual, errorOf(half, a.delta.map((p, j) => ({ x: (p.x + m.delta[j]!.x) / 2, y: (p.y + m.delta[j]!.y) / 2 }))))
+          refined.push(m, b)
+          return
+        }
         // 阶梯跳变那一小段是故意的,不算残差
         if (b.t - a.t > 2 * STEP_EPSILON) residual = Math.max(residual, err)
         refined.push(b)
@@ -1899,8 +2091,6 @@ export function exportToUnity(
             continue
           }
           for (const geo of geos) {
-            // 逐帧修正的网格,deform 已经算在修正里(correctionShapes)
-            if (geo.correction !== null) continue
             // 关键帧之间分歧超过 0.5 像素:这条动画也改用逐帧修正
             const gap = deformGap(geo, anim, d)
             if (gap > 0.5) {
@@ -1958,7 +2148,7 @@ export function exportToUnity(
 
       writeSequenceCurves(anim, timelines, floats)
       for (const geo of skinned) {
-        if ((geo.correction !== null || deformCorrected.has(geo)) && geo.nodeIndex >= 0) correctionShapes(geo, anim, timelines, floats)
+        if (deformCorrected.has(geo) && geo.nodeIndex >= 0) correctionShapes(geo, anim, timelines, floats)
       }
     })
 
@@ -2008,7 +2198,7 @@ export function exportToUnity(
         name: assetName,
         vertices: geo.vertices,
         triangles: geo.triangles,
-        bindposes: geo.bindposes,
+        bindposes: geo.slots.map((s) => s.bindpose),
         weights: geo.weights,
         blendShapes: geo.shapes,
       }),

@@ -1482,10 +1482,15 @@ for (const file of SEQUENCE_SAMPLES) {
 }
 
 /**
- * 绑定姿势不一致的加权网格(绑完又在别的姿势下改过顶点)。SkinnedMeshRenderer 一套 bindpose 所有顶点共用,
- * 以前一律按 setup 绑,一动就偏(female_lead 75 像素、Oldwoman_sit 44 像素);现在按实测选绑定、还偏就逐帧加修正
- * Blend Shape,deform 帧间分歧大的也走逐帧修正。参照物是 Unity 的规则(unityEval,含 Bone4 截断),
- * 每个 SkinnedMeshRenderer 网格 30 fps 逐帧与 Spine 比(避开关键帧那一瞬 —— 阶梯跳变在 0.1 毫秒内完成)。
+ * 绑定姿势不一致的加权网格(绑完又在别的姿势下改过顶点)。以前一律按 setup 绑,一动就偏(female_lead 75 像素、
+ * Oldwoman_sit 44 像素)。现在同一根骨骼在 m_Bones 里可以重复出现、各带一个 bindpose,每个影响的局部坐标原样表达;
+ * deform 帧间分歧大的走逐帧修正。参照物是 Unity 的规则(unityEval),每个 SkinnedMeshRenderer 网格 30 fps 逐帧
+ * 与 Spine 比(避开关键帧那一瞬 —— 阶梯跳变在 0.1 毫秒内完成)。
+ *
+ * 两种蒙皮质量各验一遍:
+ * - `auto`(Unity 用完整权重):只验绑定本身。实测最大 0.47 像素(wave,deform 帧间),其余 ≤ 0.04
+ * - `bone4`(默认):这几个网格都有顶点超过 4 根骨骼,另外验截断拟合(挑留哪 4 根 + 拟合局部坐标)。
+ *   不拟合时 female_lead 的 nvzhu_st1 差 10.9 像素,拟合后 1.1
  */
 const MC2_ROOT = 'E:/UnityProject/MergeCooking2/MergeCooking2/Assets/Export/Spine/NewSpine'
 const BIND_SAMPLES = ['MapCharacters/female_lead/female_lead', 'MapCharacters/Oldwoman_sit/Oldwoman_sit', 'wave/wave', 'PetMerge/checkerboard_cat']
@@ -1493,12 +1498,15 @@ for (const rel of BIND_SAMPLES) {
   const skel = `${MC2_ROOT}/${rel}.skel.bytes`
   const atlasPath = `${MC2_ROOT}/${rel}.atlas.txt`
   describe.skipIf(!existsSync(skel) || !existsSync(atlasPath))(`绑定姿势不一致的网格:逐帧与 Spine 一致(${rel.replace(/^.*\//, '')})`, () => {
-    it('⭐ 每个 SkinnedMeshRenderer 网格 30 fps 逐帧,按 Unity 的规则算出的顶点与 Spine 差 < 1 像素', () => {
+    it.each([
+      ['auto', 1],
+      ['bone4', 1.5],
+    ] as const)('⭐ 每个 SkinnedMeshRenderer 网格 30 fps 逐帧,按 Unity 的规则算出的顶点与 Spine 一致(蒙皮质量 %s,差 < %s 像素)', (skinQuality, tolerance) => {
       const part = readSkeletonPart(new Uint8Array(readFileSync(skel)))
       const atlas = parseAtlas(readFileSync(atlasPath, 'utf8'))
       const dir = atlasPath.slice(0, atlasPath.lastIndexOf('/'))
       const sources = new Map<string, Image>(atlas.pages.map((p) => [p.name, decodePng(new Uint8Array(readFileSync(`${dir}/${p.name}`)))]))
-      const unity = exportToUnity(part, atlas, sources, { name: 'x', pixelsPerUnit: 100, renderPipeline: 'urp' })
+      const unity = exportToUnity(part, atlas, sources, { name: 'x', pixelsPerUnit: 100, renderPipeline: 'urp', skinQuality, skipImages: true })
       const scene = loadUnityScene(new Map(unity.files.map((f) => [f.path, f.content])))
       const defaultSkin = (part.skins.find((s) => s.name === 'default') ?? part.skins[0])!.name
       let checked = 0
@@ -1525,7 +1533,7 @@ for (const rel of BIND_SAMPLES) {
             if (att === undefined || att.type !== 'mesh') continue
             const spine = attachmentVertices(part, atlas, att, skinName, slot, pose, anim, time)
             v.points.forEach((q, i) => {
-              expect(Math.hypot(q.x * 100 - spine[i]!.x, q.y * 100 - spine[i]!.y), `${node} 第 ${i} 个顶点 @${anim.name} ${time.toFixed(4)}`).toBeLessThan(1)
+              expect(Math.hypot(q.x * 100 - spine[i]!.x, q.y * 100 - spine[i]!.y), `${node} 第 ${i} 个顶点 @${anim.name} ${time.toFixed(4)}`).toBeLessThan(tolerance)
             })
             checked++
           }

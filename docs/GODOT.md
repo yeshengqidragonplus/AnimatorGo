@@ -148,7 +148,9 @@ Godot 的绑定是「每根骨骼一个矩阵、所有顶点共用」(与 Unity 
 MergeCooking2 全部 535 个骨架:需要第 3 档修正的网格修正后,采样帧之间只剩 `female_lead` 的 `nvzhu_t_gb6` 一处 2.3 像素
 (阶梯关键帧的瞬间跳变),报 approximated。
 
-Unity 导出的 SkinnedMeshRenderer 照同样的三档做了(2026-10-08),修正轨道换成修正 Blend Shape,见 UNITY-2D.md 11.6。
+Unity 导出一开始照搬了这三档(修正轨道换成修正 Blend Shape),产物涨到 2~3 倍,改成了更好的办法:Unity 的 SkinnedMeshRenderer
+允许同一根骨骼在 `m_Bones` 里出现多次、各带一个 bindpose,每个影响的局部坐标原样表达,任何姿势都精确(UNITY-2D.md 11.6)。
+Godot 这边对应的是「每个影响一根辅助子骨骼」(rest 各不同),还没做 —— 现在的逐帧修正轨道照用。
 
 ## 7. 动画
 

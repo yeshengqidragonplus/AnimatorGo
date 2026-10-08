@@ -96,7 +96,8 @@ pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [
 
 **网格有两条路径。** 默认 SpriteRenderer + SpriteSkin;**只有** SpriteSkin 表达不了的网格
 (有 deform 顶点动画 / 绑定姿势非刚性 / 图集缩放不一致)改走 SkinnedMeshRenderer + Mesh `.asset`,
-deform 变成 Blend Shape。绑完又改过顶点的网格,setup 绑定 / 按贴图拟合两种按实测取小的,还偏就逐帧加修正 Blend Shape。
+deform 变成 Blend Shape。绑完又改过顶点的网格,**同一根骨骼在 `m_Bones` 里占多个槽位**、各带一个 bindpose,每个影响原样表达,
+任何姿势都精确;每顶点超过 4 根骨骼的,挑留哪 4 根并按全部动画的姿势拟合它们的局部坐标。
 `--skin-quality` 默认 `bone4`;`auto` 只给所有档位都是 Unlimited 的工程用。⚠️ 工程 Quality 的 Skin Weights 是**上限**,
 渲染器写 Bone4 也盖不过(实测;SpriteSkin 不受影响),工程各档要设成 Four Bones —— 导出时从输出目录往上找
 `ProjectSettings/QualitySettings.asset` 逐档查,截到就报。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 11 节。
@@ -332,6 +333,9 @@ render/   薄适配层。PixiJS / Godot / Unity / Cocos 各一个
 - ⚠️ **SkinnedMeshRenderer 不会自动带 sprite 的纹理**,挂默认材质是纯白;每张图集页要写
   一个引用了它的 `.mat`。渲染器 `m_Quality` 写 4,但工程 Quality 的 Skin Weights 是上限 ——
   真实工程 Low/Medium 档只有 2 根,这些网格在那几档照样只用 2 根
+- ⚠️ **SkinnedMeshRenderer 的 `m_Bones` 可以重复同一根骨骼、各配一个 bindpose**(实测 BakeMesh 误差 0)—— Spine 加权网格每个影响
+  各存一份局部坐标,绑完又改过顶点的网格靠它精确表达。别再走「逐帧加修正 Blend Shape」:准是准,产物涨到 2~3 倍,
+  在 Unity 里改骨骼动画修正也不跟着变。见 [UNITY-2D.md](docs/UNITY-2D.md) 11.6
 - ⚠️ **`.anim` 一条曲线里不能有两个写出来时刻相同的键**(7 位有效数字)—— Unity 不报错,切线除以 0,
   实测权重冲到 −3×10¹⁸。Spine 的 float32 关键帧时刻和 30 fps 采样网格会撞上。见 [UNITY-2D.md](docs/UNITY-2D.md) 11.3
 - ⚠️ **`.meta` 里有顶点就必须有等量的 `weights`,哪怕这个 sprite 没有骨骼** ——
