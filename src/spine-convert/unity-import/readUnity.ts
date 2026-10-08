@@ -1,6 +1,6 @@
 import type { Atlas, AtlasPage, AtlasRegion } from '../../core/atlas.ts'
 import { decodePng, type Image } from '../../unity/png.ts'
-import { parseMesh } from '../../unity/writeMesh.ts'
+import { parseMesh, skinWeights } from '../../unity/writeMesh.ts'
 import { SPRITE_SKIN_SCRIPT_GUID } from '../../unity/writePrefab.ts'
 import { spriteRecord } from '../../unity/spriteMeta.ts'
 import { list, map, num, parseUnityYaml, parseYamlDocument, ref, str, vec, type UnityObject, type UnityRef, type YamlMap, type YamlValue } from '../../unity/yaml.ts'
@@ -539,7 +539,9 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
     })
     const boneIds = list(r.data['m_Bones']).map((b) => ref(b).fileID)
     const boneOfIndex = boneIds.map((id) => boneName.get(id) ?? rootBoneName)
-    const weights = mesh.fullWeights.length === mesh.vertexCount ? mesh.fullWeights : mesh.streamWeights
+    // 按渲染器的 m_Quality 取 Unity 实际蒙皮用的权重(Bone4 = 顶点流里的前 4 根)
+    const { weights, autoQuality } = skinWeights(mesh, num(r.data['m_Quality']))
+    if (autoQuality) issues.add('approximated', where, '渲染器的蒙皮质量是 Auto(跟工程 Quality 档位走),有顶点超过 4 根骨骼,按完整权重读 —— 工程档位不是 Unlimited 的话 Unity 里实际会截断')
     const vertices: number[] = []
     const flatStart: number[] = []
     let flat = 0

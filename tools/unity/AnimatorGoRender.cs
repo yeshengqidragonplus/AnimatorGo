@@ -30,6 +30,11 @@ public static class AnimatorGoRender
     [MenuItem("Tools/AnimatorGo/渲染动画帧到 Renders")]
     public static void Render()
     {
+        // ⚠️ 工程 Quality 档位的 Skin Weights 会给 SkinnedMeshRenderer 的骨骼数封顶,渲染器上写死的 Bone4 突破不了(实测)。
+        // batchmode 用的是 0 级,一般是 OneBone —— 不改的话多骨骼顶点只跟最重的那根走,渲出来的不是产物该有的样子。
+        // 设成和导出时一样的 4 根;要看「某个档位下」的样子,用 ANIMATORGO_RENDER_SKIN_WEIGHTS=1|2|4|255
+        string skinWeights = Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_SKIN_WEIGHTS");
+        QualitySettings.skinWeights = int.TryParse(skinWeights, out int sw) ? (SkinWeights)sw : SkinWeights.FourBones;
         string[] prefabFilter = Split(Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_PREFABS"));
         string[] clipFilter = Split(Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_CLIPS"));
         int steps = int.TryParse(Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_STEPS"), out int parsed) ? parsed : 4;

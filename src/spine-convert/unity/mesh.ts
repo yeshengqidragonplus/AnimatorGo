@@ -45,6 +45,40 @@ export function applyFit(fit: Fit, x: number, y: number): { x: number; y: number
   return { x: c * x - s * y + fit.x, y: s * x + c * y + fit.y }
 }
 
+/** 相似变换写成矩阵 */
+export function fitMatrix(fit: Fit): { a: number; b: number; c: number; d: number; x: number; y: number } {
+  const c = Math.cos(DEG * fit.rotation) * fit.scale
+  const s = Math.sin(DEG * fit.rotation) * fit.scale
+  return { a: c, b: -s, c: s, d: c, x: fit.x, y: fit.y }
+}
+
+/** 最小二乘仿射 `dst ≈ M·src + t`;点不足 3 个或近乎共线时返回 null */
+export function fitAffine(
+  src: readonly { x: number; y: number }[],
+  dst: readonly { x: number; y: number }[],
+): { a: number; b: number; c: number; d: number; x: number; y: number } | null {
+  const n = src.length
+  if (n < 3) return null
+  let sx = 0, sy = 0, dx = 0, dy = 0
+  for (let i = 0; i < n; i++) { sx += src[i]!.x / n; sy += src[i]!.y / n; dx += dst[i]!.x / n; dy += dst[i]!.y / n }
+  let sxx = 0, sxy = 0, syy = 0, cxx = 0, cxy = 0, cyx = 0, cyy = 0
+  for (let i = 0; i < n; i++) {
+    const px = src[i]!.x - sx, py = src[i]!.y - sy
+    const qx = dst[i]!.x - dx, qy = dst[i]!.y - dy
+    sxx += px * px; sxy += px * py; syy += py * py
+    cxx += qx * px; cxy += qx * py; cyx += qy * px; cyy += qy * py
+  }
+  const det = sxx * syy - sxy * sxy
+  // 相对判据:点铺得太扁(共线)时仿射不定
+  if (det < 1e-6 * (sxx + syy) * (sxx + syy) || det < 1e-9) return null
+  const i00 = syy / det, i01 = -sxy / det, i11 = sxx / det
+  const a = cxx * i00 + cxy * i01
+  const b = cxx * i01 + cxy * i11
+  const c = cyx * i00 + cyy * i01
+  const d = cyx * i01 + cyy * i11
+  return { a, b, c, d, x: dx - (a * sx + b * sy), y: dy - (c * sx + d * sy) }
+}
+
 /**
  * 最小二乘拟合 `dst ≈ scale · R(θ) · src + t`。
  *

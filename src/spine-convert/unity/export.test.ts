@@ -8,6 +8,9 @@ import { applyPoint, poseAt, type Affine as EvalAffine } from '../../spine-eval/
 import { drawOrderOf, layerOfSlot } from '../../spine-eval/drawOrder.ts'
 import { sequenceFrameAt, sequenceRegionName, type SequenceKey } from '../../spine-eval/sequence.ts'
 import { exportToUnity, type UnityFile } from './export.ts'
+import { loadUnityScene } from '../unity-import/unityEval.ts'
+import { list, map, parseUnityYaml, str } from '../../unity/yaml.ts'
+import { attachmentVertices } from '../../spine-eval/vertices.ts'
 
 /**
  * Spine → Unity 的**端到端校验**。
@@ -1453,6 +1456,76 @@ for (const file of SEQUENCE_SAMPLES) {
         }
       }
       expect(checked).toBeGreaterThan(50)
+    })
+  })
+}
+
+/**
+ * 绑定姿势不一致的加权网格(绑完又在别的姿势下改过顶点)。SkinnedMeshRenderer 一套 bindpose 所有顶点共用,
+ * 以前一律按 setup 绑,一动就偏(female_lead 75 像素、Oldwoman_sit 44 像素);现在按实测选绑定、还偏就逐帧加修正
+ * Blend Shape,deform 帧间分歧大的也走逐帧修正。参照物是 Unity 的规则(unityEval,含 Bone4 截断),
+ * 每个 SkinnedMeshRenderer 网格 30 fps 逐帧与 Spine 比(避开关键帧那一瞬 —— 阶梯跳变在 0.1 毫秒内完成)。
+ */
+const MC2_ROOT = 'E:/UnityProject/MergeCooking2/MergeCooking2/Assets/Export/Spine/NewSpine'
+const BIND_SAMPLES = ['MapCharacters/female_lead/female_lead', 'MapCharacters/Oldwoman_sit/Oldwoman_sit', 'wave/wave', 'PetMerge/checkerboard_cat']
+for (const rel of BIND_SAMPLES) {
+  const skel = `${MC2_ROOT}/${rel}.skel.bytes`
+  const atlasPath = `${MC2_ROOT}/${rel}.atlas.txt`
+  describe.skipIf(!existsSync(skel) || !existsSync(atlasPath))(`绑定姿势不一致的网格:逐帧与 Spine 一致(${rel.replace(/^.*\//, '')})`, () => {
+    it('⭐ 每个 SkinnedMeshRenderer 网格 30 fps 逐帧,按 Unity 的规则算出的顶点与 Spine 差 < 1 像素', () => {
+      const part = readSkeletonPart(new Uint8Array(readFileSync(skel)))
+      const atlas = parseAtlas(readFileSync(atlasPath, 'utf8'))
+      const dir = atlasPath.slice(0, atlasPath.lastIndexOf('/'))
+      const sources = new Map<string, Image>(atlas.pages.map((p) => [p.name, decodePng(new Uint8Array(readFileSync(`${dir}/${p.name}`)))]))
+      const unity = exportToUnity(part, atlas, sources, { name: 'x', pixelsPerUnit: 100, renderPipeline: 'urp' })
+      const scene = loadUnityScene(new Map(unity.files.map((f) => [f.path, f.content])))
+      const defaultSkin = (part.skins.find((s) => s.name === 'default') ?? part.skins[0])!.name
+      let checked = 0
+      for (const anim of part.animations) {
+        let end = 0
+        for (const tl of anim.timelines) {
+          const frames = tl.kind === 'deform' ? (tl.frames[0] as { frames: Record<string, unknown>[] }).frames : tl.frames
+          for (const f of frames) end = Math.max(end, Number(f['time'] ?? 0))
+        }
+        for (let t = 0; t <= end + 1e-9; t += 1 / 30) {
+          const time = Math.min(end, t + 1e-4)
+          const pose = poseAt(part, anim, time)
+          for (const [path, v] of scene.verticesAt(`x@${anim.name}`, time)) {
+            if (v.sprite !== null) continue
+            // 挂图节点名 <slot>[__键名][@皮肤]
+            const node = path.replace(/^.*\//, '')
+            const at = node.lastIndexOf('@')
+            const skinName = at > 0 ? node.slice(at + 1) : defaultSkin
+            const rest = at > 0 ? node.slice(0, at) : node
+            const sep = rest.indexOf('__')
+            const slot = part.slots.findIndex((s) => s.name === (sep > 0 ? rest.slice(0, sep) : rest))
+            const key = sep > 0 ? rest.slice(sep + 2) : rest
+            const att = part.skins.find((s) => s.name === skinName)?.slots.find((e) => e.slot === slot)?.attachments.find((a) => a.key === key)
+            if (att === undefined || att.type !== 'mesh') continue
+            const spine = attachmentVertices(part, atlas, att, skinName, slot, pose, anim, time)
+            v.points.forEach((q, i) => {
+              expect(Math.hypot(q.x * 100 - spine[i]!.x, q.y * 100 - spine[i]!.y), `${node} 第 ${i} 个顶点 @${anim.name} ${time.toFixed(4)}`).toBeLessThan(1)
+            })
+            checked++
+          }
+        }
+      }
+      expect(checked).toBeGreaterThan(50)
+
+      // ⚠️ 写出时刻(7 位有效数字)相同的两个键,Unity 不跳过零长度的段 —— 斜率 1e10 的曲线一算就飞(实测权重 -3e18,
+      // 网格铺满屏)。参照物跳过零长度段看不出来,所以单独查
+      for (const f of unity.files) {
+        if (!f.path.endsWith('.anim')) continue
+        const clip = parseUnityYaml(f.content as string).find((o) => o.type === 'AnimationClip')!.data
+        for (const field of ['m_FloatCurves', 'm_PositionCurves', 'm_EulerCurves', 'm_ScaleCurves']) {
+          for (const entry of list(clip[field]).map(map)) {
+            const times = list(map(entry['curve'])['m_Curve']).map((k) => Number(str(map(k)['time'])))
+            times.forEach((t, k) => {
+              if (k > 0) expect(t, `${f.path} ${field} ${str(entry['path'])} ${str(entry['attribute'])} 第 ${k} 个键`).toBeGreaterThan(times[k - 1]!)
+            })
+          }
+        }
+      }
     })
   })
 }

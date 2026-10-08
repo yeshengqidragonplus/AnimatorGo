@@ -166,7 +166,7 @@ Unity.exe -batchmode -quit -nographics -projectPath <工程>           -executeM
 | Blend Shape 增量与蒙皮的顺序 | **加完再蒙皮**,与 Spine 同序(反向假设误差 1.41,正向 0) |
 | 权重是否线性 | 是,50 = 半个增量 |
 | 每顶点 >4 根骨骼 | 6 根全部参与蒙皮,误差 0。**但工程 Quality 的 `skinWeights` 必须是 Unlimited**,默认 4 根时误差 0.6 |
-| ⚠️ 真实工程的 Quality 设置 | UnityAnimationGo 六档里 Low/Medium/High 是 **2 根**,Very High 4 根,只有 Ultra 是 Unlimited;MergeCooking2 三档是 2 / 4 / 2 根。SkinnedMeshRenderer 按 `m_Quality: 0`(Auto)走会被**降到 2 根**,比 SpriteSkin 还差。导出时必须写 `m_Quality: 4`(Bone4,每渲染器上限就是 4),>4 根只有在工程 Quality 为 Unlimited 时才成立 —— 要像认渲染管线那样从 `ProjectSettings/QualitySettings.asset` 读出来再决定报不报 approximated |
+| ⚠️ 真实工程的 Quality 设置 | UnityAnimationGo 六档里 Low/Medium/High 是 **2 根**,Very High 4 根,只有 Ultra 是 Unlimited;MergeCooking2 三档是 2 / 4 / 2 根。SkinnedMeshRenderer 按 `m_Quality: 0`(Auto)走会被**降到 2 根**,比 SpriteSkin 还差。导出时写 `m_Quality: 4`(Bone4,每渲染器上限就是 4)。⚠️ 2026-10-08 实测:**工程的 Skin Weights 是上限,Bone4 盖不过**,档位 2 根就只用 2 根 —— 这里原来以为写 Bone4 就够了。>4 根只有在工程 Quality 为 Unlimited 时才成立 —— 要像认渲染管线那样从 `ProjectSettings/QualitySettings.asset` 读出来再决定报不报 approximated |
 | 绑定矩阵里的非等比缩放 | 保留,误差 0(SpriteSkin 的「只有 TR」限制是 2D 包自己的,不是 Unity 的) |
 | `m_SortingOrder` 能否打关键帧 | **能**,SpriteRenderer 和 SkinnedMeshRenderer 都能;Animation 窗口里列出 SpriteRenderer 的;2.5 取整成 3 |
 | `blendShape.<名>` 曲线 | 能驱动权重;`.anim` 里 `attribute: blendShape.shape0`,`classID: 137` |
@@ -334,7 +334,8 @@ Unity batchmode 自检 + `angry` 三套皮肤各渲两帧肉眼看(见下)。
 顺带发现的:`wave` 的 deform 打在 `path` attachment 上(路径约束用),不参与渲染,报 info 跳过。
 
 代价(都报出来):这些网格上的 slot 颜色动画丢弃(SkinnedMeshRenderer 没有 `m_Color`);
-每顶点 >4 根仍截到 4(渲染器写死 Bone4);关键帧之间与 Spine 的分歧 >0.5px 时报 approximated
+每顶点 >4 根仍截到 4(渲染器写 Bone4,且受工程 Skin Weights 上限);关键帧之间与 Spine 的分歧 >0.5px 时报 approximated
+(2026-10-08 起改走逐帧修正,见下文)
 (`wave` 最大 1.3px)。
 
 ## 未完成
@@ -343,13 +344,18 @@ Unity batchmode 自检 + `angry` 三套皮肤各渲两帧肉眼看(见下)。
 VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
 1. **Cocos 原生节点 + 动画剪辑**(用户定:不用 Cocos 自带的 Spine 组件)。Cocos 原生没有网格蒙皮,只能做刚性部件
-2. **Unity SkinnedMeshRenderer 的绑定误差**:见下文「Unity 导出里之前没报的绑定误差」,现在只报不修
-3. `.skel` 里往返验不出的区域:path 约束里同类型字段的语义顺序(字节布局已由 99 个真实文件确认,
+2. **Unity 曲线帧之间的误差**:Unity 运行时按帧率重采样带权切线的曲线,Spine 贝塞尔转出来的带权切线帧之间差几像素
+   (长骨骼链上最明显,`female_lead` 2.2 像素)。修法是按帧展开成不带权的密键 —— 精确但在 Unity 里不好改,**等用户定**。
+   见 [UNITY-2D.md](UNITY-2D.md) 11.6
+3. **工程 Quality 的 Skin Weights 没读**:它是 SkinnedMeshRenderer 的上限(实测),档位 < 4 根时 Bone4 照样被截。
+   导出时该像认渲染管线那样从 `ProjectSettings/QualitySettings.asset` 读出来,< 4 根就报
+4. `.skel` 里往返验不出的区域:path 约束里同类型字段的语义顺序(字节布局已由 99 个真实文件确认,
    见 [SPINE-BINARY.md](SPINE-BINARY.md) 第 9 节)
-4. **VAT 出口** —— 极限性能时才需要。来源有两个:Spine 直出,以及 Unity 正常动画烘焙。
+5. **VAT 出口** —— 极限性能时才需要。来源有两个:Spine 直出,以及 Unity 正常动画烘焙。
    求值器按「(数据, 时间) → 顶点数组」设计,让两边共用
 
 ~~跨度 < 64px 的加权网格不参与缩放分流~~ 查下来不是缺口,见上文。
+~~Unity SkinnedMeshRenderer 的绑定误差~~ 已修(2026-10-08),见下文。
 ~~Godot 导出~~ 中转模型 → Godot 已做完(2026-09-28),见下文。
 ~~Unity 产物 → 中转模型~~ 已做完(2026-10-08),接上 Godot 写出器就是 Unity → Godot,见下文。
 
@@ -430,7 +436,7 @@ Godot 4.7 原生 `Skeleton2D` + `Bone2D` + `Polygon2D` + `AnimationPlayer`,**零
 | 渲染肉眼看(`AnimatorGoRender.gd`) | MX2_cat / Female staff / BBQ_grill / wave 正常 |
 | MergeCooking2 全部 535 个骨架 | 全部导出成功 |
 
-### ⚠️ Unity 导出里之前没报的绑定误差(2026-09-28,做 Godot 时发现)
+### ✅ Unity SkinnedMeshRenderer 的绑定误差(2026-09-28 发现,2026-10-08 修)
 
 有一类加权网格,**绑完又在别的姿势下改过顶点**,各顶点对应的不是同一个绑定姿势 —— 既不能按 setup 绑,按图也拟合不准。
 Unity 导出里这类网格如果走 **SkinnedMeshRenderer**(有 deform / 非刚性 / 缩放不一致),绑定矩阵写的是 setup 的逆:
@@ -441,8 +447,26 @@ setup 姿势精确,一动就偏,而且**之前一声不响**。现在逐帧实�
 做 Godot 时第一版按「逐影响残差的最大值」判,把 Unity 里走 SpriteSkin、完全正常的 `whiteman_sit` / `B_body2` 也算了进去,
 得出「Unity 同样差 127 像素」。按**加权后**的偏差重判后,它两边都没问题。
 
-修法已经在 Godot 那边验证过(GODOT.md 第 6 节):两种绑定按实测取小的;还偏就逐帧加修正。Unity 这边对应的是
-SkinnedMeshRenderer 用按图拟合的绑定矩阵(Mesh 的 bindposes 本来就是任意 4×4)+ 逐帧的修正 Blend Shape。**还没做,等用户定。**
+**已修(2026-10-08)**,照 Godot 那边验证过的三档(GODOT.md 第 6 节):setup 绑定 / 按贴图拟合的绑定矩阵按实测取小的,
+还偏 0.5 像素以上就每条动画逐帧加修正 Blend Shape。有 deform 的网格关键帧之间与 Spine 差 > 0.5 像素的也改走修正。
+细节见 [UNITY-2D.md](UNITY-2D.md) 11.6。
+
+| | 结果 |
+|---|---|
+| MergeCooking2 535 个骨架 | 12 个骨架、31 个网格走到第 2/3 档,7 个按贴图拟合就精确,其余逐帧修正 |
+| 按 Unity 的规则求值,120 fps | 全部 ≤ 0.87 像素(Female staff 的 `fileb` 除外:骨骼 shear 已报 loss,那段时间是隐藏的) |
+| 真 Unity BakeMesh(4 根) | `Oldwoman_sit` 44 → 0.003 像素,`female_lead` 75 → 2.2 像素(剩下的是曲线重采样,见「未完成」2) |
+
+顺带查出来的(都写进了 UNITY-2D.md):
+
+- **工程 Quality 的 Skin Weights 是上限**,渲染器写 Bone4 也盖不过。之前文档说「外观不随档位变」是错的。
+  `AnimatorGoRender.cs` 现在渲染前把它设成 4 根(`ANIMATORGO_RENDER_SKIN_WEIGHTS=1|2|4|255` 可改)——
+  batchmode 默认档是 1 根,之前渲出来的加权网格其实都是刚性的
+- **一条曲线里两个键写出来的时刻相同**,Unity 不报错,权重冲到 −3×10¹⁸。修正采样合并时刻时踩到,`export.test.ts` 现在全盘查
+- 读回端(`unityEval.ts` / `readUnity.ts`)按渲染器 `m_Quality` 取权重(`writeMesh.ts` 的 `skinWeights`):Bone4 取前 4 根
+  重新归一,Auto 用完整权重并在 >4 根时报 approximated。之前一律用完整权重,和 Unity 实际播的不一致
+- `AnimatorGoRender` 的 `_MODE=animator` 渲 `female_lead`:第 0 帧缺脸/帽子/围裙,画面时间约是一半。controller 的映射和
+  速度查过是对的,新旧导出这里也完全一样 —— 判断是渲染工具的问题,还没查
 
 ~~linkedmesh~~ 已做完(2026-09-23)。~~运行时换皮肤~~ 早在 2026-09-10 就做完了(零脚本 + `--skins script`
 两种),之前这里漏删。

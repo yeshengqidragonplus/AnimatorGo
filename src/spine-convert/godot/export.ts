@@ -5,7 +5,7 @@ import type { Atlas, AtlasRegion } from '../../core/atlas.ts'
 import { encodePng, type Image } from '../../unity/png.ts'
 import { detectPremultiplied, unpremultiply } from '../unity/alpha.ts'
 import { resolveLinkedMeshes } from '../unity/linkedMesh.ts'
-import { fitSimilarity, applyFit, type Fit } from '../unity/mesh.ts'
+import { fitAffine, fitSimilarity, applyFit, type Fit } from '../unity/mesh.ts'
 import { toAbsoluteBezier } from '../../spine-format/bezier.ts'
 import { describeTimeline, DUPLICATE_TIMELINE_MESSAGE, lastPerProperty } from '../../spine-format/duplicateTimelines.ts'
 import { localsAt, setupLocals, valueBetween, type Affine, type BoneLocal } from '../../spine-eval/pose.ts'
@@ -145,30 +145,6 @@ function godotWorlds(part: SkeletonPart, locals: readonly GodotLocal[]): Affine[
     out[i] = bone.parent < 0 ? m : mul(out[bone.parent]!, m)
   })
   return out
-}
-
-/** 最小二乘仿射 `dst ≈ M·src + t`;点不足 3 个或近乎共线时返回 null */
-function fitAffine(src: readonly { x: number; y: number }[], dst: readonly { x: number; y: number }[]): Affine | null {
-  const n = src.length
-  if (n < 3) return null
-  let sx = 0, sy = 0, dx = 0, dy = 0
-  for (let i = 0; i < n; i++) { sx += src[i]!.x / n; sy += src[i]!.y / n; dx += dst[i]!.x / n; dy += dst[i]!.y / n }
-  let sxx = 0, sxy = 0, syy = 0, cxx = 0, cxy = 0, cyx = 0, cyy = 0
-  for (let i = 0; i < n; i++) {
-    const px = src[i]!.x - sx, py = src[i]!.y - sy
-    const qx = dst[i]!.x - dx, qy = dst[i]!.y - dy
-    sxx += px * px; sxy += px * py; syy += py * py
-    cxx += qx * px; cxy += qx * py; cyx += qy * px; cyy += qy * py
-  }
-  const det = sxx * syy - sxy * sxy
-  // 相对判据:点铺得太扁(共线)时仿射不定
-  if (det < 1e-6 * (sxx + syy) * (sxx + syy) || det < 1e-9) return null
-  const i00 = syy / det, i01 = -sxy / det, i11 = sxx / det
-  const a = cxx * i00 + cxy * i01
-  const b = cxx * i01 + cxy * i11
-  const c = cyx * i00 + cyy * i01
-  const d = cyx * i01 + cyy * i11
-  return { a, b, c, d, x: dx - (a * sx + b * sy), y: dy - (c * sx + d * sy) }
 }
 
 function fitToAffine(f: Fit): Affine {

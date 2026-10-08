@@ -503,3 +503,23 @@ export function parseMesh(yaml: string): ParsedMesh {
 
   return { vertexCount, positions, uvs, colors, streamWeights, fullWeights, triangles, bindposes, blendShapes }
 }
+
+/**
+ * SkinnedMeshRenderer 实际用来蒙皮的权重,按渲染器的 `m_Quality`(UNITY-2D.md 11.1 / 11.2):
+ *
+ * - 1 / 2 / 4(Bone1 / Bone2 / Bone4):顶点流里权重最大的那几根,重新归一
+ * - 0(Auto):跟工程的 Quality 档位走 —— 只有档位是 Unlimited 时才用 `m_VariableBoneCountWeights` 的完整权重。
+ *   角色目录里看不到工程设置,按完整权重算,`autoQuality` 置真让调用方报出来
+ */
+export function skinWeights(mesh: ParsedMesh, quality: number): { weights: { bone: number; weight: number }[][]; autoQuality: boolean } {
+  if (quality <= 0) {
+    const full = mesh.fullWeights.length === mesh.vertexCount ? mesh.fullWeights : mesh.streamWeights
+    return { weights: full, autoQuality: full.some((ws) => ws.filter((w) => w.weight > 0).length > 4) }
+  }
+  const weights = mesh.streamWeights.map((ws) => {
+    const kept = ws.filter((w) => w.weight > 0).sort((a, b) => b.weight - a.weight).slice(0, quality)
+    const total = kept.reduce((n, w) => n + w.weight, 0) || 1
+    return kept.map((w) => ({ bone: w.bone, weight: w.weight / total }))
+  })
+  return { weights, autoQuality: false }
+}

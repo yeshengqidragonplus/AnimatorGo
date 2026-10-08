@@ -1,4 +1,4 @@
-import { parseMesh } from '../../unity/writeMesh.ts'
+import { parseMesh, skinWeights } from '../../unity/writeMesh.ts'
 import { SPRITE_SKIN_SCRIPT_GUID } from '../../unity/writePrefab.ts'
 import { spriteRecord } from '../../unity/spriteMeta.ts'
 import { list, map, num, parseUnityYaml, parseYamlDocument, ref, str, vec, type UnityObject, type YamlMap, type YamlValue } from '../../unity/yaml.ts'
@@ -282,7 +282,7 @@ export function loadUnityScene(files: ReadonlyMap<string, string | Uint8Array>):
           const w = (o?.get(`137:blendShape.${s.name}`) ?? 0) / 100
           for (const d of s.deltas) { delta[d.index]!.x += d.x * w; delta[d.index]!.y += d.y * w }
         }
-        const weights = mesh.fullWeights.length === mesh.vertexCount ? mesh.fullWeights : mesh.streamWeights
+        const weights = skinWeights(mesh, num(smr.data['m_Quality'])).weights
         out.set(n.path, {
           sprite: null,
           points: mesh.positions.map((p, i) => {

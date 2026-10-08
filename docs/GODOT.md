@@ -148,6 +148,8 @@ Godot 的绑定是「每根骨骼一个矩阵、所有顶点共用」(与 Unity 
 MergeCooking2 全部 535 个骨架:需要第 3 档修正的网格修正后,采样帧之间只剩 `female_lead` 的 `nvzhu_t_gb6` 一处 2.3 像素
 (阶梯关键帧的瞬间跳变),报 approximated。
 
+Unity 导出的 SkinnedMeshRenderer 照同样的三档做了(2026-10-08),修正轨道换成修正 Blend Shape,见 UNITY-2D.md 11.6。
+
 ## 7. 动画
 
 | Spine | Godot |

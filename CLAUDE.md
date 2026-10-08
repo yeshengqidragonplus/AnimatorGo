@@ -96,8 +96,9 @@ pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [
 
 **网格有两条路径。** 默认 SpriteRenderer + SpriteSkin;**只有** SpriteSkin 表达不了的网格
 (有 deform 顶点动画 / 绑定姿势非刚性 / 图集缩放不一致)改走 SkinnedMeshRenderer + Mesh `.asset`,
-deform 变成 Blend Shape。`--skin-quality` 默认 `bone4`(渲染器写死 4 根,外观不随工程 Quality 档位变);
-`auto` 只给所有档位都是 Unlimited 的工程用。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 11 节。
+deform 变成 Blend Shape。绑完又改过顶点的网格,setup 绑定 / 按贴图拟合两种按实测取小的,还偏就逐帧加修正 Blend Shape。
+`--skin-quality` 默认 `bone4`;`auto` 只给所有档位都是 Unlimited 的工程用。⚠️ 工程 Quality 的 Skin Weights 是**上限**,
+渲染器写 Bone4 也盖不过(实测),工程各档要 ≥ 4 根。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 11 节。
 
 导出到 Godot 4(Godot 4.7 原生节点 + AnimationPlayer,零运行时脚本):
 
@@ -157,7 +158,8 @@ cp tools/unity/AnimatorGoVerify.cs UnityAnimationGo/Assets/Editor/
 (batchmode 可跑,不能加 `-nographics`),然后用 Read 直接看图。环境变量选范围:
 `ANIMATORGO_RENDER_PREFABS` / `_CLIPS` / `_STEPS`;`_MODE=animator` 走真正的 Animator 状态机(含 Write
 Defaults,最接近运行时);`_FOCUS=<物体名>` 放大看局部;`_HIDE=a,b` 关掉某些渲染器对比;`_DEBUG=1` 顺带写
-每帧亮着的渲染器占图上哪块、颜色是什么。输出到工程目录下 `Renders/`。编辑器占着 UnityAnimationGo 时,
+每帧亮着的渲染器占图上哪块、颜色是什么;`_SKIN_WEIGHTS=1|2|4|255` 改蒙皮根数(默认 4 —— batchmode 的默认档是 1 根,
+不设的话加权网格全是刚性的)。输出到工程目录下 `Renders/`。编辑器占着 UnityAnimationGo 时,
 把 `Packages/` `ProjectSettings/` `Assets/Settings/` 拷到临时目录另起一个工程跑。
 
 ⚠️ **batchmode 传给 Unity 的工程路径不能含 8.3 短名(`ZHE~1.HUA` 这种带 `~` 的)。** 实测同一个工程,
@@ -327,7 +329,10 @@ render/   薄适配层。PixiJS / Godot / Unity / Cocos 各一个
   发黑(face4 的红晕变成脸上一块深色叠加物),实心图只有一圈暗边看不出来。烘焙前按像素判断并还原,
   见 [UNITY-2D.md](docs/UNITY-2D.md) 第 10 节
 - ⚠️ **SkinnedMeshRenderer 不会自动带 sprite 的纹理**,挂默认材质是纯白;每张图集页要写
-  一个引用了它的 `.mat`。渲染器 `m_Quality` 写死 4 —— 真实工程 Low/Medium 档只有 2 根,Auto 会更差
+  一个引用了它的 `.mat`。渲染器 `m_Quality` 写 4,但工程 Quality 的 Skin Weights 是上限 ——
+  真实工程 Low/Medium 档只有 2 根,这些网格在那几档照样只用 2 根
+- ⚠️ **`.anim` 一条曲线里不能有两个写出来时刻相同的键**(7 位有效数字)—— Unity 不报错,切线除以 0,
+  实测权重冲到 −3×10¹⁸。Spine 的 float32 关键帧时刻和 30 fps 采样网格会撞上。见 [UNITY-2D.md](docs/UNITY-2D.md) 11.3
 - ⚠️ **`.meta` 里有顶点就必须有等量的 `weights`,哪怕这个 sprite 没有骨骼** ——
   Unity 的加载器会无条件读 `m_Weights[0]`,空数组直接 NRE,而这个异常会中断
   整个 sprite 循环,**让排在后面的 sprite 全部拿不到网格**(连带一片

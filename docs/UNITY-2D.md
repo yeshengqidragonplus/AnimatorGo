@@ -444,9 +444,11 @@ Unity 自带的 sprite 材质按直通 alpha 混合,拿 PMA 图喂它等于 rgb 
 
 - 节点放在骨架根下,**变换为单位** —— 网格空间就是骨架空间,绑定矩阵按此算
 - `m_Bones` 的顺序必须与 Mesh 的 `m_BindPose` 一致;`m_RootBone` 取第一根
-- **`m_Quality: 4`(Bone4)写死**。理由学 Spine:外观不随工程 Quality 档位变。实测真实工程的
-  Low/Medium/High 档 `skinWeights` 是 2 根,Auto 会比 SpriteSkin 还差。`--skin-quality auto`
-  给所有档位都设成 Unlimited 的工程用(能吃满 >4 根)
+- **`m_Quality: 4`(Bone4)**。`--skin-quality auto` 给所有档位都设成 Unlimited 的工程用(能吃满 >4 根)。
+  ⚠️ **渲染器的 `m_Quality` 只是请求,工程 Quality 的 Skin Weights 是上限**(2026-10-08 实测,BakeMesh):
+  档位设成 2 根,Bone4 的渲染器照样只用 2 根;batchmode 默认档是 1 根,所有加权网格摊成刚性。
+  之前这里写「外观不随档位变」是错的。真实工程的 Low/Medium/High 档是 2 根,所以**工程各档要设 ≥ 4 根**,
+  导出时还没读工程设置去报
 - `m_Materials` 指向第 10 节说的带纹理材质;`m_BlendShapeWeights` 全 0;`m_DirtyAABB: 1` 让 Unity 自己算包围盒
 - `m_SortingOrder` 与 SpriteRenderer 同一套(slot 下标),两种渲染器之间按它互通(实测,
   渲染到 RenderTexture 读像素);**同 order 时 Sprite 在上**,别打平
@@ -464,6 +466,11 @@ Unity 自带的 sprite 材质按直通 alpha 混合,拿 PMA 图喂它等于 rgb 
 里 5 个网格各有 `work_0` + `work_0_2` 同时满权重)。所以每条动画先按属性去重、只取最后一条
 (`spine-format/duplicateTimelines.ts`,换图 / 颜色同理),前后内容不同时报 approximated。
 
+⚠️ **一条曲线里不能有两个写出来时刻相同的键**(`.anim` 的时刻写 7 位有效数字)。Unity 不报错,两键之间的切线
+除以近乎 0 的时长,实测权重曲线冲到 −3×10¹⁸,网格整个飞走。Spine 的关键帧时刻是 float32,和 30 fps 的采样网格
+会差 1e-6 秒级 —— 逐帧修正(11.6)合并采样时刻时 1e-5 秒以内只留**后一个**(留前一个会把阶梯的跳变吃掉,实测 15 像素)。
+`export.test.ts` 查所有 `.anim` 曲线没有重复时刻。
+
 ### 11.4 ⚠️ 增量怎么算:按关键帧时刻的姿势反解,不要抄 Spine 的逐影响偏移
 
 Spine 加权网格的 deform 偏移是**每个影响一份、在各自骨骼的局部空间**里(实测 338/458 条
@@ -474,8 +481,8 @@ Spine 加权网格的 deform 偏移是**每个影响一份、在各自骨骼的�
 正确做法:Unity 在姿势 P 下作用在增量 δ 上的矩阵是 `M(P) = Σ w'ᵢ Bᵢ(P) Bᵢ(S)⁻¹`
 (w' 是 Unity 实际用的前 4 根归一权重,B 是骨骼世界矩阵的线性部分),Spine 在同一时刻的
 世界偏移是 `Δ = Σ wᵢ Bᵢ(P) dᵢ`。令 **`M(Pₖ)·δ = Δₖ`**,关键帧时刻就严格一致(实测 2 个
-骨架、上万个顶点×帧 < 0.5px)。关键帧之间两边各自 lerp,分歧导出时算出来,> 0.5px 报
-approximated —— MC2 的 458 条里 431 条 < 0.5px,最大 20px。
+骨架、上万个顶点×帧 < 0.5px)。关键帧之间两边各自 lerp,分歧导出时算出来 —— MC2 的 458 条里 431 条 < 0.5px,
+最大 20px。> 0.5px 的那条动画改走逐帧修正(11.6),不再只报 approximated。
 
 不加权网格简单得多:`δ = B(S)·d`(线性部分),任何姿势下都精确。
 
@@ -484,17 +491,51 @@ approximated —— MC2 的 458 条里 431 条 < 0.5px,最大 20px。
 实测(`AnimatorGoProbe.cs` Q3):骨骼转 90° 后增量跟着转,「加完再蒙皮」假设误差 0,
 「蒙皮后再加」假设误差 1.41。与 Spine 同序,所以上面的公式成立。权重线性,50 = 半个增量。
 
-### 11.6 已知代价
+### 11.6 ⚠️ 绑完又改过顶点的网格:三档绑定 + 逐帧修正
+
+Mesh 的 `m_BindPose` 是「每根骨骼一个、所有顶点共用」—— 与 Godot 的 `Bone2D.rest` 同构。Spine 加权网格却是
+**每个影响各存一份骨骼局部坐标**,美术绑完又在别的姿势下拖过顶点的话,同一顶点各影响在 setup 下算出的位置不一致,
+没有哪一组逐骨骼矩阵能同时解释它们。之前一律写 setup 的逆:setup 精确、一动就偏(`female_lead` 的 `nvzhu_t_gb1`
+77 像素),而且没报。现在照 Godot 导出验证过的办法(GODOT.md 第 6 节),`export.ts` 的 `rebindSkinned` 分三档:
+
+1. **setup 下绑的**(各影响位置差 < 0.05 像素,float32 舍入级):bindpose = setup 的逆,什么都不改
+2. **不一致**:再算一种「按贴图拟合」—— 每根骨骼拟合「局部坐标 → 图上位置(UV)」的仿射,按与 setup 的相似变换摆好。
+   两种绑定各自在**全部动画的全部采样姿势**上算加权后的偏差(Spine 姿势作目标,Unity 那边用兼容姿势 + Unity 实际
+   生效的权重),取小的。bindpose 本来就是任意 4×4,仿射放得下
+3. **两种都偏 0.5 像素以上**:setup 的顶点按 Spine 反解成精确值,每条动画加一组**修正 Blend Shape**
+   (`<动画>_fix<k>`):每个采样时刻一个形变目标,权重是「帐篷」—— 本时刻 100、相邻时刻 0、之间线性。
+   求解时把 deform 一起算进去,所以这些网格的 deform 不再单独转。采样时刻 = 关键帧 + 30 fps 网格 + 阶梯键前 1e-4 秒
+   (跳变前一刻也要对),再按「帧间线性插值与 Spine 差 > 0.25 像素就在中点加一个」细分,最细 1/480 秒。
+   细分完还超 0.5 像素才报 approximated
+
+另外,**有 deform 的网格**即使绑定没问题,关键帧之间 Blend Shape 线性插值与 Spine 的差 > 0.5 像素时(11.4),
+这条动画也改走逐帧修正(MC2 的 `nvzhu_t_gb1` 原来 22 像素)。
+
+实测:
+
+| | 结果 |
+|---|---|
+| MergeCooking2 535 个骨架 | 12 个骨架、31 个网格走到第 2/3 档,其中 7 个按贴图拟合就精确,其余逐帧修正 |
+| 按 Unity 的规则求值,120 fps(关键帧之间也比) | 全部 ≤ 0.87 像素;唯一例外是 Female staff 的 `fileb`(160 像素,骨骼 shear 已报 loss,那段时间它是隐藏的) |
+| 真 Unity BakeMesh(4 根,帧时刻 + 0.1 ms) | `Oldwoman_sit` 44 → **0.003** 像素;`female_lead` 75 → **2.2** 像素(剩下的在长骨骼链上,来自下面说的加权切线重采样,与绑定无关) |
+
+`export.test.ts` 的「绑定姿势不一致的网格」用例:按 Unity 的规则逐帧(30 fps + 阶梯前 1e-4 秒)读回产物,与 Spine 比
+< 1 像素,4 个样本(female_lead、Oldwoman_sit、wave、checkerboard_cat);去掉修复后用例会挂。
+
+⚠️ **Unity 运行时按帧率重采样带权切线的曲线**(2026-10-08 实测):编辑器里 `AnimationCurve.Evaluate` 与运行时只在
+帧时刻一致,帧之间运行时是按帧采样再插值的;不带权的切线在任何时刻都精确。Spine 的贝塞尔要转成带权切线(第 5 节),
+所以帧之间会差几像素,长骨骼链上最明显。修的话是把贝塞尔按帧展开成不带权的密键 —— 精确,但在 Unity 里不好改,
+**还没定**。
+
+### 11.7 已知代价
 
 - **slot 颜色动画**在这些网格上没有对应属性(SkinnedMeshRenderer 没有 `m_Color`),
   静态颜色烘进顶点色,动画部分报 loss
 - 这些网格在 Sprite Editor 里不能再刷权重;骨骼和形变权重曲线在 Animation 窗口里照常能改
 - deform 打在 `path` 上(路径约束用)不参与渲染,报 info 跳过 —— MC2 的 `wave` 有这种
-- ⚠️ **绑定矩阵是 setup 的逆** —— 网格绑完又在别的姿势下改过顶点时(各影响在 setup 下不一致),setup 姿势精确、
-  一动就偏。逐帧(30 fps)实测并报 approximated:MergeCooking2 里 25 处、最大 77 像素(`female_lead`)。
-  之前一直没报。修法在 Godot 那边验证过(GODOT.md 第 6 节),Unity 这边还没做,见 PROGRESS.md
+- 逐帧修正的网格,修正形变目标是逐帧烘的:在 Unity 里改骨骼动画,修正不会跟着变
 
-### 11.7 自检
+### 11.8 自检
 
 `AnimatorGoVerify.cs` 的 `CheckSkinnedMeshes`:Mesh 在不在、骨骼数 = 绑定矩阵数、材质带纹理、
 形变目标数;`CheckClips` 对 `blendShape.<名>` 曲线额外查 Mesh 里真有这个目标 ——
