@@ -98,7 +98,8 @@ pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [
 (有 deform 顶点动画 / 绑定姿势非刚性 / 图集缩放不一致)改走 SkinnedMeshRenderer + Mesh `.asset`,
 deform 变成 Blend Shape。绑完又改过顶点的网格,setup 绑定 / 按贴图拟合两种按实测取小的,还偏就逐帧加修正 Blend Shape。
 `--skin-quality` 默认 `bone4`;`auto` 只给所有档位都是 Unlimited 的工程用。⚠️ 工程 Quality 的 Skin Weights 是**上限**,
-渲染器写 Bone4 也盖不过(实测),工程各档要 ≥ 4 根。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 11 节。
+渲染器写 Bone4 也盖不过(实测;SpriteSkin 不受影响),工程各档要设成 Four Bones —— 导出时从输出目录往上找
+`ProjectSettings/QualitySettings.asset` 逐档查,截到就报。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 11 节。
 
 导出到 Godot 4(Godot 4.7 原生节点 + AnimationPlayer,零运行时脚本):
 
@@ -159,7 +160,7 @@ cp tools/unity/AnimatorGoVerify.cs UnityAnimationGo/Assets/Editor/
 `ANIMATORGO_RENDER_PREFABS` / `_CLIPS` / `_STEPS`;`_MODE=animator` 走真正的 Animator 状态机(含 Write
 Defaults,最接近运行时);`_FOCUS=<物体名>` 放大看局部;`_HIDE=a,b` 关掉某些渲染器对比;`_DEBUG=1` 顺带写
 每帧亮着的渲染器占图上哪块、颜色是什么;`_SKIN_WEIGHTS=1|2|4|255` 改蒙皮根数(默认 4 —— batchmode 的默认档是 1 根,
-不设的话加权网格全是刚性的)。输出到工程目录下 `Renders/`。编辑器占着 UnityAnimationGo 时,
+不设的话 SkinnedMeshRenderer 的网格全是刚性的;SpriteSkin 不受影响)。输出到工程目录下 `Renders/`。编辑器占着 UnityAnimationGo 时,
 把 `Packages/` `ProjectSettings/` `Assets/Settings/` 拷到临时目录另起一个工程跑。
 
 ⚠️ **batchmode 传给 Unity 的工程路径不能含 8.3 短名(`ZHE~1.HUA` 这种带 `~` 的)。** 实测同一个工程,

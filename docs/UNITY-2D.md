@@ -446,9 +446,12 @@ Unity 自带的 sprite 材质按直通 alpha 混合,拿 PMA 图喂它等于 rgb 
 - `m_Bones` 的顺序必须与 Mesh 的 `m_BindPose` 一致;`m_RootBone` 取第一根
 - **`m_Quality: 4`(Bone4)**。`--skin-quality auto` 给所有档位都设成 Unlimited 的工程用(能吃满 >4 根)。
   ⚠️ **渲染器的 `m_Quality` 只是请求,工程 Quality 的 Skin Weights 是上限**(2026-10-08 实测,BakeMesh):
-  档位设成 2 根,Bone4 的渲染器照样只用 2 根;batchmode 默认档是 1 根,所有加权网格摊成刚性。
-  之前这里写「外观不随档位变」是错的。真实工程的 Low/Medium/High 档是 2 根,所以**工程各档要设 ≥ 4 根**,
-  导出时还没读工程设置去报
+  档位设成 2 根,Bone4 的渲染器照样只用 2 根;batchmode 默认档是 1 根,这些网格摊成刚性。
+  之前这里写「外观不随档位变」是错的。真实工程的 Low/Medium/High 档是 2 根,所以**工程各档要设成 Four Bones**。
+  导出时从输出目录往上找 `ProjectSettings/QualitySettings.asset`(`src/unity/qualitySettings.ts`),有档位会截到
+  这些网格就报 approximated,列出是哪几档;不在工程里就提示一句。
+  **SpriteSkin 不受这个设置影响**:2D Animation 的蒙皮是包自己做的(源码里没碰 QualitySettings),
+  `female_lead` 只留 SpriteSkin 部件、1 根和 4 根各渲 8 帧,逐字节相同(工程 GPU Skinning 关着,走的是 CPU 路径)
 - `m_Materials` 指向第 10 节说的带纹理材质;`m_BlendShapeWeights` 全 0;`m_DirtyAABB: 1` 让 Unity 自己算包围盒
 - `m_SortingOrder` 与 SpriteRenderer 同一套(slot 下标),两种渲染器之间按它互通(实测,
   渲染到 RenderTexture 读像素);**同 order 时 Sprite 在上**,别打平
@@ -524,8 +527,8 @@ Mesh 的 `m_BindPose` 是「每根骨骼一个、所有顶点共用」—— 与
 
 ⚠️ **Unity 运行时按帧率重采样带权切线的曲线**(2026-10-08 实测):编辑器里 `AnimationCurve.Evaluate` 与运行时只在
 帧时刻一致,帧之间运行时是按帧采样再插值的;不带权的切线在任何时刻都精确。Spine 的贝塞尔要转成带权切线(第 5 节),
-所以帧之间会差几像素,长骨骼链上最明显。修的话是把贝塞尔按帧展开成不带权的密键 —— 精确,但在 Unity 里不好改,
-**还没定**。
+所以帧之间会差几像素,长骨骼链上最明显。修的话是把贝塞尔按帧展开成不带权的密键 —— 精确,但在 Unity 里不好改。
+**用户定:不改**(2026-10-08,见 DECISIONS.md)。
 
 ### 11.7 已知代价
 

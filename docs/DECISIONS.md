@@ -107,7 +107,9 @@ Spine 的 deform 顶点动画在 MergeCooking2 里占 **32% 的骨架**,且数�
 2. **渲染器写死 `m_Quality = 4`(Bone4)**。理由学 Spine:外观不随 Quality 档位变。真实工程的
    Low/Medium/High 档是 2 根,Auto 会比 SpriteSkin 还差。>4 根截到 4 并报 approximated(与 SpriteSkin
    一致)。转换时读 `ProjectSettings/QualitySettings.asset` 报一条提醒;`--skin-quality auto` 给
-   已把所有档位设成 Unlimited 的工程用,能吃满 >4 根
+   已把所有档位设成 Unlimited 的工程用,能吃满 >4 根。
+   ⚠️ **2026-10-08 实测这条理由不成立**:工程的 Skin Weights 是上限,Bone4 盖不过,档位 2 根就只用 2 根。
+   Bone4 仍然写(档位够的工程里与 Auto 等价),但导出时逐档查,截到这些网格就报 approximated(UNITY-2D.md 11.2)
 3. **加权网格的增量按关键帧时刻的姿势反解**(M(Pₖ)·δ = Δₖ),不直接抄 Spine 的逐影响偏移 ——
    数据证明那些偏移在世界空间里并不一致。关键帧之间的分歧在导出时算出来,>0.5 px 报 approximated
 4. 姿势求值器放 `src/spine-eval/`(纯数学、不依赖渲染),VAT 以后共用
@@ -127,6 +129,12 @@ Spine 的 deform 顶点动画在 MergeCooking2 里占 **32% 的骨架**,且数�
   真做就得换 `MeshRenderer` 自己填顶点,等于重写一个薄版 spine-unity。重新引入运行时,违背路线
 - **「只处理整块变换的 deform」这条捷径** —— 数据否了:全部 deform 都是整块平移/旋转/缩放的
   骨架只有 10 个,真·自由形变有 137 个。覆盖面不够,不做
+
+### 动画曲线保持带权切线,不按帧展开 · 已定 · 2026-10-08
+
+Unity 运行时按帧率重采样带权切线的曲线(实测),Spine 贝塞尔转成的带权切线在帧之间会差几像素
+(`female_lead` 长骨骼链上 2.2 像素)。按帧展开成不带权的密键能做到精确,但曲线在 Animation 窗口里就没法改了。
+**用户定:不改。** 几像素肉眼看不出,可编辑是初心。
 
 **已知仍然做不到的:** clipping 遮罩。逐帧绘制顺序此前判定为做不到 —— 排查证实
 `m_SortingOrder` 可以打关键帧(SpriteRenderer 与 SkinnedMeshRenderer 都行),2026-09-10 已做。

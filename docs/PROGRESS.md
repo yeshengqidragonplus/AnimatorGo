@@ -344,18 +344,15 @@ Unity batchmode 自检 + `angry` 三套皮肤各渲两帧肉眼看(见下)。
 VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
 1. **Cocos 原生节点 + 动画剪辑**(用户定:不用 Cocos 自带的 Spine 组件)。Cocos 原生没有网格蒙皮,只能做刚性部件
-2. **Unity 曲线帧之间的误差**:Unity 运行时按帧率重采样带权切线的曲线,Spine 贝塞尔转出来的带权切线帧之间差几像素
-   (长骨骼链上最明显,`female_lead` 2.2 像素)。修法是按帧展开成不带权的密键 —— 精确但在 Unity 里不好改,**等用户定**。
-   见 [UNITY-2D.md](UNITY-2D.md) 11.6
-3. **工程 Quality 的 Skin Weights 没读**:它是 SkinnedMeshRenderer 的上限(实测),档位 < 4 根时 Bone4 照样被截。
-   导出时该像认渲染管线那样从 `ProjectSettings/QualitySettings.asset` 读出来,< 4 根就报
-4. `.skel` 里往返验不出的区域:path 约束里同类型字段的语义顺序(字节布局已由 99 个真实文件确认,
+2. `.skel` 里往返验不出的区域:path 约束里同类型字段的语义顺序(字节布局已由 99 个真实文件确认,
    见 [SPINE-BINARY.md](SPINE-BINARY.md) 第 9 节)
-5. **VAT 出口** —— 极限性能时才需要。来源有两个:Spine 直出,以及 Unity 正常动画烘焙。
+3. **VAT 出口** —— 极限性能时才需要。来源有两个:Spine 直出,以及 Unity 正常动画烘焙。
    求值器按「(数据, 时间) → 顶点数组」设计,让两边共用
 
 ~~跨度 < 64px 的加权网格不参与缩放分流~~ 查下来不是缺口,见上文。
 ~~Unity SkinnedMeshRenderer 的绑定误差~~ 已修(2026-10-08),见下文。
+~~Unity 曲线帧之间的误差~~(运行时重采样带权切线,几像素)用户定不改(2026-10-08),见 DECISIONS.md。
+~~工程 Quality 的 Skin Weights 没读~~ 已做(2026-10-08):导出时逐档查,截到走 SkinnedMeshRenderer 的网格就报。
 ~~Godot 导出~~ 中转模型 → Godot 已做完(2026-09-28),见下文。
 ~~Unity 产物 → 中转模型~~ 已做完(2026-10-08),接上 Godot 写出器就是 Unity → Godot,见下文。
 
@@ -455,13 +452,14 @@ setup 姿势精确,一动就偏,而且**之前一声不响**。现在逐帧实�
 |---|---|
 | MergeCooking2 535 个骨架 | 12 个骨架、31 个网格走到第 2/3 档,7 个按贴图拟合就精确,其余逐帧修正 |
 | 按 Unity 的规则求值,120 fps | 全部 ≤ 0.87 像素(Female staff 的 `fileb` 除外:骨骼 shear 已报 loss,那段时间是隐藏的) |
-| 真 Unity BakeMesh(4 根) | `Oldwoman_sit` 44 → 0.003 像素,`female_lead` 75 → 2.2 像素(剩下的是曲线重采样,见「未完成」2) |
+| 真 Unity BakeMesh(4 根) | `Oldwoman_sit` 44 → 0.003 像素,`female_lead` 75 → 2.2 像素(剩下的是曲线重采样,用户定不改) |
 
 顺带查出来的(都写进了 UNITY-2D.md):
 
 - **工程 Quality 的 Skin Weights 是上限**,渲染器写 Bone4 也盖不过。之前文档说「外观不随档位变」是错的。
   `AnimatorGoRender.cs` 现在渲染前把它设成 4 根(`ANIMATORGO_RENDER_SKIN_WEIGHTS=1|2|4|255` 可改)——
-  batchmode 默认档是 1 根,之前渲出来的加权网格其实都是刚性的
+  batchmode 默认档是 1 根,之前渲出来的 SkinnedMeshRenderer 网格其实都是刚性的(SpriteSkin 不受影响,实测)。
+  导出时现在逐档查,截到这些网格就报 approximated(`female_lead` 进 UnityAnimationGo:四档不够,15 个网格)
 - **一条曲线里两个键写出来的时刻相同**,Unity 不报错,权重冲到 −3×10¹⁸。修正采样合并时刻时踩到,`export.test.ts` 现在全盘查
 - 读回端(`unityEval.ts` / `readUnity.ts`)按渲染器 `m_Quality` 取权重(`writeMesh.ts` 的 `skinWeights`):Bone4 取前 4 根
   重新归一,Auto 用完整权重并在 >4 根时报 approximated。之前一律用完整权重,和 Unity 实际播的不一致

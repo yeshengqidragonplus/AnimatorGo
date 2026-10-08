@@ -1092,6 +1092,27 @@ describe.skipIf(!existsSync(MC2_BRW))('皮肤:全部导进一个 prefab,皮肤�
       expect(result.issues.some((i) => i.path === `mesh.${n}` && i.message.includes('绑定姿势非刚性')), n).toBe(true)
     }
   })
+
+  /**
+   * 工程 Quality 的 Skin Weights 是 SkinnedMeshRenderer 的上限,渲染器写 Bone4 也盖不过(实测)。
+   * 换装件走 SkinnedMeshRenderer、是多骨骼加权的 —— 截到它们的档位要报出来,够的档位不报。
+   */
+  it('工程 Quality 有档位的 Skin Weights 不够:报出来是哪几档;都够就不报', () => {
+    const quality = (levels: { name: string; skinWeights: number }[]) =>
+      exportToUnity(part, atlas, sources, { name: 'brw', pixelsPerUnit: 100, renderPipeline: 'urp', skipImages: true, qualityLevels: levels })
+        .issues.filter((i) => i.message.includes('Skin Weights'))
+
+    const short = quality([{ name: 'Very Low', skinWeights: 1 }, { name: 'Medium', skinWeights: 2 }, { name: 'Ultra', skinWeights: 255 }])
+    expect(short).toHaveLength(1)
+    expect(short[0]!.level).toBe('approximated')
+    expect(short[0]!.message).toContain('Very Low(1 根)')
+    expect(short[0]!.message).not.toContain('Ultra')
+
+    expect(quality([{ name: 'High', skinWeights: 4 }, { name: 'Ultra', skinWeights: 255 }])).toEqual([])
+    // 不给就不查 —— 不知道产物进哪个工程
+    const unknown = exportToUnity(part, atlas, sources, { name: 'brw', pixelsPerUnit: 100, renderPipeline: 'urp', skipImages: true })
+    expect(unknown.issues.filter((i) => i.message.includes('Skin Weights'))).toEqual([])
+  })
 })
 
 // ─── 加权网格上的 deform:MergeCooking2 的本地样本(不在库里,存在才跑)────────────

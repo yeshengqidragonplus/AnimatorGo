@@ -25,6 +25,7 @@ import { unityGuid, internalId, uniqueIds } from '../../unity/ids.ts'
 import { encodePng, type Image } from '../../unity/png.ts'
 import { writeMesh, MESH_FILE_ID, type BlendShape, type BoneInfluence, type MeshVertex } from '../../unity/writeMesh.ts'
 import { writeSpriteMaterial, MATERIAL_FILE_ID, TEXTURE_FILE_ID } from '../../unity/writeMaterial.ts'
+import { skinWeightsLabel, UNLIMITED_SKIN_WEIGHTS, type QualityLevel } from '../../unity/qualitySettings.ts'
 import { toAbsoluteBezier } from '../../spine-format/bezier.ts'
 import {
   applyPoint,
@@ -90,11 +91,17 @@ export interface UnityExportOptions {
   /** 决定 SpriteRenderer 用哪个默认材质 —— 给错了整个角色是粉红的 */
   readonly renderPipeline: RenderPipeline
   /**
-   * SkinnedMeshRenderer 每顶点用几根骨骼蒙皮。默认 `bone4`:写死 4 根,外观不随工程
-   * Quality 档位变(学 Spine)。`auto` 跟随 Quality —— 只有所有档位都设成 Unlimited 时
-   * 才划算(能吃满 >4 根);真实工程的 Low/Medium 档往往只有 2 根,会比 SpriteSkin 还差。
+   * SkinnedMeshRenderer 每顶点用几根骨骼蒙皮。默认 `bone4`:渲染器写 4 根。`auto` 跟随 Quality ——
+   * 只有所有档位都设成 Unlimited 时才划算(能吃满 >4 根)。⚠️ 两种都以工程 Quality 的 Skin Weights
+   * 为上限(实测),Bone4 盖不过它 —— 见 `qualityLevels`。
    */
   readonly skinQuality?: 'bone4' | 'auto'
+  /**
+   * 目标工程 Quality 各档的 Skin Weights(`ProjectSettings/QualitySettings.asset`)。它是 SkinnedMeshRenderer
+   * 蒙皮根数的上限,SpriteSkin 不受影响。给了就逐档查:有档位会截到走 SkinnedMeshRenderer 的网格时报 approximated。
+   * 不给就不查(不知道产物进哪个工程)。
+   */
+  readonly qualityLevels?: readonly QualityLevel[]
   /**
    * 跳过图集 PNG 的编码。
    *
@@ -723,7 +730,7 @@ export function exportToUnity(
         issues.add(
           'approximated',
           `mesh.${item.spriteName}`,
-          '每顶点超过 4 根骨骼,SkinnedMeshRenderer 写死 Bone4,取权重最大的四根并重新归一化' +
+          '每顶点超过 4 根骨骼,SkinnedMeshRenderer 写 Bone4,取权重最大的四根并重新归一化' +
             '(完整权重已写入 Mesh;工程 Quality 全部档位设 Unlimited 并加 --skin-quality auto 可用满)',
         )
       } else {
@@ -2028,6 +2035,26 @@ export function exportToUnity(
       'skinnedMesh',
       `${skinned.length} 个网格走 SkinnedMeshRenderer,deform 已转成 ${shapes} 个 Blend Shape 形变目标`,
     )
+  }
+  // 工程 Quality 的 Skin Weights 是 SkinnedMeshRenderer 的上限(实测,渲染器写 Bone4 也盖不过)——
+  // 截到的档位里这些网格会变形。SpriteSkin 不受影响,所以只看走 SkinnedMeshRenderer 的
+  if (options.qualityLevels !== undefined) {
+    const needs = skinned.map((geo) => Math.max(1, ...geo.effective.map((e) => e.length)))
+    const need = Math.max(1, ...needs)
+    const capOf = (l: QualityLevel) => (l.skinWeights === UNLIMITED_SKIN_WEIGHTS ? Infinity : l.skinWeights)
+    const short = options.qualityLevels.filter((l) => capOf(l) < need)
+    if (short.length > 0) {
+      const lowest = Math.min(...short.map(capOf))
+      const hit = needs.filter((n) => n > lowest).length
+      issues.add(
+        'approximated',
+        'skinnedMesh',
+        `工程 Quality 的 Skin Weights 不够:${short.map((l) => `${l.name}(${skinWeightsLabel(l.skinWeights)})`).join('、')} —— ` +
+          `${hit} 个走 SkinnedMeshRenderer 的网格每顶点最多用到 ${need} 根骨骼,在这些档位会被截掉、变形` +
+          `(Skin Weights 是上限,渲染器写 Bone4 也盖不过;SpriteSkin 不受影响)。` +
+          `Project Settings ▸ Quality 把这些档设成 ${need > 4 ? 'Unlimited' : 'Four Bones'}`,
+      )
+    }
   }
   for (const spriteName of skinnedColorLoss) {
     issues.loss(`color.${spriteName}`, 'slot 颜色动画在 SkinnedMeshRenderer 上没有对应属性(静态颜色已烘进顶点色),已丢弃')
