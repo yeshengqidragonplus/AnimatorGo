@@ -209,7 +209,9 @@ godot --path <工程> --script res://AnimatorGoRender.gd -- res://a.tscn [输出
 
 `tools/godot/` 下的脚本要拷进工程根。`AnimatorGoVerify.gd` 查「只有 Godot 知道、而且不报错」的两类问题:轨道的
 节点 / 属性指不到(Godot 直接忽略这条轨道)、蒙皮骨骼路径指不到(网格不画)。`AnimatorGoRender.gd` 走真正的
-AnimationPlayer 逐帧渲成 PNG,不能加 `--headless`。
+AnimationPlayer 逐帧渲成 PNG,不能加 `--headless`。采样时刻 `时长 × i / 帧数`,与 Unity 的 `AnimatorGoRender.cs` 相同,两边能逐帧对照。
+⚠️ 播放器要 `speed_scale = 0` 定住:截图前要等两帧,不定住就晚约 0.05 秒(实测)。别用 `pause()` —— 暂停后再 `play()` 恢复、
+往回 seek,离散的 `visible` 轨道会取错键(实测,图整个灭掉;不暂停或先 `stop()` 都正常)。
 
 端到端测试 `src/spine-convert/godot/export.test.ts`:把写出的 `.tscn` 读回来,**按 Godot 的规则**(第 1 节的实测结论)
 算每个顶点,和 Spine 的求值在 setup、每个关键帧和相邻关键帧的中点比。仓库里 MX2_cat 3.8 / 4.1 必跑,

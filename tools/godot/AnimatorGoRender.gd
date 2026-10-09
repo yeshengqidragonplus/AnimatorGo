@@ -90,13 +90,17 @@ func _process(_delta: float) -> bool:
 				sp.play(skin)
 				sp.seek(0, true)
 		frame_camera()
+		# ⚠️ 播放器定住不走:下面等两帧才截图,不定住的话截到的比要的晚约 0.05 秒(实测)。
+		# 不用 pause() —— 暂停后再 play() 恢复、往回 seek,离散的 visible 轨道会取错键(实测,图整个灭掉)
+		player.speed_scale = 0.0
 		jobs.append({"anim": "", "t": 0.0, "i": 0})
 		for anim_name in player.get_animation_list():
 			if anim_name == "RESET":
 				continue
 			var length := player.get_animation(anim_name).length
+			# 时刻与 Unity 的渲染工具(AnimatorGoRender.cs)相同,两边能逐帧对照;不取 t = 时长 —— 循环动画在那一刻绕回开头
 			for i in steps:
-				jobs.append({"anim": anim_name, "t": length * i / maxf(steps - 1, 1), "i": i})
+				jobs.append({"anim": anim_name, "t": length * i / steps, "i": i})
 		index = 0
 		countdown = 3
 		return false

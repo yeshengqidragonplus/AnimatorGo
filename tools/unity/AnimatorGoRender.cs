@@ -33,8 +33,23 @@ public static class AnimatorGoRender
         // ⚠️ 工程 Quality 档位的 Skin Weights 会给 SkinnedMeshRenderer 的骨骼数封顶,渲染器上写死的 Bone4 突破不了(实测)。
         // batchmode 用的是 0 级,一般是 OneBone —— 不改的话多骨骼顶点只跟最重的那根走,渲出来的不是产物该有的样子。
         // 设成和导出时一样的 4 根;要看「某个档位下」的样子,用 ANIMATORGO_RENDER_SKIN_WEIGHTS=1|2|4|255
+        // ⚠️ 渲完要改回去:这个改动退出时会被存进工程的 ProjectSettings/QualitySettings.asset(实测,那一档从 1 根变成 4 根)
         string skinWeights = Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_SKIN_WEIGHTS");
+        SkinWeights originalSkinWeights = QualitySettings.skinWeights;
         QualitySettings.skinWeights = int.TryParse(skinWeights, out int sw) ? (SkinWeights)sw : SkinWeights.FourBones;
+        try
+        {
+            RenderAll();
+        }
+        finally
+        {
+            QualitySettings.skinWeights = originalSkinWeights;
+        }
+        if (Application.isBatchMode) EditorApplication.Exit(0);
+    }
+
+    static void RenderAll()
+    {
         string[] prefabFilter = Split(Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_PREFABS"));
         string[] clipFilter = Split(Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_CLIPS"));
         int steps = int.TryParse(Environment.GetEnvironmentVariable("ANIMATORGO_RENDER_STEPS"), out int parsed) ? parsed : 4;
@@ -82,6 +97,13 @@ public static class AnimatorGoRender
                 // 每条动画换一个干净的实例 —— SampleAnimation 不会把上一条动画动过、这一条没动的属性
                 // 还原(Animator 的 Write Defaults 会),复用实例会把上一条的表情带进来
                 var root = (GameObject)PrefabUtility.InstantiatePrefab(prefab);
+                // ⚠️ SkinnedMeshRenderer 的蒙皮矩阵每帧只算一次,而这里所有的 cam.Render() 都在编辑器的同一帧里 ——
+                // 不打开这个,换了姿势再渲还是上一次算的矩阵,进程里第一次渲染还整个不画(实测 female_lead 的 jump_4:
+                // 第 0 帧脸、帽子、围裙全没了,1.0 秒的胳膊画成另一个样子;BakeMesh 和 Play 模式里逐帧都是对的)
+                foreach (SkinnedMeshRenderer smr in root.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+                {
+                    smr.forceMatrixRecalculationPerRender = true;
+                }
                 try
                 {
                     // 带脚本模式:皮肤由 AnimatorGoSkins 管,按名字发消息切,免得渲染脚本依赖运行时脚本。
@@ -156,7 +178,6 @@ public static class AnimatorGoRender
         cam.targetTexture = null;
         rt.Release();
         Debug.Log($"AnimatorGo 渲染:写了 {written} 张到 {outDir}");
-        if (Application.isBatchMode) EditorApplication.Exit(0);
     }
 
     static readonly System.Reflection.MethodInfo DeformMethod = typeof(SpriteSkin).GetMethod(

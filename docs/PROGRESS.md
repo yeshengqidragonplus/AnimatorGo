@@ -1,4 +1,4 @@
-# 开发进度与交接(2026-10-08)
+# 开发进度与交接(2026-10-09)
 
 ## 产品定位
 
@@ -398,6 +398,29 @@ pnpm from-unity <Unity 产物目录> --to godot|json [--out 目录] [--ppu 100] 
 | Unity YAML 解析器 | 3000 个真实 Unity 文件(45975 个对象)0 异常 |
 | Unity → Godot 渲染 | MX2_cat 与 Spine 直出 Godot 的渲染一致 |
 
+### ⚠️ 两个渲染工具都画错过(2026-10-09 修)
+
+**产物没问题,是验证用的渲染工具错了。** 起因是 `female_lead` 的 `jump_4` 在 Unity 和 Godot 里渲出来第 10、15 帧姿势不一样。
+
+**Unity(`AnimatorGoRender.cs`):SkinnedMeshRenderer 的蒙皮矩阵每帧只算一次**,而批处理里所有 `cam.Render()` 都在编辑器的
+同一帧里。于是换了姿势再渲,这些网格还是上一次的矩阵(1.0 秒的胳膊画成另一个样子);进程里第一次渲染还整个不画(第 0 帧
+脸、帽子、围裙全没了)。打开 `forceMatrixRecalculationPerRender` 就好。排查过程中逐个排除的:
+包围盒剔除(实例化时就算对了)、异步编译 shader(批处理本来就是同步的)、Blend Shape 权重(清零、重写都不影响画面)、
+`m_Bones` 里重复的骨骼(重新赋值不影响)。
+
+- 产物是对的:BakeMesh(CPU)每次都和 Spine 一致;**Play 模式**(真正的帧循环,PlayMode 测试跑)里正常速度播放,
+  `nvzhu_t_gb5`(26 个槽位、4 根骨骼、472 个 Blend Shape)亮着的 119 帧,GPU 画的和 BakeMesh 逐像素比,每帧 0 个像素不同
+- ⚠️ **之前的 Unity 渲染里,SkinnedMeshRenderer 网格每条动画只有第一帧可信。** 精度结论(11.6 的 BakeMesh、读回端逐点比)不受影响
+- 修好后:`female_lead` 10 条动画 × 8 帧、`Oldwoman_sit` 2 条,和 Godot 同一时刻逐帧对照全部一致;`_MODE=animator`
+  与直接采样逐像素相同(57 帧)
+- 顺带:渲染工具把 Quality 的 Skin Weights 设成 4 根,**退出时会存进工程的 `QualitySettings.asset`**(实测那一档从 1 变成 4)。
+  现在渲完改回去
+
+**Godot(`AnimatorGoRender.gd`):截图比要的时刻晚约 0.05 秒。** `play` + `seek` 之后等两帧才截图,播放器一直在走;
+最后一帧(t = 时长)还会绕回开头。现在 `speed_scale = 0` 定住,80 帧实测时刻全对。⚠️ 别用 `pause()`:暂停后再 `play()` 恢复、
+往回 seek,离散的 `visible` 轨道会取错键,整张图灭掉(实测;不暂停、或先 `stop()` 都正常)。采样时刻也改成和 Unity 一样的
+`时长 × i / 帧数`,两边能逐帧对照。
+
 ### ⚠️ Godot 导出:同一时刻两个键,开头一帧两张图一起亮(2026-10-08 修)
 
 换图轨道在 0 秒先写 setup 值、再写第一帧的值 —— Godot **恰好在那一刻取第一个键**(实测),动画开头和每次循环回到起点,
@@ -475,8 +498,8 @@ setup 姿势精确,一动就偏,而且**之前一声不响**。现在逐帧实�
 - **一条曲线里两个键写出来的时刻相同**,Unity 不报错,权重冲到 −3×10¹⁸。修正采样合并时刻时踩到,`export.test.ts` 现在全盘查
 - 读回端(`unityEval.ts` / `readUnity.ts`)按渲染器 `m_Quality` 取权重(`writeMesh.ts` 的 `skinWeights`):Bone4 取前 4 根
   重新归一,Auto 用完整权重并在 >4 根时报 approximated。之前一律用完整权重,和 Unity 实际播的不一致
-- `AnimatorGoRender` 的 `_MODE=animator` 渲 `female_lead`:第 0 帧缺脸/帽子/围裙,画面时间约是一半。controller 的映射和
-  速度查过是对的,新旧导出这里也完全一样 —— 判断是渲染工具的问题,还没查
+- ~~`AnimatorGoRender` 的 `_MODE=animator` 渲 `female_lead`:第 0 帧缺脸/帽子/围裙,画面时间约是一半~~ 查清了(2026-10-09),
+  是渲染工具的问题、不是产物的,而且和 animator 模式无关,见下一节。「时间约是一半」是误判
 
 ~~linkedmesh~~ 已做完(2026-09-23)。~~运行时换皮肤~~ 早在 2026-09-10 就做完了(零脚本 + `--skins script`
 两种),之前这里漏删。

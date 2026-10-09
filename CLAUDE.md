@@ -116,7 +116,7 @@ pnpm godot <骨架文件或目录> [--out 目录] [--atlas 图集] [--skin 初�
 
 Godot 侧的验证:`tools/godot/` 的探针 / 自检 / 渲染脚本拷进一个 Godot 工程根,本机 Godot 在
 `E:/Tools/Godot_v4.7.2-stable_win64/Godot_v4.7.2-stable_win64_console.exe`(`--import` 先导入贴图;
-渲染不能加 `--headless`)。端到端测试把写出的 `.tscn` 读回来按 Godot 的规则算顶点,和 Spine 求值逐点比。
+渲染不能加 `--headless`,采样时刻与 Unity 的渲染工具相同,两边能逐帧对照)。端到端测试把写出的 `.tscn` 读回来按 Godot 的规则算顶点,和 Spine 求值逐点比。
 
 Unity 角色读回(我们导到 Unity、又在 Unity 里改过的,或别人在 Unity 里做的)→ Godot / Spine JSON:
 
@@ -164,6 +164,9 @@ Defaults,最接近运行时);`_FOCUS=<物体名>` 放大看局部;`_HIDE=a,b` �
 每帧亮着的渲染器占图上哪块、颜色是什么;`_SKIN_WEIGHTS=1|2|4|255` 改蒙皮根数(默认 4 —— batchmode 的默认档是 1 根,
 不设的话 SkinnedMeshRenderer 的网格全是刚性的;SpriteSkin 不受影响)。输出到工程目录下 `Renders/`。编辑器占着 UnityAnimationGo 时,
 把 `Packages/` `ProjectSettings/` `Assets/Settings/` 拷到临时目录另起一个工程跑。
+⚠️ 自己写 Unity 验证脚本时:批处理里所有 `cam.Render()` 都在编辑器的同一帧,SkinnedMeshRenderer 的蒙皮矩阵每帧只算一次 ——
+要开 `forceMatrixRecalculationPerRender`,否则换了姿势还是上一次的矩阵、进程里第一次渲染还整个不画(2026-10-09 之前的渲染都中过);
+改了 `QualitySettings` 要改回去,退出时会存进工程设置。要看真正的帧循环,用 PlayMode 测试(`-runTests -testPlatform PlayMode`)。
 
 ⚠️ **batchmode 传给 Unity 的工程路径不能含 8.3 短名(`ZHE~1.HUA` 这种带 `~` 的)。** 实测同一个工程,
 短路径下用户脚本(Assembly-CSharp)的 MonoScript 全部挂不上类:prefab 里的组件变成 missing script,
