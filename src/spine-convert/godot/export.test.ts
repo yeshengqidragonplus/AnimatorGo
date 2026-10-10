@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs'
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
 import { readSkeletonPart } from '../../spine-format/binary/readSkeleton.ts'
 import type { AnimationData } from '../../spine-format/binary/readAnimations.ts'
 import { parseAtlas } from '../../core/atlas.ts'
@@ -223,8 +223,14 @@ const SAMPLES: { label: string; skel: string; atlas: string }[] = [
   { label: 'Stage_rewards(遮罩 setup 里关着)', skel: `${MC2}/../../Activity/StageReward/Spine/Stage_rewards.skel.bytes`, atlas: `${MC2}/../../Activity/StageReward/Spine/Stage_rewards.atlas.txt` },
 ]
 
-for (const sample of SAMPLES) {
-describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atlas))(`Spine → Godot 端到端(${sample.label})`, () => {
+/**
+ * 导出一个样本,把写出的 .tscn 读回来。
+ *
+ * ⚠️ 在 beforeAll 里调,不能放在 describe 体里:skip 掉的 suite 收集用例时 describe 体照样执行,样本不在
+ * (res/ 是 gitignore 掉的,worktree 里没有;MergeCooking2 是本机的)就 ENOENT,整个文件「no tests」,
+ * 别的用例全被盖住。跳过的 suite 不跑 beforeAll。
+ */
+function exportSample(sample: (typeof SAMPLES)[number]) {
   const part = readSkeletonPart(new Uint8Array(readFileSync(sample.skel)))
   const atlas = parseAtlas(readFileSync(sample.atlas, 'utf8'))
   const dir = sample.atlas.slice(0, sample.atlas.lastIndexOf('/'))
@@ -280,7 +286,18 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
     return { excess, where }
   }
 
+  return { part, result, scene, pairs, worstAt }
+}
+
+for (const sample of SAMPLES) {
+describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atlas))(`Spine → Godot 端到端(${sample.label})`, () => {
+  let exported: ReturnType<typeof exportSample>
+  beforeAll(() => {
+    exported = exportSample(sample)
+  })
+
   it('每个 attachment 都有 Polygon2D;根下有 Skeleton2D 和 AnimationPlayer', () => {
+    const { pairs, scene } = exported
     for (const p of pairs) expect(p.node, p.a.name).toBeDefined()
     expect(scene.nodes.get('Skeleton2D')?.type).toBe('Skeleton2D')
     expect(scene.nodes.get('AnimationPlayer')?.props.get('deterministic')).toBe(true)
@@ -288,11 +305,13 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
   })
 
   it('⭐ setup 姿势:按 Godot 的规则算出的顶点与 Spine 一致(含「第二套」网格的辅助骨骼)', () => {
+    const { worstAt } = exported
     const { excess, where } = worstAt(null, 0, 0.05)
     expect(excess, where).toBeLessThan(0)
   })
 
   it('⭐ 每条动画的每个关键帧,以及相邻关键帧的中点:顶点与 Spine 一致', () => {
+    const { part, worstAt } = exported
     let checked = 0
     for (const anim of part.animations) {
       const times = new Set<number>()
@@ -312,6 +331,7 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
   })
 
   it('每条轨道都指向场景里真实存在的节点', () => {
+    const { scene } = exported
     for (const [name, anim] of scene.animations) {
       for (let i = 0; anim.props.has(`tracks/${i}/type`); i++) {
         const path = args(anim.props.get(`tracks/${i}/path`))[0] as unknown as string
@@ -322,6 +342,7 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
   })
 
   it('⭐ 同一个属性在所有动画(含 RESET)里是同一种轨道(实测:值 / 贝塞尔混着的话,没碰它的动画回不到 RESET,读出 0)', () => {
+    const { scene } = exported
     const typeOf = new Map<string, string>()
     for (const [name, anim] of scene.animations) {
       for (let i = 0; anim.props.has(`tracks/${i}/type`); i++) {
@@ -335,6 +356,7 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
   })
 
   it('⭐ 没有一条轨道在同一时刻有两个键(Godot 在那一刻取第一个,和这里的求值不一样 —— 实测开头一帧两张图一起亮)', () => {
+    const { scene } = exported
     for (const [name, anim] of scene.animations) {
       for (let i = 0; anim.props.has(`tracks/${i}/type`); i++) {
         const keys = anim.props.get(`tracks/${i}/keys`) as Record<string, ParsedValue>
@@ -345,6 +367,7 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
   })
 
   it('皮肤:每套一条 SkinPlayer 动画;初始按默认皮肤,具名皮肤的节点灭、被它盖住的默认节点在它的动画里灭', () => {
+    const { part, scene, pairs } = exported
     const named = part.skins.filter((s, i) => i > 0 && s.slots.length > 0)
     if (named.length === 0) {
       expect(scene.nodes.has('SkinPlayer')).toBe(false)
@@ -369,6 +392,7 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
   })
 
   it('⭐ clipping:遮罩是 clip_children 的 Polygon2D,被遮的部件都在它下面、同层、按 slot 排;形状和开关逐时刻与 Spine 一致', () => {
+    const { part, scene, pairs } = exported
     const groups = clipGroups(part, new IssueCollector())
     for (const g of groups) {
       const slot = part.slots[g.slot]!
@@ -411,6 +435,7 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
   })
 
   it('⭐ 混合模式:multiply → blend_mul 着色器,透明度折进颜色(实测 CanvasItemMaterial 的 MUL 不看透明度,透明处乘成黑);additive → CanvasItemMaterial', () => {
+    const { part, scene, pairs } = exported
     const ids = [...scene.resources.keys()]
     const idOf = (v: ParsedValue | undefined) => args(v)[0] as unknown as string
     for (const { a, slot, node } of pairs) {
@@ -437,6 +462,7 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
   })
 
   it('有损的地方都报出来了(IK / transform 约束)', () => {
+    const { part, result } = exported
     const kinds = result.issues.map((i) => `${i.level}:${i.path}`)
     expect(kinds.filter((k) => k.startsWith('loss:ik.')).length).toBe(part.ik.length)
     expect(kinds.filter((k) => k.startsWith('loss:transform.')).length).toBe(part.transform.length)

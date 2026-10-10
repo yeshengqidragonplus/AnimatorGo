@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs'
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
 import { packedSize, parseAtlas, regionUVs, writeAtlas } from './atlas.ts'
 
 /**
@@ -171,19 +171,31 @@ describe('UV 计算', () => {
 /**
  * 拿真实 Spine 图集验证 —— 语义弄反时这里会炸,合成 fixture 未必炸。
  * res/ 不进仓库(是用户的美术资源),所以文件不在时跳过。
+ *
+ * ⚠️ 图集在 beforeAll 里读:skip 掉的 suite 收集用例时 describe 体照样执行,在那里读会 ENOENT,
+ * 整个文件「no tests」,别的用例全被盖住。跳过的 suite 不跑 beforeAll。
  */
 const REAL_ATLAS = 'res/BBQ/BBQ_grill.atlas.txt'
 
-describe.skipIf(!existsSync(REAL_ATLAS))('真实图集不变量', () => {
+function loadRealAtlas() {
   const atlas = parseAtlas(readFileSync(REAL_ATLAS, 'utf-8'))
-  const page = atlas.pages[0]!
+  return { atlas, page: atlas.pages[0]! }
+}
+
+describe.skipIf(!existsSync(REAL_ATLAS))('真实图集不变量', () => {
+  let real: ReturnType<typeof loadRealAtlas>
+  beforeAll(() => {
+    real = loadRealAtlas()
+  })
 
   it('解析出区域且含旋转项', () => {
+    const { atlas } = real
     expect(atlas.regions.size).toBeGreaterThan(0)
     expect([...atlas.regions.values()].some((r) => r.rotate === 90)).toBe(true)
   })
 
   it('每个区域的占位矩形都在页内 —— 宽高弄反会越界', () => {
+    const { atlas, page } = real
     for (const r of atlas.regions.values()) {
       const [pw, ph] = packedSize(r)
       expect(r.x + pw, `${r.name} 横向越界`).toBeLessThanOrEqual(page.width)
@@ -192,6 +204,7 @@ describe.skipIf(!existsSync(REAL_ATLAS))('真实图集不变量', () => {
   })
 
   it('摆正尺寸加上裁剪偏移不超过原始尺寸 —— 宽高弄反会超', () => {
+    const { atlas } = real
     for (const r of atlas.regions.values()) {
       expect(r.width + r.offsetX, `${r.name} 宽超出原图`).toBeLessThanOrEqual(r.originalWidth)
       expect(r.height + r.offsetY, `${r.name} 高超出原图`).toBeLessThanOrEqual(r.originalHeight)
@@ -199,6 +212,7 @@ describe.skipIf(!existsSync(REAL_ATLAS))('真实图集不变量', () => {
   })
 
   it('UV 全部落在 [0,1]', () => {
+    const { atlas, page } = real
     for (const r of atlas.regions.values()) {
       for (const uv of regionUVs(r, page)) {
         expect(uv).toBeGreaterThanOrEqual(0)

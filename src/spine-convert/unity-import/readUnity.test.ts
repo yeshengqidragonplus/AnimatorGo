@@ -148,35 +148,58 @@ function compareColorsWithUnity(files: ReadonlyMap<string, string | Uint8Array>)
   return checked
 }
 
+/**
+ * 把一个 Spine 样本导到 Unity:原骨架、图集、产物(路径 → 内容)。
+ *
+ * ⚠️ 样本一律在 beforeAll 里读,不能放在 describe 体里:skip 掉的 suite 收集用例时 describe 体照样执行,
+ * 样本不在(res/ 是 gitignore 掉的,worktree 里没有;MergeCooking2 等是本机的)就 ENOENT,整个文件「no tests」,
+ * 别的用例全被盖住。跳过的 suite 不跑 beforeAll。
+ */
+function exportSample(skel: string, atlasPath: string) {
+  const part = readSkeletonPart(new Uint8Array(readFileSync(skel)))
+  const atlas = parseAtlas(readFileSync(atlasPath, 'utf8'))
+  const dir = atlasPath.slice(0, atlasPath.lastIndexOf('/'))
+  const sources = new Map<string, Image>(atlas.pages.map((p) => [p.name, decodePng(new Uint8Array(readFileSync(`${dir}/${p.name}`)))]))
+  const unity = exportToUnity(part, atlas, sources, { name: 'x', pixelsPerUnit: PPU, renderPipeline: 'urp' })
+  return { part, atlas, files: new Map(unity.files.map((f) => [f.path, f.content])) }
+}
+
+/** 导到 Unity 再读回来 */
+function exportAndReadBack(skel: string, atlasPath: string) {
+  const { part, atlas, files } = exportSample(skel, atlasPath)
+  const imported = importUnity(files, { pixelsPerUnit: PPU })
+  const back = fromJson(imported.json)
+
+  const attachmentOf = (skin: string, slot: string, key: string) =>
+    back.skins.find((s) => s.name === skin)?.slots.find((e) => e.slot === slotIndex(back, slot))?.attachments.find((a) => a.key === key)
+  return { part, atlas, files, imported, back, attachmentOf }
+}
+
 for (const sample of SAMPLES) {
   describe.skipIf(!existsSync(sample.skel) || !existsSync(sample.atlas))(`Unity 产物 → Spine(${sample.label})`, () => {
-    const part = readSkeletonPart(new Uint8Array(readFileSync(sample.skel)))
-    const atlas = parseAtlas(readFileSync(sample.atlas, 'utf8'))
-    const dir = sample.atlas.slice(0, sample.atlas.lastIndexOf('/'))
-    const sources = new Map<string, Image>(atlas.pages.map((p) => [p.name, decodePng(new Uint8Array(readFileSync(`${dir}/${p.name}`)))]))
-    const unity = exportToUnity(part, atlas, sources, { name: 'x', pixelsPerUnit: PPU, renderPipeline: 'urp' })
-    const files = new Map(unity.files.map((f) => [f.path, f.content]))
-    const imported = importUnity(files, { pixelsPerUnit: PPU })
-    const back = fromJson(imported.json)
-
-    const attachmentOf = (skin: string, slot: string, key: string) =>
-      back.skins.find((s) => s.name === skin)?.slots.find((e) => e.slot === slotIndex(back, slot))?.attachments.find((a) => a.key === key)
+    let rt: ReturnType<typeof exportAndReadBack>
+    beforeAll(() => {
+      rt = exportAndReadBack(sample.skel, sample.atlas)
+    })
 
     it('结构:每个挂图节点都读成了 attachment;动画一条不少;没有「丢失」', () => {
+      const { part, imported, back, attachmentOf } = rt
       for (const n of imported.nodes) expect(attachmentOf(n.skin, n.slot, n.key), n.path).toBeDefined()
       expect(back.animations.map((a) => a.name).sort()).toEqual(part.animations.map((a) => a.name).sort())
       expect(imported.issues.filter((i) => i.level === 'loss')).toEqual([])
     })
 
     it('⭐ 与 Unity 的规则逐点一致:setup、每条动画的关键帧、中点、四分点(0.05 像素)', () => {
+      const { files } = rt
       expect(compareWithUnity(files)).toBeGreaterThan(20)
     })
 
     it('⭐ 每个挂图物体的颜色与 Unity 的规则一致(slot 颜色 × attachment 颜色)', () => {
-      expect(compareColorsWithUnity(files)).toBeGreaterThan(0)
+      expect(compareColorsWithUnity(rt.files)).toBeGreaterThan(0)
     })
 
     it('粗检:setup 与原 Spine 一致(容差按 Unity 导出自己的判据)', () => {
+      const { part, atlas, imported, back, attachmentOf } = rt
       const pose = setupPose(part, { unityCompatible: true })
       const poseB = setupPose(back)
       for (const skin of part.skins) {
@@ -200,19 +223,23 @@ for (const sample of SAMPLES) {
 }
 
 
-/**
- * 读取器存在的理由:角色导到 Unity、**在 Unity 里改过之后**再转出去。改动按 Unity 编辑器真实写出的样子
- * 直接改文本(改关键帧取值、插一个默认切线的新关键帧、挪 prefab 里骨骼的位置),
- * 读回来要逐点符合 Unity 的规则,而且改动要落在对应的骨骼 / 时间轴上。
- */
-describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('混合模式读回来(MX2_cat 4.1,slot 轮流改成四种模式)', () => {
+/** MX2_cat 的 slot 轮流改成四种混合模式 */
+function loadBlendedCat() {
   const part = readSkeletonPart(new Uint8Array(readFileSync('res/spine/4.1/MX2_cat.skel.bytes')))
   const atlas = parseAtlas(readFileSync('res/spine/4.1/MX2_cat.atlas.txt', 'utf8'))
   const sources = new Map<string, Image>(atlas.pages.map((p) => [p.name, decodePng(new Uint8Array(readFileSync(`res/spine/4.1/${p.name}`)))]))
-  const blended = { ...part, slots: part.slots.map((s, i) => ({ ...s, blendMode: i % 4 })) }
+  return { atlas, sources, blended: { ...part, slots: part.slots.map((s, i) => ({ ...s, blendMode: i % 4 })) } }
+}
+
+describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('混合模式读回来(MX2_cat 4.1,slot 轮流改成四种模式)', () => {
+  let cat: ReturnType<typeof loadBlendedCat>
+  beforeAll(() => {
+    cat = loadBlendedCat()
+  })
 
   for (const rp of ['urp', 'builtin'] as const) {
     it(`⭐ ${rp}:我们导出的混合材质读回成 slot 的 blend,与原来逐个相同(SpriteRenderer、SkinnedMeshRenderer 都有)`, () => {
+      const { blended, atlas, sources } = cat
       const unity = exportToUnity(blended, atlas, sources, { name: 'x', pixelsPerUnit: PPU, renderPipeline: rp })
       const back = fromJson(importUnity(new Map(unity.files.map((f) => [f.path, f.content])), { pixelsPerUnit: PPU }).json)
       expect(back.slots.length).toBeGreaterThan(10)
@@ -228,12 +255,13 @@ describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('混合模式�
   }
 })
 
-describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('Unity 产物在 Unity 里改过之后 → Spine(MX2_cat 4.1)', () => {
-  const part = readSkeletonPart(new Uint8Array(readFileSync('res/spine/4.1/MX2_cat.skel.bytes')))
-  const atlas = parseAtlas(readFileSync('res/spine/4.1/MX2_cat.atlas.txt', 'utf8'))
-  const sources = new Map<string, Image>(atlas.pages.map((p) => [p.name, decodePng(new Uint8Array(readFileSync(`res/spine/4.1/${p.name}`)))]))
-  const unity = exportToUnity(part, atlas, sources, { name: 'x', pixelsPerUnit: PPU, renderPipeline: 'urp' })
-  const original = new Map(unity.files.map((f) => [f.path, f.content]))
+/**
+ * 读取器存在的理由:角色导到 Unity、**在 Unity 里改过之后**再转出去。改动按 Unity 编辑器真实写出的样子
+ * 直接改文本(改关键帧取值、插一个默认切线的新关键帧、挪 prefab 里骨骼的位置),
+ * 读回来要逐点符合 Unity 的规则,而且改动要落在对应的骨骼 / 时间轴上。
+ */
+function editCat() {
+  const original = exportSample('res/spine/4.1/MX2_cat.skel.bytes', 'res/spine/4.1/MX2_cat.atlas.txt').files
 
   /** 把某个文件里唯一出现的一段文本换掉(出现不止一次说明改错了地方) */
   const edit = (files: Map<string, string | Uint8Array>, path: string, from: string, to: string) => {
@@ -259,8 +287,17 @@ describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('Unity 产物�
   const boneIndex = (name: string) => after.bones.findIndex((b) => b.name === name)
   const rotateFrames = (p: typeof after) =>
     p.animations.find((a) => a.name === 'idle')!.timelines.find((tl) => tl.kind === 'rotate' && tl.owner === boneIndex('body2'))!.frames
+  return { edited, before, after, boneIndex, rotateFrames }
+}
+
+describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('Unity 产物在 Unity 里改过之后 → Spine(MX2_cat 4.1)', () => {
+  let cat: ReturnType<typeof editCat>
+  beforeAll(() => {
+    cat = editCat()
+  })
 
   it('改关键帧的值、插关键帧:落在 body2 的旋转时间轴上,别的帧不动', () => {
+    const { before, after, rotateFrames } = cat
     const b = rotateFrames(before), a = rotateFrames(after)
     expect(a.map((f) => f['time'] ?? 0)).toEqual([0, 0.5, 1, 2])
     expect(Number(a[2]!['value']) - Number(b[1]!['value'])).toBeCloseTo(30, 4)
@@ -270,12 +307,14 @@ describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('Unity 产物�
   })
 
   it('挪骨骼:setup 位置跟着变(单位 × ppu)', () => {
+    const { before, after, boneIndex } = cat
     const i = boneIndex('body')
     expect(Number(after.bones[i]!.x) - Number(before.bones[i]!.x)).toBeCloseTo(30, 4)
     expect(after.bones[i]!.y).toBeCloseTo(Number(before.bones[i]!.y), 6)
   })
 
   it('⭐ 改过的产物与 Unity 的规则逐点一致', () => {
+    const { edited } = cat
     expect(compareWithUnity(edited)).toBeGreaterThan(20)
   })
 })
@@ -284,14 +323,18 @@ describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('Unity 产物�
  * 别人的角色 / 在 Unity 里动过结构的角色:我们导出时不会出现、但 Unity 里很常见的写法。
  * 每一条都直接改文本(写法照 Unity 自己写出的),读回来逐点、逐「画了哪些、先后」符合 Unity 的规则。
  */
-describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('Unity 里常见、我们导出时不会出现的写法(MX2_cat 4.1 上改)', () => {
-  const part = readSkeletonPart(new Uint8Array(readFileSync('res/spine/4.1/MX2_cat.skel.bytes')))
-  const atlas = parseAtlas(readFileSync('res/spine/4.1/MX2_cat.atlas.txt', 'utf8'))
-  const sources = new Map<string, Image>(atlas.pages.map((p) => [p.name, decodePng(new Uint8Array(readFileSync(`res/spine/4.1/${p.name}`)))]))
-  const unity = exportToUnity(part, atlas, sources, { name: 'x', pixelsPerUnit: PPU, renderPipeline: 'urp' })
-  const original = new Map(unity.files.map((f) => [f.path, f.content]))
+function exportCat() {
+  const original = exportSample('res/spine/4.1/MX2_cat.skel.bytes', 'res/spine/4.1/MX2_cat.atlas.txt').files
   const originalNodes = importUnity(original, { pixelsPerUnit: PPU }).nodes
   const spriteOf = (path: string) => originalNodes.find((n) => n.path === path)!.sprite!
+  return { original, spriteOf }
+}
+
+describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('Unity 里常见、我们导出时不会出现的写法(MX2_cat 4.1 上改)', () => {
+  let cat: ReturnType<typeof exportCat>
+  beforeAll(() => {
+    cat = exportCat()
+  })
 
   type Files = Map<string, string | Uint8Array>
   const textOf = (files: Files, path: string) => files.get(path) as string
@@ -385,8 +428,8 @@ describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('Unity 里常�
     {
       label: 'm_Sprite 曲线换图(逐帧换 sprite)→ 每张图一个 attachment,换图时间轴',
       apply: (files) => {
-        const [g1, f1] = spriteOf('root/bubble2/bubble2__bubble').split(':')
-        const [g2, f2] = spriteOf('head').split(':')
+        const [g1, f1] = cat.spriteOf('root/bubble2/bubble2__bubble').split(':')
+        const [g2, f2] = cat.spriteOf('head').split(':')
         const k = (time: number, g: string, f: string) => `    - time: ${time}\n      value: {fileID: ${f}, guid: ${g}, type: 3}\n`
         editText(files, 'x@idle.anim', 'm_PPtrCurves: []', `m_PPtrCurves:\n  - curve:\n${k(0, g1!, f1!)}${k(0.5, g2!, f2!)}${k(1, g1!, f1!)}    attribute: m_Sprite\n    path: root/bubble2/bubble2__bubble\n    classID: 212\n    script: {fileID: 0}\n    flags: 2`)
       },
@@ -394,8 +437,8 @@ describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('Unity 里常�
         expect(losses(r)).toEqual([])
         const slot = r.back.slots.findIndex((s) => s.name === 'bubble2')
         const at = (t: number) => r.imported.nodes.find((n) => n.slot === 'bubble2' && n.key === slotAttachmentsAt(r.back, idle(r.back), t)[slot])?.sprite
-        expect(at(0.6)).toBe(spriteOf('head'))
-        expect(at(1.1)).toBe(spriteOf('root/bubble2/bubble2__bubble'))
+        expect(at(0.6)).toBe(cat.spriteOf('head'))
+        expect(at(1.1)).toBe(cat.spriteOf('root/bubble2/bubble2__bubble'))
       },
     },
     {
@@ -437,7 +480,7 @@ describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('Unity 里常�
 
   for (const e of EDITS) {
     it(`⭐ ${e.label}`, () => {
-      const files = new Map(original)
+      const files = new Map(cat.original)
       e.apply(files)
       expect(compareWithUnity(files)).toBeGreaterThan(20)
       e.check(read(files))
@@ -445,7 +488,7 @@ describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('Unity 里常�
   }
 
   it('⭐ 以上全部一起改', () => {
-    const files = new Map(original)
+    const files = new Map(cat.original)
     for (const e of EDITS) e.apply(files)
     expect(compareWithUnity(files)).toBeGreaterThan(20)
   })
@@ -456,12 +499,21 @@ describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('Unity 里常�
  * 11 条动画全是 `m_Sprite` 逐帧换图,每帧一张单独的贴图(Single 模式,`.meta` 里没有顶点)。
  */
 const PLAYER = 'E:/UnityProject/BlockTile1/BlockTile1/Assets/ThirdParty/Easy performant outline/Demo/Models for Demo scene/Free 2D Demo Character sprite sheet'
-describe.skipIf(!existsSync(PLAYER))('别人做的角色:逐帧换 sprite(Free 2D Demo Character)', () => {
+function readPlayer() {
   const files = readUnityDir(PLAYER)
   const imported = importUnity(files, { pixelsPerUnit: PPU })
   const back = fromJson(imported.json)
+  return { files, imported, back }
+}
+
+describe.skipIf(!existsSync(PLAYER))('别人做的角色:逐帧换 sprite(Free 2D Demo Character)', () => {
+  let player: ReturnType<typeof readPlayer>
+  beforeAll(() => {
+    player = readPlayer()
+  })
 
   it('结构:一个 slot、每张图一个 attachment、动画一条不少、没有丢失', () => {
+    const { files, imported, back } = player
     expect(imported.issues.filter((i) => i.level === 'loss')).toEqual([])
     expect(back.slots.map((s) => s.name)).toEqual(['Player'])
     const sprites = new Set<string>()
@@ -476,6 +528,7 @@ describe.skipIf(!existsSync(PLAYER))('别人做的角色:逐帧换 sprite(Free 2
   })
 
   it('⭐ 时长 = clip 的 m_StopTime(最后一帧要停一会儿,不能被吃掉)', () => {
+    const { files, back } = player
     for (const [path, content] of files) {
       if (!path.endsWith('.anim')) continue
       const clip = parseUnityYaml(content as string).find((o) => o.type === 'AnimationClip')!
@@ -487,6 +540,7 @@ describe.skipIf(!existsSync(PLAYER))('别人做的角色:逐帧换 sprite(Free 2
   })
 
   it('⭐ 与 Unity 的规则一致:每一刻画哪张图、顶点在哪', () => {
+    const { files } = player
     expect(compareWithUnity(files)).toBeGreaterThan(100)
   })
 })

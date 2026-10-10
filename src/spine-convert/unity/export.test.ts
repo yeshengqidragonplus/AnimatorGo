@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs'
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
 import { readSkeletonPart, type BoneRecord, type SkeletonPart } from '../../spine-format/binary/readSkeleton.ts'
 import type { Attachment } from '../../spine-format/binary/readSkins.ts'
 import { fromJsonText } from '../../spine-format/json/fromJson.ts'
@@ -399,8 +399,12 @@ function checkBlendMaterials(part: SkeletonPart, files: readonly UnityFile[], pr
 }
 
 // ─── 用例 ────────────────────────────────────────────────────────────────────
+//
+// ⚠️ 样本一律在 beforeAll 里读,不能放在 describe 体里:skip 掉的 suite 收集用例时 describe 体照样执行,
+// 样本不在(res/ 是 gitignore 掉的,worktree 里没有;MergeCooking2 等是本机的)就 ENOENT,整个文件「no tests」,
+// 别的用例全被盖住。跳过的 suite 不跑 beforeAll。
 
-describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
+function exportCat() {
   const part = readSkeletonPart(new Uint8Array(readFileSync(SKELETON)))
   const atlas = parseAtlas(readFileSync(ATLAS, 'utf8'))
   const sources = new Map<string, Image>([['MX2_cat.png', decodePng(new Uint8Array(readFileSync(PAGE)))]])
@@ -409,8 +413,17 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
   const fileOf = (suffix: string): UnityFile =>
     result.files.find((f) => f.path.endsWith(suffix)) ?? (() => { throw new Error(`没产出 ${suffix}`) })()
   const textOf = (suffix: string) => fileOf(suffix).content as string
+  return { part, atlas, sources, result, fileOf, textOf }
+}
+
+describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
+  let cat: ReturnType<typeof exportCat>
+  beforeAll(() => {
+    cat = exportCat()
+  })
 
   it('产出一整套 Unity 资源,每个都带 .meta', () => {
+    const { result } = cat
     const paths = result.files.map((f) => f.path).sort()
     expect(paths).toContain('MX2_cat.png')
     expect(paths).toContain('MX2_cat.prefab')
@@ -424,6 +437,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
   })
 
   it('每个 attachment 都有 sprite 或 Mesh 资产,没有漏图', () => {
+    const { result, textOf } = cat
     const meta = readMeta(textOf('.png.meta'))
     // 3 个 region(bubble 共用)+ 15 个 mesh,region 去重后一共 16 个;
     // 其中 eyelid 有 deform,走 SkinnedMeshRenderer,是一个 .asset 而不是 sprite
@@ -437,11 +451,13 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
   })
 
   it('每个加权网格都有一个 SpriteSkin', () => {
+    const { textOf } = cat
     const prefab = readPrefab(textOf('.prefab'))
     expect(prefab.skinCount).toBe(14)
   })
 
   it('权重归一化,骨骼下标不越界', () => {
+    const { textOf } = cat
     const meta = readMeta(textOf('.png.meta'))
     for (const sprite of meta.sprites) {
       if (sprite.weights.length === 0) continue
@@ -468,6 +484,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
    * 所以 region 也要写一个铺满矩形的四顶点网格。
    */
   it('⭐ 没有任何 sprite 的顶点为空(空的会连累后面所有 sprite)', () => {
+    const { textOf } = cat
     const text = textOf('.png.meta')
     // sprite 条目缩进 6 空格;缩进 4 空格的那条是「单图模式」的默认块,在最后,无害
     expect(text).not.toMatch(/^ {6}vertices: \[]$/m)
@@ -487,6 +504,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
    * 实测:不加权的 `eyelid` 排第 4,它一抛,#4~#16 全废。
    */
   it('⭐ 每个有顶点的 sprite 都有等量 weights(空数组会让 Unity 抛异常中断)', () => {
+    const { textOf } = cat
     const meta = readMeta(textOf('.png.meta'))
     for (const sprite of meta.sprites) {
       if (sprite.vertices.length === 0) continue
@@ -495,6 +513,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
   })
 
   it('三角形下标不越界', () => {
+    const { textOf } = cat
     const meta = readMeta(textOf('.png.meta'))
     for (const sprite of meta.sprites) {
       expect(sprite.triangles.length % 3).toBe(0)
@@ -507,6 +526,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
    * 按 Unity 的规则把产物算一遍,顶点必须落在 Spine 算出来的同一个位置。
    */
   it('Unity 按自己的规则导入后,顶点与 Spine 的求值一致(亚像素)', () => {
+    const { part, textOf } = cat
     const meta = readMeta(textOf('.png.meta'))
     const prefab = readPrefab(textOf('.prefab'))
     const pose = setupPose(part.bones)
@@ -583,6 +603,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
    * 拟合出的平移进 pivot、旋转由节点反着转回来。这条路错了只有那几张图会歪。
    */
   it('不加权网格:节点变换 + pivot 摆位后与 Spine 一致', () => {
+    const { part, result, textOf } = cat
     const meta = readMeta(textOf('.png.meta'))
     const prefab = readPrefab(textOf('.prefab'))
     const pose = setupPose(part.bones)
@@ -637,6 +658,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
    * 两条路必须落在同一个地方。
    */
   it('region attachment:四角与 Spine 的 UpdateRegion 一致', () => {
+    const { part, atlas, textOf } = cat
     const meta = readMeta(textOf('.png.meta'))
     const prefab = readPrefab(textOf('.prefab'))
     const pose = setupPose(part.bones)
@@ -712,6 +734,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
    * 权重取 `.anim` 里 blendShape 曲线在关键帧时刻的键值,再与 Spine 的 deform 求值比对。
    */
   it('⭐ SkinnedMeshRenderer:按 Unity 的规则蒙皮 + Blend Shape 后,顶点与 Spine 的 deform 一致(关键帧时刻)', () => {
+    const { part, textOf } = cat
     const renderers = readSkinnedRenderers(textOf('.prefab'))
     expect(renderers.map((r) => r.name)).toEqual(['eyelid'])
     const smr = renderers[0]!
@@ -818,6 +841,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
    * attachment 时间轴驱动它),GameObject m_IsActive 是皮肤(单皮肤骨架全亮)。
    */
   it('⭐ 挂图节点的初始显隐按 setup pose:同一 slot 只亮一个(渲染器 m_Enabled),皮肤那一维全亮', () => {
+    const { part, result, textOf } = cat
     const prefab = readPrefab(textOf('.prefab'))
     // 期望:每个可渲染 attachment 一个节点,key ≠ slot.attachmentName 的渲染器必须是灭的
     const expected = new Map<string, boolean>()
@@ -859,6 +883,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
    * 关键帧时刻的值 = 按 Spine 规则铺出的完整顺序里该 slot 的层号;没有 drawOrder 的动画写 setup 值。
    */
   it('⭐ 逐帧绘制顺序:m_SortingOrder 曲线在每个关键帧上等于 Spine 铺出的层号', () => {
+    const { part, textOf } = cat
     const affected = new Set<number>()
     for (const anim of part.animations) {
       for (const t of anim.timelines) {
@@ -906,6 +931,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
    * 烘焙后的图必须已经还原:半透明像素里要有 RGB 大于 alpha 的。
    */
   it('⭐ 预乘 alpha 的图集烘焙后是直通 alpha', () => {
+    const { sources, result, fileOf } = cat
     const source = sources.get('MX2_cat.png')!
     let semi = 0
     let over = 0
@@ -930,6 +956,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
   })
 
   it('有损的地方都报出来了,不静默', () => {
+    const { result } = cat
     const kinds = result.issues.map((i) => `${i.level}:${i.path}`)
     // deform 转成 Blend Shape、逐帧绘制顺序转成 m_SortingOrder 曲线,都不再是 loss
     expect(kinds.some((k) => k.startsWith('loss:') && k.includes('deform'))).toBe(false)
@@ -965,6 +992,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
   })
 
   it('⭐ 混合模式:每个渲染器挂它那个 slot 该用的材质,因子是 Spine 的;没有 loss,运行时带上着色器(URP / 内置)', () => {
+    const { part, atlas, sources, result } = cat
     expect(part.slots.every((s) => s.blendMode === 0)).toBe(true)
     // 全是 normal:不写混合材质、不带混合着色器
     expect(result.files.some((f) => /@(additive|multiply|screen)\.mat$/.test(f.path))).toBe(false)
@@ -992,6 +1020,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
   })
 
   it('两次导出逐字节相同 —— 否则 Unity 里的引用会断', () => {
+    const { part, atlas, sources, result } = cat
     const again = exportToUnity(part, atlas, sources, { name: 'MX2_cat', pixelsPerUnit: 100, renderPipeline: 'urp' })
     expect(again.files.length).toBe(result.files.length)
     again.files.forEach((file, i) => {
@@ -1008,6 +1037,7 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
    * 5 个网格各有 `work_0` 与 `work_0_2` 两个目标同时满权重。
    */
   it('⭐ 重复的 deform 时间轴不会叠成两倍 Blend Shape:产物与没有重复时逐字节相同,并报 approximated', () => {
+    const { part, atlas, sources, result } = cat
     let inserted = 0
     const withDuplicates = {
       ...part,
@@ -1044,12 +1074,21 @@ const MC2_BRW = 'E:/UnityProject/MergeCooking2/MergeCooking2/Assets/Export/Spine
  * blackrichwoman 有 default + 5 套换装皮肤(3rd_anniversary / Christmas_day / Pirate / Valentines_day / WestCowboy)。
  * Spine 一次只有一套生效;之前全部导出,海盗帽上叠着生日帽和圣诞围巾。
  */
-describe.skipIf(!existsSync(MC2_BRW))('皮肤:全部导进一个 prefab,皮肤层切(MergeCooking2 本地样本)', () => {
+function loadBrw() {
   const dir = MC2_BRW.slice(0, MC2_BRW.lastIndexOf('/'))
   const part = readSkeletonPart(new Uint8Array(readFileSync(MC2_BRW)))
   const atlas = parseAtlas(readFileSync(`${dir}/blackrichwoman.atlas.txt`, 'utf8'))
   const sources = new Map<string, Image>()
   for (const page of atlas.pages) sources.set(page.name, decodePng(new Uint8Array(readFileSync(`${dir}/${page.name}`))))
+  return { part, atlas, sources }
+}
+
+describe.skipIf(!existsSync(MC2_BRW))('皮肤:全部导进一个 prefab,皮肤层切(MergeCooking2 本地样本)', () => {
+  let brw: ReturnType<typeof loadBrw>
+  beforeAll(() => {
+    brw = loadBrw()
+  })
+
   const textIn = (result: ReturnType<typeof exportToUnity>, suffix: string) =>
     result.files.find((f) => f.path.endsWith(suffix))!.content as string
   const prefabOf = (result: ReturnType<typeof exportToUnity>) => readPrefab(textIn(result, '.prefab'))
@@ -1062,6 +1101,7 @@ describe.skipIf(!existsSync(MC2_BRW))('皮肤:全部导进一个 prefab,皮肤�
   const SCARVES = ['WestCowboy_scarf@Christmas_day', 'WestCowboy_scarf@Valentines_day', 'WestCowboy_scarf@WestCowboy']
 
   it('默认初始:所有皮肤的节点都在,只有默认皮肤的亮;表情变体靠渲染器 m_Enabled 灭', () => {
+    const { part, atlas, sources } = brw
     const result = exportToUnity(part, atlas, sources, { name: 'brw', pixelsPerUnit: 100, renderPipeline: 'urp' })
     const prefab = prefabOf(result)
     const all = [...prefab.nameOf.values()]
@@ -1120,6 +1160,7 @@ describe.skipIf(!existsSync(MC2_BRW))('皮肤:全部导进一个 prefab,皮肤�
   })
 
   it('--skin Pirate:初始皮肤是海盗 —— 海盗三件亮,别的皮肤灭,皮肤层默认 state 是 Pirate', () => {
+    const { part, atlas, sources } = brw
     const result = exportToUnity(part, atlas, sources, { name: 'brw', pixelsPerUnit: 100, renderPipeline: 'urp', skin: 'Pirate' })
     const prefab = prefabOf(result)
     expect(isOn(prefab, PIRATE_HAT)).toBe(true)
@@ -1137,6 +1178,7 @@ describe.skipIf(!existsSync(MC2_BRW))('皮肤:全部导进一个 prefab,皮肤�
    * 没有皮肤层、没有皮肤 clip;本体的 sprite 照旧硬引用。
    */
   it('--skins script:根节点挂 AnimatorGoSkins,换装件的 sprite 与材质留空、写成软引用', () => {
+    const { part, atlas, sources } = brw
     const result = exportToUnity(part, atlas, sources, {
       name: 'brw',
       pixelsPerUnit: 100,
@@ -1175,6 +1217,7 @@ describe.skipIf(!existsSync(MC2_BRW))('皮肤:全部导进一个 prefab,皮肤�
   })
 
   it('不存在的皮肤名当场报错,并列出有哪些', () => {
+    const { part, atlas, sources } = brw
     expect(() => exportToUnity(part, atlas, sources, { name: 'brw', pixelsPerUnit: 100, renderPipeline: 'urp', skin: 'Nope' })).toThrow(/Pirate/)
   })
 
@@ -1183,6 +1226,7 @@ describe.skipIf(!existsSync(MC2_BRW))('皮肤:全部导进一个 prefab,皮肤�
    * 换装小件因此留在 SpriteSkin;实测它们的绑定残差 5~19 像素,一直是被「非刚性」判据分流的。
    */
   it('跨度 < 64px、缩放差 50% 的换装小件照样走 SkinnedMeshRenderer(由绑定残差判据分流)', () => {
+    const { part, atlas, sources } = brw
     const result = exportToUnity(part, atlas, sources, { name: 'brw', pixelsPerUnit: 100, renderPipeline: 'urp' })
     for (const n of ['Valentines_flower1', 'Valentines_flower2', 'WestCowboy-sign', 'Christmas_bg_flower']) {
       expect(result.files.some((f) => f.path === `brw@${n}.asset`), n).toBe(true)
@@ -1195,6 +1239,7 @@ describe.skipIf(!existsSync(MC2_BRW))('皮肤:全部导进一个 prefab,皮肤�
    * 换装件走 SkinnedMeshRenderer、是多骨骼加权的 —— 截到它们的档位要报出来,够的档位不报。
    */
   it('工程 Quality 有档位的 Skin Weights 不够:报出来是哪几档;都够就不报', () => {
+    const { part, atlas, sources } = brw
     const quality = (levels: { name: string; skinWeights: number }[]) =>
       exportToUnity(part, atlas, sources, { name: 'brw', pixelsPerUnit: 100, renderPipeline: 'urp', skipImages: true, qualityLevels: levels })
         .issues.filter((i) => i.message.includes('Skin Weights'))
@@ -1221,7 +1266,7 @@ const MC2_CUSTOMER = 'E:/UnityProject/MergeCooking2/MergeCooking2/Assets/Export/
  * Unity 的增量是网格空间里一个向量。导出器按关键帧时刻的姿势反解增量 —— 这里照 Unity 的规则
  * (顶点流里前 4 根归一后的权重、加完增量再蒙皮)把写出来的文件算一遍,与 Spine 比对。
  */
-describe.skipIf(!existsSync(MC2_CUSTOMER))('加权网格的 deform → Blend Shape(MergeCooking2 本地样本)', () => {
+function exportCustomer() {
   const dir = MC2_CUSTOMER.slice(0, MC2_CUSTOMER.lastIndexOf('/'))
   const part = readSkeletonPart(new Uint8Array(readFileSync(MC2_CUSTOMER)))
   const atlas = parseAtlas(readFileSync(`${dir}/customer_1.atlas.txt`, 'utf8'))
@@ -1229,8 +1274,17 @@ describe.skipIf(!existsSync(MC2_CUSTOMER))('加权网格的 deform → Blend Sha
   for (const page of atlas.pages) sources.set(page.name, decodePng(new Uint8Array(readFileSync(`${dir}/${page.name}`))))
   const result = exportToUnity(part, atlas, sources, { name: 'customer_1', pixelsPerUnit: 100, renderPipeline: 'urp' })
   const textOf = (suffix: string) => result.files.find((f) => f.path.endsWith(suffix))!.content as string
+  return { part, result, textOf }
+}
+
+describe.skipIf(!existsSync(MC2_CUSTOMER))('加权网格的 deform → Blend Shape(MergeCooking2 本地样本)', () => {
+  let customer: ReturnType<typeof exportCustomer>
+  beforeAll(() => {
+    customer = exportCustomer()
+  })
 
   it('⭐ 加权网格:按 Unity 的规则(前 4 根归一 + 加完再蒙皮)算出的顶点,关键帧时刻与 Spine 一致', () => {
+    const { part, result, textOf } = customer
     const prefab = readPrefab(textOf('.prefab'))
     const renderers = readSkinnedRenderers(textOf('.prefab'))
     expect(renderers.length).toBeGreaterThan(0)
@@ -1341,7 +1395,7 @@ describe.skipIf(!existsSync(MC2_CUSTOMER))('加权网格的 deform → Blend Sha
 
 const MC2_FEMALE = 'E:/UnityProject/MergeCooking2/MergeCooking2/Assets/Export/Spine/NewSpine/Customer12/Female staff.skel.bytes'
 
-describe.skipIf(!existsSync(MC2_FEMALE))('linkedmesh 展开(MergeCooking2 本地样本)', () => {
+function exportFemale() {
   const dir = MC2_FEMALE.slice(0, MC2_FEMALE.lastIndexOf('/'))
   const part = readSkeletonPart(new Uint8Array(readFileSync(MC2_FEMALE)))
   const atlas = parseAtlas(readFileSync(`${dir}/Female staff.atlas.txt`, 'utf8'))
@@ -1355,8 +1409,17 @@ describe.skipIf(!existsSync(MC2_FEMALE))('linkedmesh 展开(MergeCooking2 本地
   const inSlot = defaultSkin.slots.find((e) => e.slot === slot)!.attachments
   const parentAttachment = inSlot.find((a) => a.key === 'head_take offence')!
   const linkedAttachment = inSlot.find((a) => a.key === 'head_ordinary')!
+  return { part, result, textOf, slot, parentAttachment, linkedAttachment }
+}
+
+describe.skipIf(!existsSync(MC2_FEMALE))('linkedmesh 展开(MergeCooking2 本地样本)', () => {
+  let female: ReturnType<typeof exportFemale>
+  beforeAll(() => {
+    female = exportFemale()
+  })
 
   it('样本的形状符合预期:父网格有 deform,linkedmesh 继承时间轴', () => {
+    const { result, parentAttachment, linkedAttachment } = female
     expect(parentAttachment.type).toBe('mesh')
     expect(linkedAttachment.type).toBe('linkedmesh')
     expect(linkedAttachment.data['parent']).toBe('head_take offence')
@@ -1365,6 +1428,7 @@ describe.skipIf(!existsSync(MC2_FEMALE))('linkedmesh 展开(MergeCooking2 本地
   })
 
   it('几何与父网格相同,UV 换成自己的图', () => {
+    const { result, textOf } = female
     const linked = parseMesh(textOf('female@head_ordinary.asset'))
     const meshes = result.files
       .filter((f) => f.path.endsWith('.asset') && f.path !== 'female@head_ordinary.asset')
@@ -1382,6 +1446,7 @@ describe.skipIf(!existsSync(MC2_FEMALE))('linkedmesh 展开(MergeCooking2 本地
   })
 
   it('⭐ 继承的 deform:按 Unity 的规则算出的顶点,关键帧时刻与 Spine 一致', () => {
+    const { part, result, textOf, slot, parentAttachment } = female
     const prefab = readPrefab(textOf('female.prefab'))
     const meta = result.files.find((f) => f.path === 'female@head_ordinary.asset.meta')!.content as string
     const renderer = readSkinnedRenderers(textOf('female.prefab')).find((r) => meta.includes(`guid: ${r.meshGuid}`))!
@@ -1489,47 +1554,57 @@ const SEQUENCE_SAMPLES = [
   'E:/UnityProject/FindTM1/Assets/Res/FindTM/Spines/Transportation/Boat_001/boat_1.skel.bytes',
 ]
 
+function exportSequenceSample(file: string, base: string) {
+  const dir = file.slice(0, file.lastIndexOf('/'))
+  const part = readSkeletonPart(new Uint8Array(readFileSync(file)))
+  const atlas = parseAtlas(readFileSync(`${dir}/${base}.atlas.txt`, 'utf8'))
+  const sources = new Map<string, Image>()
+  for (const page of atlas.pages) sources.set(page.name, decodePng(new Uint8Array(readFileSync(`${dir}/${page.name}`))))
+  const result = exportToUnity(part, atlas, sources, { name: base, pixelsPerUnit: 100, renderPipeline: 'urp', skipImages: true })
+  const textOf = (path: string) => result.files.find((f) => f.path === path)?.content as string | undefined
+  const prefab = readPrefab(textOf(`${base}.prefab`)!)
+  const defaultSkin = part.skins.find((s) => s.name === 'default') ?? part.skins[0]!
+
+  /** 每个序列帧 attachment:它的各帧节点(fileID)、帧号 */
+  const groups = part.skins.flatMap((skin) =>
+    skin.slots.flatMap((entry) =>
+      entry.attachments
+        .filter((a) => a.sequence !== null)
+        .map((a) => {
+          const slot = part.slots[entry.slot]!
+          const nodeOf = (i: number) => {
+            let name = `${attachmentNodeName(slot.name, a.key)}#${sequenceRegionName('', a.sequence!, i)}`
+            if (skin !== defaultSkin) name += `@${skin.name}`
+            return name
+          }
+          const nodes = Array.from({ length: a.sequence!.count }, (_, i) => {
+            const id = [...prefab.nameOf].find(([, n]) => n === nodeOf(i))?.[0]
+            return { index: i, name: nodeOf(i), id }
+          })
+          return { skin: skin.name, slot: entry.slot, key: a.key, seq: a.sequence!, nodes }
+        }),
+    ),
+  )
+  return { part, result, textOf, prefab, groups }
+}
+
 for (const file of SEQUENCE_SAMPLES) {
   const base = file.slice(file.lastIndexOf('/') + 1).replace(/\.skel\.bytes$/, '')
   describe.skipIf(!existsSync(file))(`4.1 序列帧 → 每帧一个节点(本地样本 ${base})`, () => {
-    const dir = file.slice(0, file.lastIndexOf('/'))
-    const part = readSkeletonPart(new Uint8Array(readFileSync(file)))
-    const atlas = parseAtlas(readFileSync(`${dir}/${base}.atlas.txt`, 'utf8'))
-    const sources = new Map<string, Image>()
-    for (const page of atlas.pages) sources.set(page.name, decodePng(new Uint8Array(readFileSync(`${dir}/${page.name}`))))
-    const result = exportToUnity(part, atlas, sources, { name: base, pixelsPerUnit: 100, renderPipeline: 'urp', skipImages: true })
-    const textOf = (path: string) => result.files.find((f) => f.path === path)?.content as string | undefined
-    const prefab = readPrefab(textOf(`${base}.prefab`)!)
-    const defaultSkin = part.skins.find((s) => s.name === 'default') ?? part.skins[0]!
-
-    /** 每个序列帧 attachment:它的各帧节点(fileID)、帧号 */
-    const groups = part.skins.flatMap((skin) =>
-      skin.slots.flatMap((entry) =>
-        entry.attachments
-          .filter((a) => a.sequence !== null)
-          .map((a) => {
-            const slot = part.slots[entry.slot]!
-            const nodeOf = (i: number) => {
-              let name = `${attachmentNodeName(slot.name, a.key)}#${sequenceRegionName('', a.sequence!, i)}`
-              if (skin !== defaultSkin) name += `@${skin.name}`
-              return name
-            }
-            const nodes = Array.from({ length: a.sequence!.count }, (_, i) => {
-              const id = [...prefab.nameOf].find(([, n]) => n === nodeOf(i))?.[0]
-              return { index: i, name: nodeOf(i), id }
-            })
-            return { skin: skin.name, slot: entry.slot, key: a.key, seq: a.sequence!, nodes }
-          }),
-      ),
-    )
+    let sample: ReturnType<typeof exportSequenceSample>
+    beforeAll(() => {
+      sample = exportSequenceSample(file, base)
+    })
 
     it('样本里确实有序列帧,每帧都有节点,且没有缺图', () => {
+      const { result, groups } = sample
       expect(groups.length).toBeGreaterThan(0)
       for (const g of groups) for (const n of g.nodes) expect(n.id, n.name).toBeDefined()
       expect(result.issues.filter((i) => i.level === 'loss' && i.message.includes('图集里没有'))).toEqual([])
     })
 
     it('setup:只有 setup 那一帧的渲染器亮(且该 attachment 本来就是 setup 显示的)', () => {
+      const { part, prefab, groups } = sample
       for (const g of groups) {
         const shown = part.slots[g.slot]!.attachmentName === g.key
         const setup = sequenceFrameAt(undefined, g.seq, 0)
@@ -1538,6 +1613,7 @@ for (const file of SEQUENCE_SAMPLES) {
     })
 
     it('⭐ 每个采样时刻,Unity 亮着的恰好是 Spine 在那一刻显示的那一帧', () => {
+      const { part, textOf, prefab, groups } = sample
       const stepAt = (keys: { time: number; value: number }[], t: number) => {
         let v = keys[0]!.value
         for (const k of keys) if (k.time <= t) v = k.value
@@ -1668,8 +1744,7 @@ const CLIP_SAMPLES = [
   ['race_haibao(范围里 20 个走 SkinnedMeshRenderer)', `${MC2_ROOT}/SpeedRaceStart/race_haibao`],
 ] as const
 
-for (const [label, stem] of CLIP_SAMPLES) {
-describe.skipIf(!existsSync(`${stem}.skel.bytes`))(`clipping → SpriteMask(${label})`, () => {
+function exportClipSample(stem: string) {
   const dir = stem.slice(0, stem.lastIndexOf('/'))
   const part = readSkeletonPart(new Uint8Array(readFileSync(`${stem}.skel.bytes`)))
   const atlas = parseAtlas(readFileSync(`${stem}.atlas.txt`, 'utf8'))
@@ -1713,8 +1788,18 @@ describe.skipIf(!existsSync(`${stem}.skel.bytes`))(`clipping → SpriteMask(${la
   }
   const meta = readMeta(textOf('c@clip.png.meta'))
   const internalIds = [...textOf('c@clip.png.meta').matchAll(/internalID: (-?\d+)/g)].map((m) => m[1]!)
+  return { part, result, textOf, groups, goName, trOfGo, trs, masks, interaction, pathOf, meta, internalIds }
+}
+
+for (const [label, stem] of CLIP_SAMPLES) {
+describe.skipIf(!existsSync(`${stem}.skel.bytes`))(`clipping → SpriteMask(${label})`, () => {
+  let sample: ReturnType<typeof exportClipSample>
+  beforeAll(() => {
+    sample = exportClipSample(stem)
+  })
 
   it('被遮的 slot 的渲染器都「只在遮罩里显示」,别的都不是;被遮的 SkinnedMeshRenderer 用自带着色器', () => {
+    const { part, result, textOf, groups, goName, interaction } = sample
     const clipped = new Set(groups.flatMap((g) => g.clipped.map((s) => part.slots[s]!.name)))
     const slotOfNode = (name: string) => part.slots.map((s) => s.name).filter((n) => name === n || name.startsWith(`${n}__`) || name.startsWith(`${n}#`) || name.startsWith(`${n}@`)).sort((x, y) => y.length - x.length)[0]
     let checked = 0
@@ -1735,6 +1820,7 @@ describe.skipIf(!existsSync(`${stem}.skel.bytes`))(`clipping → SpriteMask(${la
   })
 
   it('⭐ 每个遮罩:范围 = (遮罩 slot, 最后一个被遮的 slot];逐时刻只亮一个 SpriteMask,开关和形状与 Spine 一致', () => {
+    const { part, textOf, groups, goName, trOfGo, trs, masks, pathOf, meta, internalIds } = sample
     for (const g of groups) {
       const slot = part.slots[g.slot]!
       const base = g.key === slot.name ? slot.name : `${slot.name}__${g.key}`
@@ -1788,6 +1874,7 @@ describe.skipIf(!existsSync(`${stem}.skel.bytes`))(`clipping → SpriteMask(${la
   })
 
   it('有损的地方都报了:没有「clipping 已丢弃」,每个遮罩一条说明', () => {
+    const { part, result, groups } = sample
     expect(result.issues.some((i) => i.message.includes('clipping 遮罩的对应物'))).toBe(false)
     for (const g of groups) expect(result.issues.some((i) => i.path === `clipping.${part.slots[g.slot]!.name}/${g.key}` && i.message.includes('SpriteMask'))).toBe(true)
   })
@@ -1803,8 +1890,8 @@ const BLEND_SAMPLES = [
   ['Multiple_Energy(24 个 additive 的粒子)', `${MC2_ROOT}/../../Public/System/MultipleEnergy/Spine/Multiple_Energy`, ['particle', 'particle24']],
 ] as const
 
-for (const [label, stem, expected] of BLEND_SAMPLES) {
-describe.skipIf(!existsSync(`${stem}.skel.bytes`))(`混合模式(${label})`, () => {
+/** 读一个混合模式样本,URP / 内置各导一遍;blended 是画得出东西、混合模式不是 normal 的 slot */
+function exportBlendSample(stem: string) {
   const part = readSkeletonPart(new Uint8Array(readFileSync(`${stem}.skel.bytes`)))
   const atlas = parseAtlas(readFileSync(`${stem}.atlas.txt`, 'utf8'))
   const dir = stem.slice(0, stem.lastIndexOf('/'))
@@ -1812,11 +1899,21 @@ describe.skipIf(!existsSync(`${stem}.skel.bytes`))(`混合模式(${label})`, () 
   for (const page of atlas.pages) sources.set(page.name, decodePng(new Uint8Array(readFileSync(`${dir}/${page.name}`))))
   const drawn = (slot: number) => part.skins.some((s) => s.slots.some((e) => e.slot === slot && e.attachments.some((a) => a.type === 'region' || a.type === 'mesh')))
   const blended = part.slots.map((s, i) => ({ s, i })).filter(({ s, i }) => s.blendMode !== 0 && drawn(i))
+  const exportWith = (rp: RenderPipeline) => exportToUnity(part, atlas, sources, { name: 'b', pixelsPerUnit: 100, renderPipeline: rp, skipImages: true })
+  return { part, blended, results: { urp: exportWith('urp'), builtin: exportWith('builtin') } }
+}
+
+for (const [label, stem, expected] of BLEND_SAMPLES) {
+describe.skipIf(!existsSync(`${stem}.skel.bytes`))(`混合模式(${label})`, () => {
+  let sample: ReturnType<typeof exportBlendSample>
+  beforeAll(() => {
+    sample = exportBlendSample(stem)
+  })
 
   for (const rp of ['urp', 'builtin'] as const) {
-    const result = exportToUnity(part, atlas, sources, { name: 'b', pixelsPerUnit: 100, renderPipeline: rp, skipImages: true })
-
     it(`${rp}:每个画得出东西、混合模式不是 normal 的 slot 都报了 info(带 slot 名和模式名),normal 的不报`, () => {
+      const { part, blended } = sample
+      const result = sample.results[rp]
       for (const name of expected) expect(blended.map(({ s }) => s.name)).toContain(name)
       for (const { s } of blended) {
         const issue = result.issues.find((i) => i.path === `slot.${s.name}`)
@@ -1828,6 +1925,8 @@ describe.skipIf(!existsSync(`${stem}.skel.bytes`))(`混合模式(${label})`, () 
     })
 
     it(`${rp}:⭐ 每个渲染器的材质与它的 slot 的混合模式对得上(被遮的 SkinnedMeshRenderer 在 URP 下用 AnimatorGoMaskedMesh)`, () => {
+      const { part } = sample
+      const result = sample.results[rp]
       const { checked, runtime, shadersOf } = checkBlendMaterials(part, result.files, 'b.prefab', rp)
       for (const name of expected) expect(checked.get(name), name).toBeGreaterThan(0)
       expect(runtime.size).toBeGreaterThan(0)
