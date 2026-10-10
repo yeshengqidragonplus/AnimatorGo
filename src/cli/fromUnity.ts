@@ -7,19 +7,21 @@ import { encodePng } from '../unity/png.ts'
 import { exportToGodot } from '../spine-convert/godot/export.ts'
 import type { ConversionIssue } from '../spine-convert/types.ts'
 import { findGodotProject, godotResDir } from './godotProject.ts'
-import { readUnityDir } from './unityDir.ts'
+import { detectColorSpace, readUnityDir } from './unityDir.ts'
+import type { ColorSpace } from '../unity/colorSpace.ts'
 
 /**
  * Unity 产物 → Spine / Godot 的命令行入口。
  *
  * ```
- * pnpm from-unity <Unity 产物目录> --to godot|json [--out 目录] [--ppu 100] [--skin 初始皮肤]
+ * pnpm from-unity <Unity 产物目录> --to godot|json [--out 目录] [--ppu 100] [--skin 初始皮肤] [--color-space linear|gamma]
  * ```
  *
  * 读一个 Unity 角色目录:正好一个 prefab(或一个 PSD Importer 导入的 `.psb` / `.psd`),加上 `.anim` + controller + 贴图 / Mesh / 材质及其 `.meta`。
  * 我们导出(`pnpm unity`)、又在 Unity 里改过的可以读;别人做的(骨骼上直接挂图、`m_IsActive` 显隐、
  * `m_Sprite` 逐帧换图)也可以读。`--ppu` 要与导出时一致;别人的角色就是想要的 Spine 像素 / Unity 单位。
- * `--skin` 不给就用 prefab 里亮着的那套皮肤。
+ * `--skin` 不给就用 prefab 里亮着的那套皮肤。`--color-space` 不给就从目录往上找工程的设置(SkinnedMeshRenderer 的顶点色在
+ * 线性工程里是线性值,读回要换算),不在工程里按 linear。
  *
  * - `--to godot`:Godot 4 场景(`pnpm godot` 同一个写出器)
  * - `--to json`:Spine 4.1 JSON + `.atlas` + 贴图
@@ -33,6 +35,8 @@ interface Options {
   readonly out: string
   readonly ppu: number
   readonly skin: string | null
+  /** null = 从目录所在的 Unity 工程认 */
+  readonly colorSpace: ColorSpace | null
 }
 
 function parseArgs(argv: readonly string[]): Options | string {
@@ -55,8 +59,13 @@ function parseArgs(argv: readonly string[]): Options | string {
   if (to !== 'godot' && to !== 'json') return '--to 要是 godot 或 json'
   const ppu = Number(flags.get('ppu') ?? '100')
   if (!Number.isFinite(ppu) || ppu <= 0) return `--ppu 要是正数`
+  const colorSpace = flags.get('color-space') ?? null
+  if (colorSpace !== null && colorSpace !== 'linear' && colorSpace !== 'gamma') return '--color-space 要是 linear 或 gamma'
   const resolved = resolve(input)
-  return { input: resolved, to, out: resolve(flags.get('out') ?? `${resolved}_${to}`), ppu, skin: flags.get('skin') ?? null }
+  return {
+    input: resolved, to, out: resolve(flags.get('out') ?? `${resolved}_${to}`), ppu, skin: flags.get('skin') ?? null,
+    colorSpace: colorSpace as ColorSpace | null,
+  }
 }
 
 const MARKS: Record<string, string> = { loss: '✗', approximated: '≈', info: 'ℹ' }
@@ -65,17 +74,18 @@ const describe = (issue: ConversionIssue) => `  ${MARKS[issue.level] ?? '·'} ${
 function main(): void {
   const parsed = parseArgs(process.argv.slice(2))
   if (typeof parsed === 'string') {
-    console.error(`✗ ${parsed}\n\n用法:pnpm from-unity <Unity 产物目录> --to godot|json [--out 目录] [--ppu 100] [--skin 初始皮肤]`)
+    console.error(`✗ ${parsed}\n\n用法:pnpm from-unity <Unity 产物目录> --to godot|json [--out 目录] [--ppu 100] [--skin 初始皮肤] [--color-space linear|gamma]`)
     process.exitCode = 1
     return
   }
   const files = readUnityDir(parsed.input)
-  const imported = importUnity(files, { pixelsPerUnit: parsed.ppu })
+  const colorSpace = parsed.colorSpace ?? detectColorSpace(parsed.input)?.space ?? 'linear'
+  const imported = importUnity(files, { pixelsPerUnit: parsed.ppu, colorSpace })
   const name = imported.name
   // 自检:写出的 Spine JSON 要能被自己的读取器读通
   const part = fromJson(imported.json)
   console.log(`Unity → ${parsed.to === 'godot' ? 'Godot 4' : 'Spine 4.1 JSON'}:${basename(parsed.input)}`)
-  console.log(`  骨骼 ${part.bones.length},slot ${part.slots.length},皮肤 ${part.skins.length},动画 ${part.animations.length}`)
+  console.log(`  骨骼 ${part.bones.length},slot ${part.slots.length},皮肤 ${part.skins.length},动画 ${part.animations.length},色彩空间 ${colorSpace}`)
   for (const issue of imported.issues) console.log(describe(issue))
 
   const dir = join(parsed.out, name)

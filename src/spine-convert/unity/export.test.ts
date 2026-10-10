@@ -1,6 +1,10 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { readSkeletonPart, type BoneRecord } from '../../spine-format/binary/readSkeleton.ts'
+import { readSkeletonPart, type BoneRecord, type SkeletonPart } from '../../spine-format/binary/readSkeleton.ts'
+import type { Attachment } from '../../spine-format/binary/readSkins.ts'
+import { fromJsonText } from '../../spine-format/json/fromJson.ts'
+import { slotColorAt, unpackRgba } from '../../spine-eval/color.ts'
+import { srgbToLinear } from '../../unity/colorSpace.ts'
 import { parseAtlas } from '../../core/atlas.ts'
 import { decodePng, type Image } from '../../unity/png.ts'
 import { parseMesh } from '../../unity/writeMesh.ts'
@@ -17,7 +21,6 @@ import { clipDeformOf, clipGroups, clipPolygonAt } from '../clipping.ts'
 import { IssueCollector } from '../types.ts'
 import { BLEND_FACTORS, BLEND_SHADER_FILES, BLEND_SHADER_GUIDS, MASKED_MESH_SHADER_FILE, MASKED_MESH_SHADER_GUID, type SpineBlend } from '../../unity/writeMaterial.ts'
 import { SPRITE_MATERIALS, type RenderPipeline } from '../../unity/writePrefab.ts'
-import type { SkeletonPart } from '../../spine-format/binary/readSkeleton.ts'
 
 /**
  * Spine → Unity 的**端到端校验**。
@@ -1837,4 +1840,157 @@ describe.skipIf(!existsSync(`${stem}.skel.bytes`))(`混合模式(${label})`, () 
     })
   }
 })
+}
+
+// ─── attachment 自己的颜色 ────────────────────────────────────────────────────
+
+/**
+ * 每个挂图节点在 Unity 里画出来的颜色(unityEval:SpriteRenderer 的 m_Color 曲线 / SkinnedMeshRenderer 的顶点色换回 sRGB),
+ * 与 Spine 的 slot 颜色(各颜色时间轴按顺序套用)× attachment 自己的颜色逐时刻比。SkinnedMeshRenderer 的颜色动画报 loss,
+ * 只比 setup。节点名 `<slot>[__键名]` —— 只用于没有皮肤 / 序列帧的骨架。返回比过的节点名
+ */
+function expectNodeColors(part: SkeletonPart, files: readonly UnityFile[], name: string, tolerance: { sprite: number; mesh: number }): Set<string> {
+  const scene = loadUnityScene(new Map(files.map((f) => [f.path, f.content])))
+  const prefab = files.find((f) => f.path === `${name}.prefab`)!.content as string
+  const skinned = new Set(readSkinnedRenderers(prefab).map((r) => r.name))
+  const is38 = part.header.major === '3.8'
+  const byNode = new Map<string, { slot: number; attachment: Attachment }>()
+  for (const e of part.skins[0]!.slots) for (const a of e.attachments) byNode.set(attachmentNodeName(part.slots[e.slot]!.name, a.key), { slot: e.slot, attachment: a })
+  const isColor = (kind: string) => kind === 'color' || kind === 'twoColor' || kind.startsWith('slotColor')
+  const checked = new Set<string>()
+  for (const anim of [null, ...part.animations]) {
+    let end = 0
+    for (const tl of anim?.timelines ?? []) for (const f of tl.kind === 'deform' ? [] : tl.frames) end = Math.max(end, Number(f['time'] ?? 0))
+    const times = [0]
+    // 关键帧刚过去 0.1 毫秒 + 60 fps 网格:阶梯跳变那一瞬两边差的 1e-7 秒不算数
+    for (let t = 1e-4; anim !== null && t <= end + 1e-9; t += 1 / 60) times.push(t)
+    for (const tl of anim?.timelines ?? []) if (isColor(tl.kind)) for (const f of tl.frames) times.push(Number(f['time'] ?? 0) + 1e-4)
+    const timelines = anim === null ? [] : lastPerProperty(anim.timelines).kept
+    for (const t of times) {
+      for (const [path, got] of scene.colorAt(anim === null ? null : `${name}@${anim.name}`, t)) {
+        const node = path.replace(/^.*\//, '')
+        const hit = byNode.get(node)
+        if (hit === undefined || (skinned.has(node) && anim !== null)) continue
+        const slotColor = slotColorAt(timelines.filter((tl) => tl.owner === hit.slot && isColor(tl.kind)), unpackRgba(part.slots[hit.slot]!.color), t, is38)
+        const own = unpackRgba((hit.attachment.data['color'] as number | undefined) ?? -1)
+        got.forEach((v, k) => {
+          expect(Math.abs(v - slotColor[k]! * own[k]!), `${node} @${anim?.name ?? 'setup'} ${t.toFixed(4)} 通道 ${k}`).toBeLessThan(skinned.has(node) ? tolerance.mesh : tolerance.sprite)
+        })
+        checked.add(node)
+      }
+    }
+  }
+  return checked
+}
+
+describe('attachment 颜色:乘进节点颜色,颜色曲线按 attachment 颜色缩放', () => {
+  // shadow:半透明黑的影子(MC2 race_haibao 的 AAyizi 就是 00000049),slot alpha 动画带贝塞尔
+  // swap:同一 slot 两张图颜色不同,中途换图,rgb 动画
+  // cloth:有 deform → SkinnedMeshRenderer,颜色烘进顶点色(颜色动画报 loss)
+  const json = {
+    skeleton: { hash: 'x', spine: '4.1.23', x: 0, y: 0, width: 64, height: 64 },
+    bones: [{ name: 'root' }],
+    slots: [
+      { name: 'shadow', bone: 'root', attachment: 'shadow' },
+      { name: 'swap', bone: 'root', attachment: 'a', color: 'ff8080ff' },
+      { name: 'cloth', bone: 'root', attachment: 'cloth', color: 'c0c0c0ff' },
+    ],
+    skins: [{
+      name: 'default',
+      attachments: {
+        shadow: { shadow: { color: '00000049', width: 16, height: 16 } },
+        swap: { a: { color: 'ff000080', width: 16, height: 16 }, b: { color: '40c0ffff', x: 20, width: 16, height: 16 } },
+        cloth: { cloth: { type: 'mesh', color: 'd1c1a4ff', uvs: [0, 0, 1, 0, 1, 1, 0, 1], triangles: [0, 1, 2, 0, 2, 3], vertices: [0, 0, 16, 0, 16, 16, 0, 16], hull: 4, width: 16, height: 16 } },
+      },
+    }],
+    animations: {
+      blink: {
+        slots: {
+          shadow: {
+            rgba: [
+              { color: 'ffffffff', curve: [0.1, 1, 0.3, 1, 0.1, 1, 0.3, 1, 0.1, 1, 0.3, 1, 0.1, 0.9, 0.2, 0] },
+              { time: 0.5, color: 'ffffff00', curve: 'stepped' },
+              { time: 0.75, color: 'ffffff98' },
+            ],
+          },
+          swap: {
+            attachment: [{ time: 0.5, name: 'b' }],
+            rgb: [{ time: 0.25, color: 'ffffff', curve: [0.3, 1, 0.4, 0.5, 0.3, 1, 0.4, 0.6, 0.3, 1, 0.4, 0.2] }, { time: 0.75, color: '20ff80' }],
+          },
+          cloth: { rgba: [{ color: 'ffffffff' }, { time: 1, color: 'ffffff00' }] },
+        },
+        attachments: { default: { cloth: { cloth: { deform: [{}, { time: 0.5, vertices: [3, 0] }, { time: 1 }] } } } },
+      },
+    },
+  }
+  const part = fromJsonText(JSON.stringify(json))
+  const atlas = parseAtlas(['p.png', 'size: 64, 64', 'filter: Linear, Linear', 'shadow', '  bounds: 0, 0, 16, 16', 'a', '  bounds: 16, 0, 16, 16', 'b', '  bounds: 32, 0, 16, 16', 'cloth', '  bounds: 0, 16, 16, 16', ''].join('\n'))
+  const sources = new Map<string, Image>([['p.png', { width: 64, height: 64, data: new Uint8Array(64 * 64 * 4).fill(255) }]])
+  const exportWith = (colorSpace?: 'linear' | 'gamma') =>
+    exportToUnity(part, atlas, sources, { name: 'c', pixelsPerUnit: 100, renderPipeline: 'urp', ...(colorSpace === undefined ? {} : { colorSpace }) })
+  const result = exportWith()
+  const textOf = (path: string) => result.files.find((f) => f.path === path)!.content as string
+
+  it('⭐ 每个节点、每个时刻:Unity 画出来的颜色 = Spine 的 slot 颜色 × attachment 颜色', () => {
+    const checked = expectNodeColors(part, result.files, 'c', { sprite: 1e-4, mesh: 1.5 / 255 })
+    expect([...checked].sort()).toEqual(['cloth', 'shadow', 'swap__a', 'swap__b'])
+  })
+
+  it('同一 slot 下颜色不同的两张图,各自一条按自己颜色缩放的曲线;半透明黑的影子 rgb 恒为 0', () => {
+    const curves = readFloatCurves(textOf('c@blink.anim'), 'm_Color.')
+    const of = (node: string, channel: string) => curves.find((c) => c.path.endsWith(node) && c.attribute === `m_Color.${channel}`)!.keys.map((k) => k.value)
+    // swap 的 r:slot 1 → 0x20/255 的曲线,a 乘 1、b 乘 0x40/255
+    const a = of('swap__a', 'r')
+    const b = of('swap__b', 'r')
+    expect(a.length).toBe(b.length)
+    a.forEach((v, i) => expect(b[i]).toBeCloseTo((v * 0x40) / 255, 6))
+    expect(Math.max(...of('shadow', 'r'), ...of('shadow', 'g'), ...of('shadow', 'b'))).toBe(0)
+    expect(Math.max(...of('shadow', 'a'))).toBeCloseTo(0x49 / 255, 6)
+  })
+
+  it('⭐ SkinnedMeshRenderer:顶点色 = slot × attachment,Linear 工程换成线性值(Unity 不换算顶点色),Gamma 工程原样', () => {
+    const tint = [0xc0 * 0xd1, 0xc0 * 0xc1, 0xc0 * 0xa4].map((v) => v / 255 / 255)
+    const colorOf = (r: ReturnType<typeof exportWith>) => parseMesh(r.files.find((f) => f.path === 'c@cloth.asset')!.content as string).colors[0]!
+    const linear = colorOf(result)
+    const gamma = colorOf(exportWith('gamma'))
+    const near = (got: number, want: number) => expect(Math.abs(got - want)).toBeLessThanOrEqual(0.5 / 255 + 1e-9)
+    near(linear.r, srgbToLinear(tint[0]!))
+    near(linear.g, srgbToLinear(tint[1]!))
+    near(linear.b, srgbToLinear(tint[2]!))
+    near(gamma.r, tint[0]!)
+    near(gamma.g, tint[1]!)
+    near(gamma.b, tint[2]!)
+    expect(linear.a).toBe(1)
+    expect(exportWith('linear').files.find((f) => f.path === 'c@cloth.asset')!.content).toBe(textOf('c@cloth.asset'))
+  })
+
+  it('有损的照报:SkinnedMeshRenderer 上的颜色动画 loss;带颜色的 SkinnedMeshRenderer 网格说明按哪种色彩空间写的', () => {
+    expect(result.issues.some((i) => i.level === 'loss' && i.path === 'color.cloth')).toBe(true)
+    expect(result.issues.some((i) => i.level === 'info' && i.path === 'skinnedMesh' && i.message.includes('Linear'))).toBe(true)
+    expect(exportWith('gamma').issues.some((i) => i.level === 'info' && i.path === 'skinnedMesh' && i.message.includes('Gamma'))).toBe(true)
+    // SpriteRenderer 上乘常数是精确的,不该多出近似
+    expect(result.issues.filter((i) => i.level === 'approximated')).toEqual([])
+  })
+})
+
+const ATTACHMENT_COLOR_SAMPLES = [
+  // 半透明黑的影子(00000049),loop 里 slot alpha 闪烁;之前整块画成不透明的原图
+  { rel: 'Spine/NewSpine/SpeedRaceStart/race_haibao', nodes: ['AAyizi1', 'AAyizi2', 'AAcheyi3'] },
+  // 烟(ebe3beff),setup 时 slot alpha 0,first_confirm 里淡入淡出
+  { rel: 'World/Map7/Spine/35701', nodes: ['Smoke_01', 'Smoke_1__Smoke_01'] },
+]
+for (const { rel, nodes } of ATTACHMENT_COLOR_SAMPLES) {
+  const skel = `E:/UnityProject/MergeCooking2/MergeCooking2/Assets/Export/${rel}.skel.bytes`
+  const atlasPath = `E:/UnityProject/MergeCooking2/MergeCooking2/Assets/Export/${rel}.atlas.txt`
+  describe.skipIf(!existsSync(skel) || !existsSync(atlasPath))(`attachment 颜色(MergeCooking2 本地样本 ${rel.replace(/^.*\//, '')})`, () => {
+    it('⭐ 带颜色的件:每个时刻 Unity 画出来的颜色 = slot 颜色 × attachment 颜色', () => {
+      const part = readSkeletonPart(new Uint8Array(readFileSync(skel)))
+      const atlas = parseAtlas(readFileSync(atlasPath, 'utf8'))
+      const dir = atlasPath.slice(0, atlasPath.lastIndexOf('/'))
+      const sources = new Map<string, Image>(atlas.pages.map((p) => [p.name, decodePng(new Uint8Array(readFileSync(`${dir}/${p.name}`)))]))
+      const unity = exportToUnity(part, atlas, sources, { name: 'x', pixelsPerUnit: 100, renderPipeline: 'urp' })
+      const checked = expectNodeColors(part, unity.files, 'x', { sprite: 1e-4, mesh: 1.5 / 255 })
+      for (const n of nodes) expect(checked.has(n), n).toBe(true)
+    })
+  })
 }

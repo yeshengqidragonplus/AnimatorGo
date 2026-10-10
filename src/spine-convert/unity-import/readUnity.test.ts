@@ -113,6 +113,41 @@ function compareWithUnity(files: ReadonlyMap<string, string | Uint8Array>): numb
   return checked
 }
 
+/**
+ * 每个挂图物体的颜色:Unity 的规则(unityEval:SpriteRenderer 的 m_Color 曲线、SkinnedMeshRenderer 的顶点色换回 sRGB)
+ * 与读回的 Spine(slot 颜色按颜色时间轴求值 × 物体那些 attachment 的颜色)在 setup 和每条动画的关键帧上比。
+ * 读取器报了「不成比例」的 slot 跳过(那是 Spine 表达不了的,报出来就是对的)。返回比过的「物体 × 时刻」数
+ */
+function compareColorsWithUnity(files: ReadonlyMap<string, string | Uint8Array>): number {
+  const imported = importUnity(files, { pixelsPerUnit: PPU })
+  const back = fromJson(imported.json)
+  const scene = loadUnityScene(files)
+  const prefix = `${imported.name}@`
+  const skipped = new Set(imported.issues.flatMap((i) => (i.level === 'approximated' ? [/(?:^|\.)color\[(.+)\]$/.exec(i.path)?.[1]] : [])).filter((x) => x !== undefined))
+  const attachmentOf = (skin: string, slot: string, key: string) =>
+    back.skins.find((s) => s.name === skin)?.slots.find((e) => e.slot === slotIndex(back, slot))?.attachments.find((a) => a.key === key)
+  let checked = 0
+  for (const clip of [null, ...scene.clips.filter((c) => !c.includes('@skin@'))]) {
+    const anim = clip === null ? null : back.animations.find((a) => a.name === (clip.startsWith(prefix) ? clip.slice(prefix.length) : clip))!
+    const times = [0, ...(anim?.timelines.flatMap((tl) => tl.frames.map((f) => Number(f['time'] ?? 0))) ?? [])]
+    for (const t of [...new Set(times)]) {
+      const colors = scene.colorAt(clip, t)
+      for (const n of imported.nodes) {
+        const expected = colors.get(n.path)
+        if (expected === undefined || skipped.has(n.slot)) continue
+        const si = slotIndex(back, n.slot)
+        const tls = anim === null ? [] : anim.timelines.filter((tl) => tl.owner === si && tl.kind.startsWith('slotColor'))
+        const slotColor = slotColorAt(tls, unpackRgba(back.slots[si]!.color), t, false)
+        const own = unpackRgba((attachmentOf(n.skin, n.slot, n.key)!.data['color'] as number | undefined) ?? -1)
+        // slot 颜色与 attachment 颜色各自按字节写,乘起来最多差 1/255
+        expected.forEach((v, k) => expect(Math.abs(v - slotColor[k]! * own[k]!), `${n.path}@${clip ?? 'setup'} ${t.toFixed(3)} 通道 ${k}`).toBeLessThan(1.01 / 255))
+        checked++
+      }
+    }
+  }
+  return checked
+}
+
 for (const sample of SAMPLES) {
   describe.skipIf(!existsSync(sample.skel) || !existsSync(sample.atlas))(`Unity 产物 → Spine(${sample.label})`, () => {
     const part = readSkeletonPart(new Uint8Array(readFileSync(sample.skel)))
@@ -123,7 +158,6 @@ for (const sample of SAMPLES) {
     const files = new Map(unity.files.map((f) => [f.path, f.content]))
     const imported = importUnity(files, { pixelsPerUnit: PPU })
     const back = fromJson(imported.json)
-    const scene = loadUnityScene(files)
 
     const attachmentOf = (skin: string, slot: string, key: string) =>
       back.skins.find((s) => s.name === skin)?.slots.find((e) => e.slot === slotIndex(back, slot))?.attachments.find((a) => a.key === key)
@@ -138,24 +172,8 @@ for (const sample of SAMPLES) {
       expect(compareWithUnity(files)).toBeGreaterThan(20)
     })
 
-    it('⭐ slot 颜色与 Unity 的规则一致(取每个 slot 在 prefab 里的第一个节点)', () => {
-      const firstNode = new Map<string, string>()
-      for (const n of imported.nodes) if (!firstNode.has(n.slot)) firstNode.set(n.slot, n.path)
-      for (const clip of [null, ...scene.clips.filter((c) => !c.includes('@skin@'))]) {
-        const anim = clip === null ? null : back.animations.find((a) => a.name === clip.slice('x@'.length))!
-        const times = [0, ...(anim?.timelines.flatMap((tl) => tl.frames.map((f) => Number(f['time'] ?? 0))) ?? [])]
-        for (const t of [...new Set(times)]) {
-          const colors = scene.colorAt(clip, t)
-          for (const [slot, path] of firstNode) {
-            const expected = colors.get(path)
-            if (expected === undefined) continue
-            const si = slotIndex(back, slot)
-            const tls = anim === null ? [] : anim.timelines.filter((tl) => tl.owner === si && tl.kind.startsWith('slotColor'))
-            const got = slotColorAt(tls, unpackRgba(back.slots[si]!.color), t, false)
-            expected.forEach((v, k) => expect(Math.abs(v - got[k]!), `${slot}@${clip ?? 'setup'} ${t.toFixed(3)} 通道 ${k}`).toBeLessThan(1.01 / 255))
-          }
-        }
-      }
+    it('⭐ 每个挂图物体的颜色与 Unity 的规则一致(slot 颜色 × attachment 颜色)', () => {
+      expect(compareColorsWithUnity(files)).toBeGreaterThan(0)
     })
 
     it('粗检:setup 与原 Spine 一致(容差按 Unity 导出自己的判据)', () => {
@@ -605,3 +623,64 @@ for (const file of truths) {
     })
   })
 }
+
+/**
+ * attachment 自己的颜色:导出时乘进每个挂图物体的颜色(曲线按它缩放),同一 slot 下的物体颜色因此各不相同。
+ * 读回要把每个物体的颜色拆成 slot 颜色 × attachment 颜色;Unity 里单独改过某一件、与同 slot 的不成比例的,报近似。
+ */
+describe('attachment 颜色读回:同一 slot 下颜色不同的物体 → slot 颜色 × attachment 颜色', () => {
+  const json = {
+    skeleton: { hash: 'x', spine: '4.1.23', x: 0, y: 0, width: 64, height: 64 },
+    bones: [{ name: 'root' }],
+    slots: [
+      { name: 'shadow', bone: 'root', attachment: 'shadow' },
+      { name: 'swap', bone: 'root', attachment: 'a', color: 'ff8080ff' },
+    ],
+    skins: [{
+      name: 'default',
+      attachments: {
+        shadow: { shadow: { color: '00000049', width: 16, height: 16 } },
+        swap: { a: { color: 'ff000080', width: 16, height: 16 }, b: { color: '40c0ffff', x: 20, width: 16, height: 16 } },
+      },
+    }],
+    animations: {
+      blink: {
+        slots: {
+          shadow: { rgba: [{ color: 'ffffffff', curve: [0.1, 1, 0.3, 1, 0.1, 1, 0.3, 1, 0.1, 1, 0.3, 1, 0.1, 0.9, 0.2, 0] }, { time: 0.5, color: 'ffffff00' }] },
+          swap: {
+            attachment: [{ time: 0.5, name: 'b' }],
+            rgb: [{ time: 0.25, color: 'ffffff', curve: [0.3, 1, 0.4, 0.5, 0.3, 1, 0.4, 0.6, 0.3, 1, 0.4, 0.2] }, { time: 0.75, color: '20ff80' }],
+          },
+        },
+      },
+    },
+  }
+  const part = fromJson(json)
+  const atlas = parseAtlas(['p.png', 'size: 64, 64', 'shadow', '  bounds: 0, 0, 16, 16', 'a', '  bounds: 16, 0, 16, 16', 'b', '  bounds: 32, 0, 16, 16', ''].join('\n'))
+  const sources = new Map<string, Image>([['p.png', { width: 64, height: 64, data: new Uint8Array(64 * 64 * 4).fill(255) }]])
+  const unity = exportToUnity(part, atlas, sources, { name: 'x', pixelsPerUnit: PPU, renderPipeline: 'urp' })
+  const files = new Map(unity.files.map((f) => [f.path, f.content]))
+
+  it('⭐ 逐物体、逐时刻与 Unity 的规则一致,不报近似;颜色不同的两件各带自己的 attachment 颜色', () => {
+    const imported = importUnity(files, { pixelsPerUnit: PPU })
+    expect(imported.issues.filter((i) => i.path.includes('color['))).toEqual([])
+    expect(compareColorsWithUnity(files)).toBeGreaterThan(0)
+    const swap = ((imported.json['skins'] as Record<string, unknown>[])[0]!['attachments'] as Record<string, Record<string, Record<string, unknown>>>)['swap']!
+    // 每个通道取最亮的一件当参照:r 是 a(ff),g / b / a 是 b —— 两件都不是白的
+    expect(swap['a']!['color']).toBeDefined()
+    expect(swap['b']!['color']).toBeDefined()
+  })
+
+  it('在 Unity 里单独改了一件的颜色(与同 slot 的另一件不成比例)→ 报 approximated,不静默取第一个', () => {
+    // swap__b 的 m_Color.r 原本 = slot 的 r × 0x40/255,改成 0.9 —— 动画里它的 r 曲线没跟着变
+    const edited = new Map(files)
+    const docs = (edited.get('x.prefab') as string).split(/^(?=--- )/m)
+    const go = docs.find((d) => /^--- !u!1 &/.test(d) && /m_Name: swap__b$/m.test(d))!
+    const id = /^--- !u!1 &(\d+)/.exec(go)![1]!
+    const i = docs.findIndex((d) => /^--- !u!212 &/.test(d) && d.includes(`m_GameObject: {fileID: ${id}}`))
+    docs[i] = docs[i]!.replace(/m_Color: \{r: [^,]+,/, 'm_Color: {r: 0.9,')
+    edited.set('x.prefab', docs.join(''))
+    const imported = importUnity(edited, { pixelsPerUnit: PPU })
+    expect(imported.issues.some((x) => x.level === 'approximated' && /(^|\.)color\[swap\]$/.test(x.path))).toBe(true)
+  })
+})

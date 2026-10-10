@@ -464,6 +464,17 @@ screen One/OneMinusSrcColor),两套管线各一个着色器(`tools/unity/runtime
 - 内置管线的 Unity 临时工程放在 scratchpad 下,`com.unity.collections` 的 ILSupport.dll 路径超 260 字符,Burst 加载失败,
   SpriteSkin 校验直接抛异常、渲染工具挂掉(不只是日志噪音)。临时工程要放在路径短的地方
 
+### ✅ attachment 颜色 + 顶点色的色彩空间(2026-10-10)
+
+Spine 画 attachment 用 slot 颜色 × attachment 自己的颜色;Unity 导出只写了 slot 颜色,attachment 颜色**一声不响丢了**
+(Godot 那边一直是对的)。MC2 里 6 个骨架、30 个 attachment:race_haibao 的半透明黑影子(`00000049`)画成不透明的原图盖住路面,
+4 个地图建筑的烟、wave 的影子少了底色。现在乘进每个挂图节点的颜色,颜色曲线按 attachment 颜色缩放(精确)。见 [UNITY-2D.md](UNITY-2D.md) 第 19 节。
+
+顺带实测出一个之前就有的问题:**线性工程里 SkinnedMeshRenderer 的顶点色 Unity 不做 sRGB 换算**,而 `m_Color` 做 ——
+同一个 `808080`,顶点色画成 `bcbcbc`。MC2 里 12 个走 SkinnedMeshRenderer 的网格带 slot 颜色,一直偏亮。现在线性工程先换成线性值再写,
+导出时从工程的 `ProjectSettings.asset` 认色彩空间(`--color-space` 可指定)。读回端(`readUnity.ts`)把每个物体的颜色拆成 slot × attachment,
+同 slot 下不成比例的报近似(之前静默取第一个物体)。
+
 ### ⚠️ 两个渲染工具都画错过(2026-10-09 修)
 
 **产物没问题,是验证用的渲染工具错了。** 起因是 `female_lead` 的 `jump_4` 在 Unity 和 Godot 里渲出来第 10、15 帧姿势不一样。
@@ -629,7 +640,7 @@ JSON 这几处的根因是**只做过「我们写 → 我们读」的自洽往�
 ### 已知转不过去的东西(都会报出来,不静默)
 
 - ~~deform 顶点关键帧~~ —— 已转成 SkinnedMeshRenderer 的 Blend Shape;打在 `path` 上的 deform 不参与渲染,跳过
-- **走 SkinnedMeshRenderer 的网格上的 slot 颜色动画** —— 没有 `m_Color`,静态颜色烘进顶点色,动画部分丢弃
+- **走 SkinnedMeshRenderer 的网格上的 slot 颜色动画** —— 没有 `m_Color`,静态颜色(slot × attachment)烘进顶点色,动画部分丢弃
 - ~~逐帧绘制顺序~~ —— 已转成 `m_SortingOrder` 阶梯曲线
 - **path / transform 约束** —— 没有对应物
 - **两色染色(dark color)** —— 没有对应物

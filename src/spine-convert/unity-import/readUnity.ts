@@ -7,7 +7,8 @@ import { spriteRecord } from '../../unity/spriteMeta.ts'
 import { list, map, num, parseUnityYaml, parseYamlDocument, ref, str, vec, type UnityObject, type UnityRef, type YamlMap, type YamlValue } from '../../unity/yaml.ts'
 import { IssueCollector, type ConversionIssue } from '../types.ts'
 import { drawOrderOf } from '../../spine-eval/drawOrder.ts'
-import { align, frameCurve, readHermite, toSpineKeys, valueAt, type SpineKey } from './curves.ts'
+import { align, frameCurve, readHermite, scaleKeys, toSpineKeys, valueAt, type SpineKey } from './curves.ts'
+import { fromVertexColor, type ColorSpace } from '../../unity/colorSpace.ts'
 import { expandPsdImports } from './expandPsd.ts'
 
 /**
@@ -48,6 +49,11 @@ import { expandPsdImports } from './expandPsd.ts'
 export interface UnityImportOptions {
   /** Unity 单位 → Spine 像素。与导出时的 `--ppu` 一致,默认 100 */
   readonly pixelsPerUnit?: number
+  /**
+   * 工程的色彩空间,默认 `linear`。SkinnedMeshRenderer 的颜色在 Mesh 的顶点色里,线性工程里 Unity 把它当线性值用
+   * (不做 sRGB 换算,见 colorSpace.ts),读回时换回 sRGB
+   */
+  readonly colorSpace?: ColorSpace
 }
 
 export interface UnityImportResult {
@@ -93,6 +99,10 @@ const trs = (x: number, y: number, deg: number, sx: number, sy: number): Affine 
   return { a: c * sx, b: -s * sy, c: s * sx, d: c * sy, x, y }
 }
 const hex2 = (v: number) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0')
+type Rgba = { r: number; g: number; b: number; a: number }
+const CHANNELS = ['r', 'g', 'b', 'a'] as const
+type Channel = (typeof CHANNELS)[number]
+const hexRgba = (c: Rgba) => `${hex2(c.r)}${hex2(c.g)}${hex2(c.b)}${hex2(c.a)}`
 const round = (v: number) => Math.round(v * 1e5) / 1e5
 const spriteId = (r: UnityRef): string | null => (r.guid === null || r.fileID === '0' ? null : `${r.guid}:${r.fileID}`)
 /** 依次比较:Sorting Group 链上每一层、再到渲染器自己的 [层, 序, −z, 层级先后] */
@@ -150,6 +160,7 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
   for (const i of expanded.issues) issues.add(i.level, i.path, i.message)
   const files: ReadonlyMap<string, string | Uint8Array> = expanded.files
   const ppu = options.pixelsPerUnit ?? 100
+  const colorSpace = options.colorSpace ?? 'linear'
   const text = (path: string): string => {
     const c = files.get(path)
     if (c === undefined) throw new Error(`缺文件 ${path}`)
@@ -411,6 +422,8 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
   const skins = new Map<string, Json>()
   /** 物体 id → slot / 皮肤 / 每张图的键名 */
   const attachmentOf = new Map<string, { slot: string; skin: string; keyOfSprite: Map<string | null, string> }>()
+  /** 物体 id → 渲染器的颜色(sRGB,与 m_Color 同一个意思):SpriteRenderer 的 m_Color,SkinnedMeshRenderer 的顶点色 */
+  const nodeColor = new Map<string, Rgba>()
   const skinnedMeshes = new Map<string, { shapes: { name: string; deltas: { index: number; x: number; y: number }[] }[]; bindposes: Affine[]; boneOfIndex: string[]; weights: { bone: number; weight: number }[][]; flatStart: number[] }>()
 
   /** SpriteRenderer 的一张图 → Spine mesh(顶点在 slot 骨骼的局部坐标里) */
@@ -521,8 +534,7 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
     const where = `node.${n.path}`
 
     if (r.type === 'SpriteRenderer') {
-      const c = rgbaOf(r.data['m_Color'])
-      if (slot.color === null) slot.color = `${hex2(c.r)}${hex2(c.g)}${hex2(c.b)}${hex2(c.a)}`
+      nodeColor.set(n.id, rgbaOf(r.data['m_Color']))
       const setupSprite = ref(r.data['m_Sprite'])
       const swaps = curveSprites.get(n.id) ?? []
       // 有换图曲线的物体,每张图一个 attachment,按图名;没有的就是物体名里的键名
@@ -575,7 +587,7 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
       }
     })
     const c = mesh.colors[0]
-    if (c !== undefined && slot.color === null) slot.color = `${hex2(c.r)}${hex2(c.g)}${hex2(c.b)}${hex2(c.a)}`
+    nodeColor.set(n.id, c === undefined ? { r: 1, g: 1, b: 1, a: 1 } : fromVertexColor(c, colorSpace))
     const key = uniqueKey(p.key)
     bySlot[key] = {
       type: 'mesh', path: regionName,
@@ -630,6 +642,58 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
   const slotIndex = new Map(slotList.map((s, i) => [s.name, i]))
   const slotNodes = new Map<string, TransformNode[]>()
   for (const n of rendererNodes) slotNodes.set(slotOfNode.get(n.id)!, [...(slotNodes.get(slotOfNode.get(n.id)!) ?? []), n])
+
+  // ── 颜色:Unity 每个渲染器各有各的颜色,Spine 是 slot 颜色 × attachment 颜色 ──
+  // 同一 slot 的几个物体(换图的几件、几套皮肤的同一件)颜色可以不同。每个通道取「全程最亮」的物体当参照,slot 颜色就是它的颜色,
+  // 其余物体与它的比例记成各自 attachment 的颜色(≤ 1,写得进 Spine 的字节)。我们导出的产物就是这么来的(节点颜色 =
+  // slot × attachment,颜色曲线按 attachment 颜色缩放),读回来精确;各物体不成比例的(在 Unity 里单独改过某一件)表达不了,
+  // 按参照物体读、报近似
+  const colorPeak = new Map<string, Rgba>()
+  for (const [id, c] of nodeColor) colorPeak.set(id, { ...c })
+  for (const clip of clips) {
+    for (const entry of list(clip.data['m_FloatCurves']).map(map)) {
+      const attribute = str(entry['attribute'])
+      const n = byPath.get(str(entry['path']))
+      const ch = attribute.slice('m_Color.'.length) as Channel
+      const peak = n === undefined ? undefined : colorPeak.get(n.id)
+      if (peak === undefined || num(entry['classID']) !== CLASS_SPRITE_RENDERER || !attribute.startsWith('m_Color.') || !CHANNELS.includes(ch)) continue
+      for (const k of readHermite(entry['curve'])) peak[ch] = Math.max(peak[ch], k.value)
+    }
+  }
+  /** 物体 id → 它在 slot 颜色上要乘的系数(= Spine 里它那些 attachment 的颜色) */
+  const colorFactor = new Map<string, Rgba>()
+  /** slot → 每个通道的参照物体 */
+  const colorRef = new Map<string, Record<Channel, TransformNode>>()
+  const colorMembers = (slotName: string) => (slotNodes.get(slotName) ?? []).filter((n) => nodeColor.has(n.id))
+  for (const slotName of slotNodes.keys()) {
+    const members = colorMembers(slotName)
+    if (members.length === 0) continue
+    const refs = {} as Record<Channel, TransformNode>
+    for (const n of members) colorFactor.set(n.id, { r: 1, g: 1, b: 1, a: 1 })
+    for (const ch of CHANNELS) {
+      // 一样亮时取第一个 —— 颜色都相同的 slot(绝大多数)与以前一样,取 prefab 里的第一个
+      let best = members[0]!
+      for (const n of members) if (colorPeak.get(n.id)![ch] > colorPeak.get(best.id)![ch] + 1e-9) best = n
+      refs[ch] = best
+      const top = colorPeak.get(best.id)![ch]
+      for (const n of members) colorFactor.get(n.id)![ch] = top > 1e-9 ? colorPeak.get(n.id)![ch] / top : 1
+    }
+    colorRef.set(slotName, refs)
+    const setup = { r: nodeColor.get(refs.r.id)!.r, g: nodeColor.get(refs.g.id)!.g, b: nodeColor.get(refs.b.id)!.b, a: nodeColor.get(refs.a.id)!.a }
+    slots.get(slotName)!.color = hexRgba(setup)
+    let worst = 0
+    for (const n of members) for (const ch of CHANNELS) worst = Math.max(worst, Math.abs(nodeColor.get(n.id)![ch] - colorFactor.get(n.id)![ch] * setup[ch]))
+    if (worst > 1 / 255) {
+      issues.add('approximated', `color[${slotName}]`, `同一 slot 下几个物体的颜色不成比例(Spine 是 slot 颜色 × 每个 attachment 一个固定颜色),setup 最多差 ${(worst * 255).toFixed(0)}/255`)
+    }
+    for (const n of members) {
+      const f = colorFactor.get(n.id)!
+      const a = attachmentOf.get(n.id)
+      if (a === undefined || CHANNELS.every((ch) => f[ch] >= 1 - 1e-9)) continue
+      const bySlot = skins.get(a.skin)![a.slot] as Json
+      for (const key of a.keyOfSprite.values()) (bySlot[key] as Json)['color'] = hexRgba(f)
+    }
+  }
 
   // ── 动画 ──
   const animations: Json = {}
@@ -834,17 +898,31 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
       }
       slotOut(slotName)['attachment'] = frames
     }
-    // 颜色:取该 slot 第一个有颜色曲线的节点,四通道补齐关键帧
-    const colorDone = new Set<string>()
-    for (const [id, channels] of colors) {
-      const att = attachmentOf.get(id)!
-      if (colorDone.has(att.slot)) continue
-      colorDone.add(att.slot)
-      const n = nodes.get(id)!
-      const base = rgbaOf(renderer(n)!.data['m_Color'])
-      const pick = (c: string, fallback: number) => channels.get(c) ?? [{ time: 0, value: fallback }]
-      const [r, g, b, a] = align([pick('r', base.r), pick('g', base.g), pick('b', base.b), pick('a', base.a)])
-      slotOut(att.slot)['rgba'] = keysToFrames([r!, g!, b!, a!], (vs) => ({ color: `${hex2(vs[0]!)}${hex2(vs[1]!)}${hex2(vs[2]!)}${hex2(vs[3]!)}` }))
+    // 颜色:slot 的曲线取参照物体的;参照物体这条动画没碰这个通道,就借同 slot 里碰了的、除以它的系数。
+    // 这条动画没有颜色曲线的物体,Write Defaults 回 prefab 里的颜色。之后逐个物体核对「= 系数 × slot 曲线」
+    for (const slotName of slotNodes.keys()) {
+      const members = colorMembers(slotName)
+      const refs = colorRef.get(slotName)
+      if (refs === undefined || !members.some((n) => colors.has(n.id))) continue
+      const own = (n: TransformNode, ch: Channel): SpineKey[] => colors.get(n.id)?.get(ch) ?? [{ time: 0, value: nodeColor.get(n.id)![ch] }]
+      const slotCurve = (ch: Channel): SpineKey[] => {
+        const source = [refs[ch], ...members].find((n) => colors.get(n.id)?.has(ch) === true && colorFactor.get(n.id)![ch] > 1e-9)
+        return source === undefined ? own(refs[ch], ch) : scaleKeys(own(source, ch), 1 / colorFactor.get(source.id)![ch])
+      }
+      const curves = CHANNELS.map(slotCurve)
+      const keyTimes = [...new Set(members.flatMap((n) => CHANNELS.flatMap((ch) => own(n, ch).map((k) => k.time))))].sort((a, b) => a - b)
+      const probes = [...keyTimes, ...keyTimes.slice(1).map((t, i) => (t + keyTimes[i]!) / 2)]
+      let worst = 0
+      for (const n of members) {
+        CHANNELS.forEach((ch, k) => {
+          for (const t of probes) worst = Math.max(worst, Math.abs(valueAt(own(n, ch), t) - colorFactor.get(n.id)![ch] * valueAt(curves[k]!, t)))
+        })
+      }
+      if (worst > 1 / 255) {
+        issues.add('approximated', `color[${slotName}]`, `同一 slot 下几个物体的颜色动画不成比例(Spine 是 slot 颜色 × 每个 attachment 一个固定颜色),按 ${refs.a.name} 读,其余最多差 ${(worst * 255).toFixed(0)}/255`)
+      }
+      const [r, g, b, a] = align(curves)
+      slotOut(slotName)['rgba'] = keysToFrames([r!, g!, b!, a!], (vs) => ({ color: hexRgba({ r: vs[0]!, g: vs[1]!, b: vs[2]!, a: vs[3]! }) }))
     }
     if (Object.keys(slotsOut).length > 0) out['slots'] = slotsOut
 

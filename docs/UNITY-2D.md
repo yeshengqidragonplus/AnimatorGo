@@ -25,6 +25,7 @@
 | 4.1 序列帧(sequence) | 每帧一个节点,m_Enabled =「attachment 亮着」且「是这一帧」的阶梯曲线 | ✅ 可映射,见第 15 节 |
 | **path / transform 约束** | —— | ❌ 没有 |
 | **两色染色(dark)** | —— | ❌ 没有 |
+| attachment 自己的颜色 | 乘进挂图节点的颜色:SpriteRenderer 的 `m_Color`(颜色曲线按它缩放)、SkinnedMeshRenderer 的顶点色 | ✅ 可映射,见第 19 节 |
 | clipping 遮罩 | `SpriteMask`(形状 = sprite 的自定义网格)+ 渲染器「只在遮罩里显示」 | ✅ 可映射,见第 17 节 |
 | slot 混合模式(additive / multiply / screen) | 自带着色器的材质,混合因子取 Spine 自己的 | ✅ 可映射,见第 18 节 |
 
@@ -553,7 +554,7 @@ Blend Shape」。准是准,但产物膨胀:`female_lead` 从 11 MB 涨到 32 MB(
 ### 11.7 已知代价
 
 - **slot 颜色动画**在这些网格上没有对应属性(SkinnedMeshRenderer 没有 `m_Color`),
-  静态颜色烘进顶点色,动画部分报 loss
+  静态颜色(slot × attachment)烘进顶点色,动画部分报 loss。⚠️ 顶点色 Unity 不做 sRGB 换算,线性工程要先换成线性值(第 19 节)
 - 这些网格在 Sprite Editor 里不能再刷权重;骨骼和形变权重曲线在 Animation 窗口里照常能改
 - deform 打在 `path` 上(路径约束用)不参与渲染,报 info 跳过 —— MC2 的 `wave` 有这种
 - deform 帧间分歧走逐帧修正的那几条动画(11.6 末尾),修正形变目标是逐帧烘的:在 Unity 里改那条动画的骨骼,修正不会跟着变
@@ -822,6 +823,7 @@ region 也读成四顶点 mesh。图集每个 sprite 一个区域(Unity 的矩�
 | z 坐标的动画(只影响同层同序谁先画,没转) | approximated |
 | 同一时刻同一 slot 亮着几个挂图节点(Spine 一个 slot 只挂一个) | approximated |
 | 几套具名皮肤的挂图物体同时亮着(取第一套当初始皮肤) | approximated |
+| 同一 slot 下几个物体的颜色(或颜色动画)不成比例 —— Spine 是 slot 颜色 × 每个 attachment 一个固定颜色(第 19.2 节) | approximated |
 | SpriteMask 遮罩(我们把 Spine 的 clipping 导成它,第 17 节):还不读,遮罩物体不当骨骼,被遮的部件按整张画 | loss |
 
 **还读不了的**(都会在上表里报出来,不静默):SpriteLibrary + SpriteResolver 换装(`m_SpriteHash` 曲线);Unity 2D IK
@@ -976,7 +978,7 @@ alpha 一律 `One, <颜色的 dst 因子>`(Spine 的运行时也是)。因子表
 半透明叠加的地方偏亮,additive 最明显(探针里同一格按两种空间算差到 62/255)。这是工程设置,spine-unity 在 Linear 工程里也一样,
 不归导出管;不透明处的 multiply 两种空间结果相同(乘法和幂运算可交换)。要和 Spine 一模一样就用 Gamma 工程。
 另外 SkinnedMeshRenderer 的 slot 颜色烘在顶点色里,**Unity 在 Linear 工程里不把顶点色换成线性**(探针按这个算才对得上),
-带颜色的这类网格在 Linear 工程里颜色会稍微偏 —— 不是这次改的,记一笔。
+带颜色的这类网格之前在 Linear 工程里偏浅 —— 已改成导出时按工程色彩空间预先换算,见第 19 节。
 
 **验证**:
 
@@ -990,7 +992,58 @@ alpha 一律 `One, <颜色的 dst 因子>`(Spine 的运行时也是)。因子表
   验证工程的深色背景上看不出。内置 + Gamma 与 URP + Gamma 逐帧差 ≤ 3 级,除了内置管线遮不住 SkinnedMeshRenderer 的那两处(已报 approximated)
 - MC2 全部 535 个骨架导出成功(试运行)
 
-## 19. 待确认
+## 19. 颜色:slot × attachment,顶点色 Unity 不做 sRGB 换算(2026-10-10)
+
+Spine 画一个 attachment 用的颜色 = slot 颜色 × **attachment 自己的颜色**(region / mesh / linkedmesh 都有,缺省白)。
+Unity 没有 attachment 这一层 —— 但我们一个 attachment 一个挂图节点,直接乘进节点自己的颜色就行,同一 slot 下颜色不同的件也各自精确:
+
+| 渲染器 | 写在哪 | 颜色动画 |
+|---|---|---|
+| SpriteRenderer | `m_Color` = slot × attachment | slot 的颜色曲线逐通道乘 attachment 颜色,每个节点一条(系数相同的共用)。乘常数对取值、贝塞尔控制点、Hermite 切线都是精确的,不新增近似 |
+| SkinnedMeshRenderer | 顶点色 = slot × attachment(线性工程先换算,见 19.1) | 没有可动画的颜色属性,报 loss(11.7) |
+
+之前只写 slot 颜色,attachment 颜色**一声不响丢了**。MC2 535 个骨架里 6 个、30 个 attachment 带颜色:race_haibao 的 `AAyizi1/2` 是
+`00000049`(29% 不透明的黑影子),丢了就把影子贴图整块不透明地画出来、盖住路面;35701 / 42101 / 42901 / 43801 的烟是一层米色,
+wave 的影子是沙色。它们所在的 slot **全都有颜色动画**(闪烁、淡入淡出),所以光改 `m_Color` 不够,曲线也要乘。
+
+### 19.1 ⚠️ 顶点色在线性工程里不做 sRGB 换算
+
+实测(`tools/unity/AnimatorGoProbeColor.cs`,Unity 6000.3 + URP,线性色彩空间,白图上着色、渲到 RenderTexture 读像素):
+
+| 颜色 | SpriteRenderer `m_Color` | 顶点色原样 | 顶点色 rgb 先换成线性值 |
+|---|---|---|---|
+| `808080` | `808080` | `bcbcbc` | `808080` |
+| `d1c1a4`(wave 的影子) | `d1c1a4` | `eae2d2` | `d1c1a4` |
+| `ebe3be` alpha `80`(叠在白底上) | `f5f1e2` | `fbf9f0` | `f5f1e2` |
+| `000000` alpha `49` | `dcdcdc` | `dcdcdc` | `dcdcdc` |
+
+`m_Color` 当 sRGB,Unity 自己换成线性;顶点色原样交给着色器,等于当线性值。Spine 的颜色是 sRGB,所以**线性工程要把 rgb 先换成
+线性值再写顶点色**(`src/unity/colorSpace.ts`,alpha 不动),Gamma 工程原样写。导出时从输出目录往上找
+`ProjectSettings/ProjectSettings.asset` 的 `m_ActiveColorSpace`,不在工程里按 Linear(URP 工程的默认),`--color-space linear|gamma` 可以指定;
+带颜色的 SkinnedMeshRenderer 网格报一条 info 说按哪种写的。
+
+之前一直原样写 —— MC2 里本来就有 12 个走 SkinnedMeshRenderer 的网格带 slot 颜色(car 的轮胎 `b8b8b8`、FeminArt `c4c4c4`),
+线性工程里都偏亮(`b8b8b8` 画成 `dcdcdc` 左右)。线性值存 8 位,很暗的颜色会差几级(sRGB `10` 读回 `0d`),肉眼看不出。
+
+### 19.2 读回
+
+Unity 每个渲染器各有各的颜色;Spine 是 slot 颜色 × 每个 attachment 一个**固定**颜色。读回时(`readUnity.ts`)每个通道取「全程最亮」的
+物体当参照,slot 颜色和颜色动画取它的,其余物体与它的比例写成各自 attachment 的颜色(≤ 1,写得进字节)。我们的产物就是这么来的,
+读回精确。Unity 里单独改过某一件、与同 slot 的不成比例的,Spine 表达不了,按参照物体读并报 approximated —— 之前是静默取第一个物体。
+SkinnedMeshRenderer 的顶点色按工程色彩空间换回 sRGB(`pnpm from-unity --color-space`,不给就往上找工程)。`unityEval.ts` 的
+`colorAt` 也把 SkinnedMeshRenderer 算进来了(顶点色换回 sRGB),读回端的颜色用例逐物体比,不再只比每个 slot 的第一个物体。
+
+### 19.3 验证
+
+- `export.test.ts`:合成骨架(半透明黑影子 + 贝塞尔 alpha 动画;同一 slot 两张颜色不同的图、中途换图 + rgb 动画;有 deform 的网格)
+  和 race_haibao、35701,按 Unity 的规则(`unityEval`)逐节点、60 fps 逐时刻,与 Spine 的 slot × attachment 比,差 < 1e-4;
+  顶点色 Linear / Gamma 两种都查。改之前全挂
+- `readUnity.test.ts`:逐物体比颜色;两张颜色不同的图读回精确、不报近似;在 prefab 里单独改一件的颜色 → 报 approximated
+- Unity 里按 Animator 渲染,改前 / 改后同一时刻对照:race_haibao 的影子从盖住路面的不透明色块变成半透明黑影(路面的车道线透出来),
+  `loop` 里 3.33 → 4.33 秒的闪烁照常(调试输出的颜色就是 slot alpha × 0.29);35701 的烟带上米色、淡入淡出照常;wave 的影子是沙色
+  (颜色动画仍是 11.7 的 loss)
+
+## 20. 待确认
 
 - `.anim` 里驱动 `SpriteResolver` 的曲线具体形态(尚无样本)。
   目前换 attachment 走的是**一个 attachment 一个物体 + `m_IsActive` 阶梯曲线**,

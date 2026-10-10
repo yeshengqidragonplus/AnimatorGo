@@ -111,6 +111,15 @@ function paramAt(t: number, x0: number, x1: number, x2: number, x3: number): num
   return (lo + hi) / 2
 }
 
+/** 取值整体乘一个常数:端点和贝塞尔控制点的值分量一起乘,曲线形状不变(精确) */
+export function scaleKeys(keys: readonly SpineKey[], factor: number): SpineKey[] {
+  return keys.map((k) => ({
+    ...k,
+    value: k.value * factor,
+    ...(k.segment?.kind === 'bezier' ? { segment: { kind: 'bezier' as const, c: [k.segment.c[0], k.segment.c[1] * factor, k.segment.c[2], k.segment.c[3] * factor] as const } } : {}),
+  }))
+}
+
 /** 键序列在 t 处的值(第一键之前取第一键,最后一键之后保持) */
 export function valueAt(keys: readonly SpineKey[], t: number): number {
   if (keys.length === 0) return 0

@@ -71,7 +71,7 @@ pnpm convert <输入路径> --to 4.1 [--out 目录] [--format skel|json] [--dry-
 导出到 Unity 2D Animation:
 
 ```bash
-pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--skin 初始皮肤] [--skins animator|script] [--skin-quality bone4|auto] [--dry-run]
+pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--skin 初始皮肤] [--skins animator|script] [--skin-quality bone4|auto] [--color-space linear|gamma] [--dry-run]
 ```
 
 **皮肤全部导进一个 prefab,运行时靠 Animator 的皮肤层切。** Spine 的皮肤是运行时查表,Unity 没有,
@@ -133,7 +133,7 @@ Godot 侧的验证:`tools/godot/` 的探针 / 自检 / 渲染脚本拷进一个 
 Unity 角色读回(我们导到 Unity、又在 Unity 里改过的,或别人在 Unity 里做的)→ Godot / Spine JSON:
 
 ```bash
-pnpm from-unity <Unity 角色目录> --to godot|json [--out 目录] [--ppu 100] [--skin 初始皮肤]
+pnpm from-unity <Unity 角色目录> --to godot|json [--out 目录] [--ppu 100] [--skin 初始皮肤] [--color-space linear|gamma]
 ```
 
 **按 Unity 的规则读**:带渲染器的物体下面挂着东西 / 被动画驱动时也是骨骼;显示 = `m_Enabled` 且各级 `m_IsActive`;
@@ -347,6 +347,9 @@ render/   薄适配层。PixiJS / Godot / Unity / Cocos 各一个
 - ⚠️ **Spine 的图集是预乘 alpha 的,Unity 的 sprite 材质按直通 alpha 混合** —— 不还原的话半透明部件
   发黑(face4 的红晕变成脸上一块深色叠加物),实心图只有一圈暗边看不出来。烘焙前按像素判断并还原,
   见 [UNITY-2D.md](docs/UNITY-2D.md) 第 10 节
+- ⚠️ **attachment 自己也有颜色**,Spine 画的时候乘在 slot 颜色上 —— Unity 导出乘进每个挂图节点的颜色,颜色曲线跟着缩放。
+  ⚠️ **SkinnedMeshRenderer 的顶点色在线性工程里 Unity 不做 sRGB 换算**(`m_Color` 做,实测同一个 `808080` 顶点色画成 `bcbcbc`),
+  线性工程要先换成线性值再写,色彩空间从工程的 `ProjectSettings.asset` 认。见 [UNITY-2D.md](docs/UNITY-2D.md) 第 19 节
 - ⚠️ **SkinnedMeshRenderer 不会自动带 sprite 的纹理**,挂默认材质是纯白;每张图集页要写
   一个引用了它的 `.mat`。渲染器 `m_Quality` 写 4,但工程 Quality 的 Skin Weights 是上限 ——
   真实工程 Low/Medium 档只有 2 根,这些网格在那几档照样只用 2 根

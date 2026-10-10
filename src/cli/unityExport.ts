@@ -7,12 +7,14 @@ import { exportToUnity } from '../spine-convert/unity/export.ts'
 import type { RenderPipeline } from '../unity/writePrefab.ts'
 import type { ConversionIssue } from '../spine-convert/types.ts'
 import { parseQualitySkinWeights, skinWeightsLabel, type QualityLevel } from '../unity/qualitySettings.ts'
+import type { ColorSpace } from '../unity/colorSpace.ts'
+import { detectColorSpace } from './unityDir.ts'
 
 /**
  * Spine → Unity 2D Animation 的命令行入口。
  *
  * ```
- * pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--dry-run]
+ * pnpm unity <骨架文件或目录> [--out 目录] [--ppu 100] [--atlas 图集] [--rp urp|builtin] [--color-space linear|gamma] [--dry-run]
  * ```
  *
  * 每个骨架产出一套可以**直接拖进 Assets 就能播**的资源:
@@ -36,6 +38,8 @@ interface Options {
   readonly skin: string | null
   /** 皮肤怎么切:animator 零脚本(默认),script 挂 AnimatorGoSkins 组件按需加载 */
   readonly skins: 'animator' | 'script'
+  /** null 表示从输出目录所在的 Unity 工程自动认;不在工程里按 linear */
+  readonly colorSpace: ColorSpace | null
 }
 
 function parseArgs(argv: readonly string[]): Options | string {
@@ -76,6 +80,8 @@ function parseArgs(argv: readonly string[]): Options | string {
 
   const skins = flags.get('skins') ?? 'animator'
   if (skins !== 'animator' && skins !== 'script') return `--skins 只能是 animator 或 script,收到 "${skins}"`
+  const colorSpace = flags.get('color-space') ?? null
+  if (colorSpace !== null && colorSpace !== 'linear' && colorSpace !== 'gamma') return `--color-space 只能是 linear 或 gamma,收到 "${colorSpace}"`
 
   const resolved = resolve(input)
   const base = statSync(resolved).isDirectory() ? resolved : dirname(resolved)
@@ -90,6 +96,7 @@ function parseArgs(argv: readonly string[]): Options | string {
     skinQuality,
     skin: flags.get('skin') ?? null,
     skins,
+    colorSpace: colorSpace as ColorSpace | null,
   }
 }
 
@@ -229,6 +236,12 @@ function main(): void {
     const why = quality === null ? '输出目录不在 Unity 工程里' : `${quality.from} 里读不出各档的 Skin Weights`
     console.log(`蒙皮根数:${why},没法检查 —— 有网格走 SkinnedMeshRenderer 时,工程 Quality 各档要设成 Four Bones(SpriteSkin 不受影响)`)
   }
+
+  const detectedSpace = parsed.colorSpace === null ? detectColorSpace(parsed.out) : null
+  const colorSpace: ColorSpace = parsed.colorSpace ?? detectedSpace?.space ?? 'linear'
+  if (parsed.colorSpace !== null) console.log(`色彩空间:${colorSpace}(命令行指定)`)
+  else if (detectedSpace !== null) console.log(`色彩空间:${colorSpace}(认自 ${detectedSpace.from})`)
+  else console.log(`色彩空间:输出目录不在 Unity 工程里,按 linear(只影响 SkinnedMeshRenderer 的顶点色;Gamma 工程加 --color-space gamma)`)
   for (const line of describeClashes(plan, root, parsed.out)) console.log(line)
   console.log()
 
@@ -305,6 +318,7 @@ function main(): void {
         renderPipeline: pipeline,
         skinQuality: parsed.skinQuality,
         ...(qualityLevels === null ? {} : { qualityLevels }),
+        colorSpace,
         skins: parsed.skins,
         assetFolder,
         ...(parsed.skin === null ? {} : { skin: parsed.skin }),

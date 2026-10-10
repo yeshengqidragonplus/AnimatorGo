@@ -29,6 +29,7 @@ import { writeSpriteMaterial, BLEND_SHADER_FILES, MASKED_MESH_SHADER_FILE, MATER
 import { attachmentVertices } from '../../spine-eval/vertices.ts'
 import { clipDeformOf, clipGroups, clipOnSteps, clipPolygonAt, clipToggled, triangulatePolygon, type ClipGroup, type Point } from '../clipping.ts'
 import { skinWeightsLabel, UNLIMITED_SKIN_WEIGHTS, type QualityLevel } from '../../unity/qualitySettings.ts'
+import { toVertexColor, type ColorSpace } from '../../unity/colorSpace.ts'
 import { bindSlots, compactSlots, truncateVertex, type BoundMesh, type PosePair } from '../skinSlots.ts'
 import { toAbsoluteBezier } from '../../spine-format/bezier.ts'
 import {
@@ -106,6 +107,12 @@ export interface UnityExportOptions {
    */
   readonly qualityLevels?: readonly QualityLevel[]
   /**
+   * 目标工程的色彩空间(`ProjectSettings/ProjectSettings.asset` 的 `m_ActiveColorSpace`),默认 `linear`。
+   * 只影响走 SkinnedMeshRenderer 的网格:颜色烘进顶点色,而顶点色 Unity 不做 sRGB 换算(实测,见 colorSpace.ts),
+   * 线性工程要先换成线性值。SpriteRenderer 的 `m_Color` 两种工程都原样写。
+   */
+  readonly colorSpace?: ColorSpace
+  /**
    * 跳过图集 PNG 的编码。
    *
    * 只给试运行用:批量摸底几百个骨架时,PNG 编码占了绝大部分时间,
@@ -159,6 +166,22 @@ function unpackColor(packed: number): { r: number; g: number; b: number; a: numb
 
 /** `SlotRecord.blendMode` 的取值 → Unity 这边要自己的材质的那三种(normal 是 null,走默认 sprite 材质) */
 const BLEND_OF_MODE: readonly (SpineBlend | null)[] = [null, 'additive', 'multiply', 'screen']
+
+type Rgba = { r: number; g: number; b: number; a: number }
+
+/**
+ * attachment 自己的颜色(region / mesh / linkedmesh 都有,缺省白)。Spine 画的时候乘在 slot 颜色上;
+ * Unity 没有这一层,只能乘进挂图节点自己的颜色 —— 一个 attachment 一个节点,同一 slot 下颜色不同的件也各自精确
+ */
+function attachmentColor(a: Attachment): Rgba {
+  return unpackColor((a.data['color'] as number | undefined) ?? -1)
+}
+
+function multiplyColor(p: Rgba, q: Rgba): Rgba {
+  return { r: p.r * q.r, g: p.g * q.g, b: p.b * q.b, a: p.a * q.a }
+}
+
+const isWhite = (c: Rgba) => c.r >= 1 && c.g >= 1 && c.b >= 1
 
 /** 逐帧修正里,阶梯跳变前补的那个采样离跳变多远(秒) */
 const STEP_EPSILON = 1e-4
@@ -398,6 +421,9 @@ export function exportToUnity(
   const toUnits = (m: Affine): Affine => ({ a: m.a, b: m.b, c: m.c, d: m.d, x: m.x * scale, y: m.y * scale })
   const linear = (m: Affine): Affine => ({ a: m.a, b: m.b, c: m.c, d: m.d, x: 0, y: 0 })
   const skinQuality: 0 | 4 = options.skinQuality === 'auto' ? 0 : 4
+  const colorSpace: ColorSpace = options.colorSpace ?? 'linear'
+  /** 带颜色(rgb 不是白)的 SkinnedMeshRenderer 网格 —— 顶点色要按工程色彩空间换算,汇总后报一次 */
+  const tintedMeshes: string[] = []
 
   const skinNameOf = (skin: number | string): string =>
     typeof skin === 'number' ? (part.skins[skin]?.name ?? String(skin)) : skin
@@ -729,7 +755,10 @@ export function exportToUnity(
     const uvs = data['uvs'] as number[]
     const triangles = data['triangles'] as number[]
     const page = baked.pages[rect.page]!
-    const color = unpackColor(part.slots[item.slot]!.color)
+    // SkinnedMeshRenderer 没有 m_Color:静态颜色(slot × attachment)烘进顶点色,线性工程要换成线性值
+    const tint = multiplyColor(unpackColor(part.slots[item.slot]!.color), attachmentColor(item.attachment))
+    if (!isWhite(tint)) tintedMeshes.push(item.spriteName)
+    const color = toVertexColor(tint, colorSpace)
     const subset = verts.weighted ? boneSubset(verts.weights) : [slotBone]
 
     // UV:Spine 的 uv 相对未裁剪原图 → 裁剪矩形内像素 → 烘焙页上的像素 → 归一化
@@ -1183,7 +1212,7 @@ export function exportToUnity(
       continue
     }
 
-    const color = unpackColor(slot.color)
+    const color = multiplyColor(unpackColor(slot.color), attachmentColor(item.attachment))
     let renderer: RendererSpec = {
       // 带脚本模式下换装件不硬引用 sprite,由 AnimatorGoSkins 切到时装上
       sprite: scriptMode && !isDefaultSkin(item.skin) ? null : { fileID: info.internalID, guid: textureGuids[info.page]! },
@@ -1979,16 +2008,27 @@ export function exportToUnity(
 
           for (const [attribute, values, component, setupValue] of channels) {
             const times = t.frames.map((f) => f['time'] as number)
-            // 颜色的取值已经是 0..1,与贝塞尔 cy 同一空间,不用再变换
-            const s = withSetup(times, values, segmentsOf(t.frames, values, (v) => v, is38, component), setupValue)
-            const curve = toUnityCurve(s.times, s.values, s.segments)
-            approximated ||= curve.approximated
+            const channel = attribute.slice('m_Color.'.length) as keyof Rgba
+            // 节点颜色 = slot 颜色 × attachment 颜色:曲线按各节点的 attachment 颜色缩放。乘常数对取值、贝塞尔控制点、
+            // Hermite 切线都是精确的。同一 slot 下 attachment 颜色可以不同,按系数各算一条
+            const byFactor = new Map<number, UnityKeyframe[]>()
+            const curveFor = (factor: number): UnityKeyframe[] => {
+              const hit = byFactor.get(factor)
+              if (hit !== undefined) return hit
+              const scaleBy = (v: number) => v * factor
+              // 颜色的取值已经是 0..1,与贝塞尔 cy 同一空间,只差这个系数
+              const s = withSetup(times, values.map(scaleBy), segmentsOf(t.frames, values, scaleBy, is38, component), scaleBy(setupValue))
+              const curve = toUnityCurve(s.times, s.values, s.segments)
+              approximated ||= curve.approximated
+              byFactor.set(factor, curve.keys)
+              return curve.keys
+            }
             for (const item of list) {
               if (skinnedByItem.has(item)) {
                 skinnedColorLoss.add(item.spriteName)
                 continue
               }
-              floats.push({ path: paths[item.node]!, attribute, classID: 212, keys: curve.keys })
+              floats.push({ path: paths[item.node]!, attribute, classID: 212, keys: curveFor(attachmentColor(item.attachment)[channel]) })
             }
           }
           noteApprox(t)
@@ -2253,6 +2293,16 @@ export function exportToUnity(
   }
   for (const spriteName of skinnedColorLoss) {
     issues.loss(`color.${spriteName}`, 'slot 颜色动画在 SkinnedMeshRenderer 上没有对应属性(静态颜色已烘进顶点色),已丢弃')
+  }
+  if (tintedMeshes.length > 0) {
+    issues.add(
+      'info',
+      'skinnedMesh',
+      `${tintedMeshes.length} 个走 SkinnedMeshRenderer 的网格带颜色(slot × attachment),烘进顶点色;` +
+        (colorSpace === 'linear'
+          ? '按 Linear 工程换成线性值(Unity 不对顶点色做 sRGB 换算)—— Gamma 工程要用 --color-space gamma 重新导出'
+          : '按 Gamma 工程原样写 —— Linear 工程里会偏亮,要用 --color-space linear 重新导出'),
+    )
   }
 
   // ── 皮肤层:每套皮肤一条静态 clip,只写挂图节点的 m_IsActive ──

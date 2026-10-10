@@ -1,4 +1,5 @@
 import { parseMesh, skinWeights } from '../../unity/writeMesh.ts'
+import { fromVertexColor, type ColorSpace } from '../../unity/colorSpace.ts'
 import { SPRITE_SKIN_SCRIPT_GUID } from '../../unity/writePrefab.ts'
 import { spriteRecord } from '../../unity/spriteMeta.ts'
 import { list, map, num, parseUnityYaml, parseYamlDocument, ref, str, vec, type UnityObject, type YamlMap, type YamlValue } from '../../unity/yaml.ts'
@@ -97,12 +98,17 @@ export interface UnityScene {
   worldAt(clip: string | null, t: number): Map<string, { a: number; b: number; c: number; d: number; x: number; y: number }>
   /** 该时刻画出来的渲染器,按画的先后(先画的在前) */
   drawnAt(clip: string | null, t: number): { path: string; sprite: string | null }[]
-  /** 节点路径 → 该时刻的 m_Color(没有颜色曲线就是 prefab 里的) */
+  /**
+   * 节点路径 → 该时刻画出来的颜色,与 SpriteRenderer 的 `m_Color` 同一个意思(sRGB)。SpriteRenderer 是 `m_Color`
+   * (没有颜色曲线就是 prefab 里的);SkinnedMeshRenderer 没有可动画的颜色,是 Mesh 的顶点色 —— 线性工程里 Unity
+   * 把它当线性值用(不做 sRGB 换算),换回 sRGB 才和 `m_Color` 可比
+   */
   colorAt(clip: string | null, t: number): Map<string, [number, number, number, number]>
   readonly clips: readonly string[]
 }
 
-export function loadUnityScene(files: ReadonlyMap<string, string | Uint8Array>): UnityScene {
+export function loadUnityScene(files: ReadonlyMap<string, string | Uint8Array>, options: { colorSpace?: ColorSpace } = {}): UnityScene {
+  const colorSpace = options.colorSpace ?? 'linear'
   const text = (p: string) => { const c = files.get(p)!; return typeof c === 'string' ? c : new TextDecoder().decode(c) }
   const pathOfGuid = new Map<string, string>()
   for (const [p] of files) if (p.endsWith('.meta')) pathOfGuid.set(str(parseYamlDocument(text(p))['guid']), p.slice(0, -5))
@@ -342,6 +348,14 @@ export function loadUnityScene(files: ReadonlyMap<string, string | Uint8Array>):
     const ov = override(clip, t)
     const out = new Map<string, [number, number, number, number]>()
     for (const n of nodes.values()) {
+      const smr = n.comps.find((c) => c.type === 'SkinnedMeshRenderer')
+      if (smr !== undefined) {
+        const v = meshOf(pathOfGuid.get(ref(smr.data['m_Mesh']).guid ?? '')!).colors[0]
+        if (v === undefined) continue
+        const c = fromVertexColor(v, colorSpace)
+        out.set(n.path, [c.r, c.g, c.b, c.a])
+        continue
+      }
       const sr = n.comps.find((c) => c.type === 'SpriteRenderer')
       if (sr === undefined) continue
       const c = map(sr.data['m_Color'])
