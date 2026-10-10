@@ -899,6 +899,19 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
     expect(degraded).toEqual([])
   })
 
+  it('⭐ 非 normal 的混合模式逐个 slot 报出来,不静默(之前一律按 normal 画、不报)', () => {
+    expect(part.slots.every((s) => s.blendMode === 0)).toBe(true)
+    expect(result.issues.some((i) => i.path.startsWith('slot.') && i.message.includes('混合'))).toBe(false)
+    // 挑三个画得出东西的 slot,分别改成 additive / multiply / screen
+    const drawn = part.slots.map((s, i) => ({ s, i })).filter(({ s }) => s.attachmentName !== null).slice(0, 3)
+    const modes = ['additive', 'multiply', 'screen']
+    const blended = { ...part, slots: part.slots.map((s, i) => { const k = drawn.findIndex((d) => d.i === i); return k < 0 ? s : { ...s, blendMode: k + 1 } }) }
+    const issues = exportToUnity(blended, atlas, sources, { name: 'MX2_cat', pixelsPerUnit: 100, renderPipeline: 'urp', skipImages: true }).issues
+    const reported = issues.filter((i) => i.path.startsWith('slot.') && i.message.includes('混合'))
+    expect(reported.map((i) => i.path)).toEqual(drawn.map(({ s }) => `slot.${s.name}`))
+    reported.forEach((i, k) => expect(i.message).toContain(modes[k]))
+  })
+
   it('两次导出逐字节相同 —— 否则 Unity 里的引用会断', () => {
     const again = exportToUnity(part, atlas, sources, { name: 'MX2_cat', pixelsPerUnit: 100, renderPipeline: 'urp' })
     expect(again.files.length).toBe(result.files.length)
@@ -1698,6 +1711,40 @@ describe.skipIf(!existsSync(`${stem}.skel.bytes`))(`clipping → SpriteMask(${la
   it('有损的地方都报了:没有「clipping 已丢弃」,每个遮罩一条说明', () => {
     expect(result.issues.some((i) => i.message.includes('clipping 遮罩的对应物'))).toBe(false)
     for (const g of groups) expect(result.issues.some((i) => i.path === `clipping.${part.slots[g.slot]!.name}/${g.key}` && i.message.includes('SpriteMask'))).toBe(true)
+  })
+})
+}
+
+// ─── slot 的混合模式:MergeCooking2 的本地样本(不在库里,存在才跑)─────────────────────────────────────
+
+const BLEND_SAMPLES = [
+  ['Easter_card(3 个 multiply 的影子)', `${MC2_ROOT}/CardCollectMain/Easter_card`, ['R2_shadow', 'R_shadow', 'M_shadow']],
+  ['34500(multiply 的整栋建筑影子)', `${MC2_ROOT}/../../World/Map7/Spine/34500`, ['shadow_F']],
+  ['Multiple_Energy(24 个 additive 的粒子)', `${MC2_ROOT}/../../Public/System/MultipleEnergy/Spine/Multiple_Energy`, ['particle', 'particle24']],
+] as const
+
+for (const [label, stem, expected] of BLEND_SAMPLES) {
+describe.skipIf(!existsSync(`${stem}.skel.bytes`))(`混合模式(${label})`, () => {
+  const part = readSkeletonPart(new Uint8Array(readFileSync(`${stem}.skel.bytes`)))
+  const atlas = parseAtlas(readFileSync(`${stem}.atlas.txt`, 'utf8'))
+  const dir = stem.slice(0, stem.lastIndexOf('/'))
+  const sources = new Map<string, Image>()
+  for (const page of atlas.pages) sources.set(page.name, decodePng(new Uint8Array(readFileSync(`${dir}/${page.name}`))))
+  const result = exportToUnity(part, atlas, sources, { name: 'b', pixelsPerUnit: 100, renderPipeline: 'urp', skipImages: true })
+  const drawn = (slot: number) => part.skins.some((s) => s.slots.some((e) => e.slot === slot && e.attachments.some((a) => a.type === 'region' || a.type === 'mesh')))
+
+  it('每个画得出东西、混合模式不是 normal 的 slot 都报了,带 slot 名和模式名', () => {
+    const names = ['normal', 'additive', 'multiply', 'screen']
+    const blended = part.slots.map((s, i) => ({ s, i })).filter(({ s, i }) => s.blendMode !== 0 && drawn(i))
+    for (const name of expected) expect(blended.map(({ s }) => s.name)).toContain(name)
+    for (const { s } of blended) {
+      const issue = result.issues.find((i) => i.path === `slot.${s.name}` && i.message.includes('混合'))
+      expect(issue, s.name).toBeDefined()
+      expect(issue!.message).toContain(names[s.blendMode])
+    }
+    // normal 的不报
+    const normal = new Set(part.slots.filter((s) => s.blendMode === 0).map((s) => `slot.${s.name}`))
+    expect(result.issues.some((i) => normal.has(i.path) && i.message.includes('混合'))).toBe(false)
   })
 })
 }

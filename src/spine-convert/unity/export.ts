@@ -156,6 +156,9 @@ function unpackColor(packed: number): { r: number; g: number; b: number; a: numb
   }
 }
 
+/** `SlotRecord.blendMode` 的取值 → Spine 里的名字 */
+const BLEND_MODE_NAMES = ['normal', 'additive', 'multiply', 'screen']
+
 /** 逐帧修正里,阶梯跳变前补的那个采样离跳变多远(秒) */
 const STEP_EPSILON = 1e-4
 
@@ -558,6 +561,12 @@ export function exportToUnity(
       }
     }
   }
+  // slot 的混合模式:Unity 的默认 sprite 材质只有 normal(直通 alpha 混合)。之前一声不响地全按 normal 画 ——
+  // additive 的光效变成不透明的一块,multiply 的影子变成盖上去的一层。只报画得出东西的 slot
+  part.slots.forEach((slot, i) => {
+    if (slot.blendMode === 0 || !used.some((u) => u.slot === i)) return
+    issues.loss(`slot.${slot.name}`, `Spine 的 ${BLEND_MODE_NAMES[slot.blendMode] ?? slot.blendMode} 混合在 Unity 的默认 sprite 材质里没有对应物,按 normal 画`)
+  })
 
   // ── 2. 烘焙图集 ──
   // Spine 导给 spine-unity 的图集默认是预乘 alpha,Unity 的 sprite 材质按直通 alpha 混合 ——
