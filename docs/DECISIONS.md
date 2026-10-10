@@ -136,7 +136,7 @@ Unity 运行时按帧率重采样带权切线的曲线(实测),Spine 贝塞尔�
 (`female_lead` 长骨骼链上 2.2 像素)。按帧展开成不带权的密键能做到精确,但曲线在 Animation 窗口里就没法改了。
 **用户定:不改。** 几像素肉眼看不出,可编辑是初心。
 
-**已知仍然做不到的:** clipping 遮罩。逐帧绘制顺序此前判定为做不到 —— 排查证实
+~~**已知仍然做不到的:** clipping 遮罩。~~ 已做(2026-10-10,SpriteMask,见 UNITY-2D.md 第 17 节)。逐帧绘制顺序此前判定为做不到 —— 排查证实
 `m_SortingOrder` 可以打关键帧(SpriteRenderer 与 SkinnedMeshRenderer 都行),2026-09-10 已做。
 排查结论全文见 [PROGRESS.md](PROGRESS.md)「Blend Shape 路线的排查结论」。
 

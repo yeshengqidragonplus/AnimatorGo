@@ -11,6 +11,11 @@ import { exportToUnity, type UnityFile } from './export.ts'
 import { loadUnityScene } from '../unity-import/unityEval.ts'
 import { list, map, parseUnityYaml, str } from '../../unity/yaml.ts'
 import { attachmentVertices } from '../../spine-eval/vertices.ts'
+import { slotAttachmentsAt } from '../../spine-eval/slots.ts'
+import { lastPerProperty } from '../../spine-format/duplicateTimelines.ts'
+import { clipDeformOf, clipGroups, clipPolygonAt } from '../clipping.ts'
+import { IssueCollector } from '../types.ts'
+import { MASKED_MESH_SHADER_FILE, MASKED_MESH_SHADER_GUID } from '../../unity/writeMaterial.ts'
 
 /**
  * Spine → Unity 的**端到端校验**。
@@ -1557,4 +1562,142 @@ for (const rel of BIND_SAMPLES) {
       }
     })
   })
+}
+
+// ─── clipping 遮罩 → SpriteMask:MergeCooking2 的本地样本(不在库里,存在才跑)───────────────────────
+//
+// ⚠️ 实测(UNITY-2D.md 第 17 节):SpriteMask 的 m_Sprite / 排序范围、渲染器的 m_MaskInteraction 都不能被动画驱动,
+// 只有 m_Enabled 能。所以每种形状一个 SpriteMask 物体、外加一个铺满的「不遮」,同一时刻只亮一个
+
+const CLIP_SAMPLES = [
+  ['Easter_card(deform + 开关)', `${MC2_ROOT}/CardCollectMain/Easter_card`],
+  ['clown_npc(两个遮罩)', `${MC2_ROOT}/CardJokerShop/clown_npc`],
+  ['Stage_rewards(setup 里关着,每条动画换形状)', `${MC2_ROOT}/../../Activity/StageReward/Spine/Stage_rewards`],
+  ['race_haibao(范围里 20 个走 SkinnedMeshRenderer)', `${MC2_ROOT}/SpeedRaceStart/race_haibao`],
+] as const
+
+for (const [label, stem] of CLIP_SAMPLES) {
+describe.skipIf(!existsSync(`${stem}.skel.bytes`))(`clipping → SpriteMask(${label})`, () => {
+  const dir = stem.slice(0, stem.lastIndexOf('/'))
+  const part = readSkeletonPart(new Uint8Array(readFileSync(`${stem}.skel.bytes`)))
+  const atlas = parseAtlas(readFileSync(`${stem}.atlas.txt`, 'utf8'))
+  const sources = new Map<string, Image>()
+  for (const page of atlas.pages) sources.set(page.name, decodePng(new Uint8Array(readFileSync(`${dir}/${page.name}`))))
+  const result = exportToUnity(part, atlas, sources, { name: 'c', pixelsPerUnit: 100, renderPipeline: 'urp' })
+  const textOf = (path: string) => result.files.find((f) => f.path === path)!.content as string
+  const groups = clipGroups(part, new IssueCollector())
+
+  // prefab:GameObject 名 / 父子 / Transform,SpriteMask 与渲染器的关键字段
+  const docs = textOf('c.prefab').split(/^--- /m).slice(1)
+  const goName = new Map<string, string>()
+  const trOfGo = new Map<string, string>()
+  const trs = new Map<string, { go: string; father: string; pos: { x: number; y: number }; scl: { x: number; y: number } }>()
+  const masks = new Map<string, { enabled: boolean; sprite: string; back: number; front: number }>()
+  const interaction = new Map<string, { cls: string; value: number; material: string }>()
+  for (const doc of docs) {
+    const [, cls, id] = /^!u!(\d+) &(\d+)/.exec(doc)!
+    const go = /m_GameObject: \{fileID: (\d+)}/.exec(doc)?.[1]
+    if (cls === '1') goName.set(id!, /m_Name: (.*)/.exec(doc)![1]!.trim())
+    else if (cls === '4') {
+      trOfGo.set(go!, id!)
+      trs.set(id!, { go: go!, father: /m_Father: \{fileID: (\d+)}/.exec(doc)![1]!, pos: pair(/m_LocalPosition: .*/.exec(doc)![0], 'x', 'y'), scl: pair(/m_LocalScale: .*/.exec(doc)![0], 'x', 'y') })
+    } else if (cls === '331') {
+      masks.set(go!, {
+        enabled: /m_Enabled: (\d)/.exec(doc)![1] === '1',
+        sprite: /m_Sprite: \{fileID: (-?\d+)/.exec(doc)![1]!,
+        back: Number(/m_BackSortingOrder: (-?\d+)/.exec(doc)![1]),
+        front: Number(/m_FrontSortingOrder: (-?\d+)/.exec(doc)![1]),
+      })
+      expect(/m_IsCustomRangeActive: 1/.test(doc)).toBe(true)
+    } else if (cls === '212' || cls === '137') {
+      interaction.set(go!, { cls: cls!, value: Number(/m_MaskInteraction: (\d)/.exec(doc)![1]), material: /m_Materials:\n {2}- \{fileID: \d+, guid: (\w+)/.exec(doc)?.[1] ?? '' })
+    }
+  }
+  /** 物体的动画路径(相对根物体) */
+  const pathOf = (go: string): string => {
+    const names: string[] = []
+    for (let tr = trOfGo.get(go)!; trs.get(tr)!.father !== '0'; tr = trs.get(tr)!.father) names.unshift(goName.get(trs.get(tr)!.go)!)
+    return names.join('/')
+  }
+  const meta = readMeta(textOf('c@clip.png.meta'))
+  const internalIds = [...textOf('c@clip.png.meta').matchAll(/internalID: (-?\d+)/g)].map((m) => m[1]!)
+
+  it('被遮的 slot 的渲染器都「只在遮罩里显示」,别的都不是;被遮的 SkinnedMeshRenderer 用自带着色器', () => {
+    const clipped = new Set(groups.flatMap((g) => g.clipped.map((s) => part.slots[s]!.name)))
+    const slotOfNode = (name: string) => part.slots.map((s) => s.name).filter((n) => name === n || name.startsWith(`${n}__`) || name.startsWith(`${n}#`) || name.startsWith(`${n}@`)).sort((x, y) => y.length - x.length)[0]
+    let checked = 0
+    let skinned = 0
+    for (const [go, r] of interaction) {
+      const slot = slotOfNode(goName.get(go)!)
+      if (slot === undefined) continue
+      expect(r.value, goName.get(go)).toBe(clipped.has(slot) ? 1 : 0)
+      checked++
+      if (r.cls === '137' && clipped.has(slot)) {
+        skinned++
+        const mat = result.files.find((f) => f.path.endsWith('.mat.meta') && (f.content as string).includes(`guid: ${r.material}`))!
+        expect(textOf(mat.path.slice(0, -'.meta'.length))).toContain(`guid: ${MASKED_MESH_SHADER_GUID}`)
+      }
+    }
+    expect(checked).toBeGreaterThan(0)
+    expect(result.runtime.includes(MASKED_MESH_SHADER_FILE)).toBe(skinned > 0)
+  })
+
+  it('⭐ 每个遮罩:范围 = (遮罩 slot, 最后一个被遮的 slot];逐时刻只亮一个 SpriteMask,开关和形状与 Spine 一致', () => {
+    for (const g of groups) {
+      const slot = part.slots[g.slot]!
+      const base = g.key === slot.name ? slot.name : `${slot.name}__${g.key}`
+      const own = [...masks.keys()].filter((go) => goName.get(go) === base || goName.get(go)!.startsWith(`${base} #`) || goName.get(go) === `${base} (off)`)
+      const off = own.find((go) => goName.get(go) === `${base} (off)`)!
+      expect(off, base).toBeDefined()
+      for (const go of own) {
+        expect(masks.get(go)!.back).toBe(g.slot)
+        expect(masks.get(go)!.front).toBe(g.clipped[g.clipped.length - 1])
+      }
+      /** 形状物体在骨骼局部(Unity 单位)的多边形:节点 = 包围盒左下角 + 大小,sprite 顶点是包围盒里 0..16 的坐标 */
+      const polygonOf = (go: string) => {
+        const tr = trs.get(trOfGo.get(go)!)!
+        const sprite = meta.sprites[internalIds.indexOf(masks.get(go)!.sprite)]!
+        return sprite.vertices.map((v) => ({ x: tr.pos.x + (v.x / 16) * tr.scl.x, y: tr.pos.y + (v.y / 16) * tr.scl.y }))
+      }
+      for (const anim of [null, ...part.animations]) {
+        const kept = anim === null ? [] : lastPerProperty(anim.timelines).kept
+        const clip = anim === null ? '' : textOf(`c@${anim.name}.anim`)
+        const curves = curveMap(clip, 'm_Enabled')
+        const frames = clipDeformOf(part, g, kept)
+        const times = new Set<number>([0])
+        for (const tl of kept) {
+          if (tl.owner !== g.slot || (tl.kind !== 'deform' && tl.kind !== 'attachment')) continue
+          const fs = tl.kind === 'deform' ? (tl.frames[0] as { frames: Record<string, unknown>[] }).frames : tl.frames
+          for (const f of fs) if (typeof f['time'] === 'number') times.add(f['time'] as number)
+        }
+        const sorted = [...times].sort((x, y) => x - y)
+        for (const t of [...sorted, ...sorted.slice(1).map((x, i) => (x + sorted[i]!) / 2)]) {
+          const enabled = own.filter((go) => {
+            const keys = curves.get(pathOf(go))
+            if (keys === undefined) return masks.get(go)!.enabled
+            let v = keys[0]!.value
+            for (const k of keys) if (k.time <= t + 1e-6) v = k.value
+            return v === 1
+          })
+          const at = `${base} @${anim?.name ?? 'setup'} ${t.toFixed(3)}`
+          expect(enabled.length, at).toBe(1)
+          const on = slotAttachmentsAt(part, anim === null ? null : { ...anim, timelines: kept }, t)[g.slot] === g.key
+          expect(enabled[0] === off, at).toBe(!on)
+          if (!on) continue
+          // 形状:关键帧之间按 30 fps 逐帧换,允许一帧的移动量
+          const want = clipPolygonAt(part, g, frames, t).map((p) => ({ x: p.x / 100, y: p.y / 100 }))
+          const got = polygonOf(enabled[0]!)
+          expect(got.length, at).toBe(want.length)
+          const worst = Math.max(...want.map((p, i) => Math.hypot(p.x - got[i]!.x, p.y - got[i]!.y))) * 100
+          expect(worst, at).toBeLessThan(2)
+        }
+      }
+    }
+  })
+
+  it('有损的地方都报了:没有「clipping 已丢弃」,每个遮罩一条说明', () => {
+    expect(result.issues.some((i) => i.message.includes('clipping 遮罩的对应物'))).toBe(false)
+    for (const g of groups) expect(result.issues.some((i) => i.path === `clipping.${part.slots[g.slot]!.name}/${g.key}` && i.message.includes('SpriteMask'))).toBe(true)
+  })
+})
 }

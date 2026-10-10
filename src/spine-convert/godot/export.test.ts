@@ -4,7 +4,10 @@ import { readSkeletonPart } from '../../spine-format/binary/readSkeleton.ts'
 import type { AnimationData } from '../../spine-format/binary/readAnimations.ts'
 import { parseAtlas } from '../../core/atlas.ts'
 import { decodePng, type Image } from '../../unity/png.ts'
-import { poseAt, setupPose, type Affine } from '../../spine-eval/pose.ts'
+import { applyPoint, poseAt, setupPose, type Affine } from '../../spine-eval/pose.ts'
+import { slotAttachmentsAt } from '../../spine-eval/slots.ts'
+import { clipDeformOf, clipGroups, clipPolygonAt } from '../clipping.ts'
+import { IssueCollector } from '../types.ts'
 import { attachmentVertices } from '../../spine-eval/vertices.ts'
 import { lastPerProperty } from '../../spine-format/duplicateTimelines.ts'
 import { parseScene, type ParsedSection, type ParsedValue } from '../../godot/tscn.ts'
@@ -211,6 +214,10 @@ const SAMPLES: { label: string; skel: string; atlas: string }[] = [
   { label: 'BBQ_grill(100 个 region、换图)', skel: `${MC2}/BBQ/BBQ_grill.skel.bytes`, atlas: `${MC2}/BBQ/BBQ_grill.atlas.txt` },
   // B_body2 的绑定姿势各顶点不一致、按图也拟合不上:每根骨骼一个 rest 的话动画里差 127 像素,靠多配辅助子骨骼
   { label: 'whiteman_sit(绑定不一致,靠辅助子骨骼)', skel: `${MC2}/MapCharacters/whiteman_sit/whiteman_sit.skel.bytes`, atlas: `${MC2}/MapCharacters/whiteman_sit/whiteman_sit.atlas.txt` },
+  // clipping 遮罩:deform + 换图开关、46 个 slot;两个遮罩;setup 里关着、每条动画换一种形状
+  { label: 'Easter_card(遮罩:deform + 开关)', skel: `${MC2}/CardCollectMain/Easter_card.skel.bytes`, atlas: `${MC2}/CardCollectMain/Easter_card.atlas.txt` },
+  { label: 'clown_npc(两个遮罩)', skel: `${MC2}/CardJokerShop/clown_npc.skel.bytes`, atlas: `${MC2}/CardJokerShop/clown_npc.atlas.txt` },
+  { label: 'Stage_rewards(遮罩 setup 里关着)', skel: `${MC2}/../../Activity/StageReward/Spine/Stage_rewards.skel.bytes`, atlas: `${MC2}/../../Activity/StageReward/Spine/Stage_rewards.atlas.txt` },
 ]
 
 for (const sample of SAMPLES) {
@@ -311,6 +318,19 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
     }
   })
 
+  it('⭐ 同一个属性在所有动画(含 RESET)里是同一种轨道(实测:值 / 贝塞尔混着的话,没碰它的动画回不到 RESET,读出 0)', () => {
+    const typeOf = new Map<string, string>()
+    for (const [name, anim] of scene.animations) {
+      for (let i = 0; anim.props.has(`tracks/${i}/type`); i++) {
+        const path = args(anim.props.get(`tracks/${i}/path`))[0] as unknown as string
+        const type = anim.props.get(`tracks/${i}/type`) as string
+        const seen = typeOf.get(path)
+        if (seen === undefined) typeOf.set(path, type)
+        else expect(type, `${name}:${path}`).toBe(seen)
+      }
+    }
+  })
+
   it('⭐ 没有一条轨道在同一时刻有两个键(Godot 在那一刻取第一个,和这里的求值不一样 —— 实测开头一帧两张图一起亮)', () => {
     for (const [name, anim] of scene.animations) {
       for (let i = 0; anim.props.has(`tracks/${i}/type`); i++) {
@@ -342,6 +362,48 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
       // 该皮肤自己的动画里一定亮
       const own = scene.evaluate(skin === part.skins[0]!.name ? initial : skin, 0).get(`${wrapper.path}:visible`)
       if (skin !== part.skins[0]!.name) expect(own, `${a.name}@${skin}`).toBe(true)
+    }
+  })
+
+  it('⭐ clipping:遮罩是 clip_children 的 Polygon2D,被遮的部件都在它下面、同层、按 slot 排;形状和开关逐时刻与 Spine 一致', () => {
+    const groups = clipGroups(part, new IssueCollector())
+    for (const g of groups) {
+      const slot = part.slots[g.slot]!
+      const name = g.key === slot.name ? slot.name : `${slot.name}__${g.key}`
+      const mask = scene.nodes.get(name)!
+      expect(mask?.type, name).toBe('Polygon2D')
+      expect(mask.props.has('clip_children'), name).toBe(true)
+      // ⚠️ 实测:子节点的 z_index 和遮罩不同就不裁 —— 被遮的都不能写 z_index,先后靠节点顺序
+      const under = pairs.filter((p) => g.clipped.includes(p.slot))
+      expect(under.length).toBeGreaterThan(0)
+      for (const p of under) {
+        expect(p.node.path.startsWith(`${name}/`), p.node.path).toBe(true)
+        expect(p.node.props.has('z_index'), p.node.path).toBe(false)
+      }
+      const order = [...scene.nodes.values()].flatMap((n) => under.filter((p) => p.node === n).map((p) => p.slot))
+      expect(order, '节点顺序 = slot 顺序').toEqual([...order].sort((x, y) => x - y))
+      // 形状(世界坐标)与开关
+      for (const anim of [null, ...part.animations]) {
+        const kept = anim === null ? [] : lastPerProperty(anim.timelines).kept
+        const frames = clipDeformOf(part, g, kept)
+        const times = new Set<number>([0])
+        for (const tl of kept) {
+          const fs = tl.kind === 'deform' ? (tl.frames[0] as { frames: Record<string, unknown>[] }).frames : tl.frames
+          for (const f of fs) if (typeof f['time'] === 'number') times.add(f['time'] as number)
+        }
+        const sorted = [...times].sort((x, y) => x - y)
+        for (const t of [...sorted, ...sorted.slice(1).map((x, i) => (x + sorted[i]!) / 2)]) {
+          const pose = anim === null ? setupPose(part) : poseAt(part, { ...anim, timelines: kept }, t)
+          const values = scene.evaluate(anim?.name ?? null, t)
+          const spine = clipPolygonAt(part, g, frames, t).map((p) => applyPoint(pose[slot.bone]!, p.x, p.y)).map((p) => ({ x: p.x, y: -p.y }))
+          const godot = scene.vertices(mask, values)
+          const worst = Math.max(...spine.map((p, i) => Math.hypot(p.x - godot[i]!.x, p.y - godot[i]!.y)))
+          const at = `${name} @${anim?.name ?? 'setup'} ${t.toFixed(3)}`
+          expect(worst, at).toBeLessThan(0.5)
+          const on = slotAttachmentsAt(part, anim === null ? null : { ...anim, timelines: kept }, t)[g.slot] === g.key
+          expect(values.get(`${name}:clip_children`) ?? mask.props.get('clip_children'), at).toBe(on ? 1 : 0)
+        }
+      }
     }
   })
 

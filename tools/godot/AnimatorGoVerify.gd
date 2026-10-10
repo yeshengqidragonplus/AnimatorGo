@@ -28,11 +28,16 @@ func verify(path: String) -> void:
 	var polys := 0
 	var skinned := 0
 	var bones_total := 0
+	var masks := 0
 	for node in root.find_children("*", "Polygon2D", true, false):
 		var poly := node as Polygon2D
 		polys += 1
-		if poly.texture == null:
+		# clipping 遮罩(下面挂着被遮的部件)本来就不画,只用它的形状
+		var is_mask := poly.get_child_count() > 0
+		if poly.texture == null and not is_mask:
 			report("%s:没有贴图" % root.get_path_to(poly))
+		if is_mask:
+			masks += 1
 		if poly.get_bone_count() == 0:
 			continue
 		skinned += 1
@@ -78,7 +83,7 @@ func verify(path: String) -> void:
 	var bone_count := 0
 	for s in skels:
 		bone_count += (s as Skeleton2D).get_bone_count()
-	print("  Polygon2D %d 个(蒙皮 %d,骨骼引用 %d),Skeleton2D 骨骼 %d 根,动画 %d 条 / 轨道 %d 条" % [polys, skinned, bones_total, bone_count, animations, tracks])
+	print("  Polygon2D %d 个(蒙皮 %d,骨骼引用 %d,遮罩 %d),Skeleton2D 骨骼 %d 根,动画 %d 条 / 轨道 %d 条" % [polys, skinned, bones_total, masks, bone_count, animations, tracks])
 	root.queue_free()
 
 ## 要等进了场景树才能查 Skeleton2D(骨骼是进树时才登记的),所以放到第一帧做

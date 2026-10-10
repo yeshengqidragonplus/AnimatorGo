@@ -105,14 +105,19 @@ function findUnityProject(outDir: string): string | null {
 }
 
 /**
- * 带脚本模式的运行时脚本,随产物拷进工程**一次**(放在输出目录下 AnimatorGoRuntime/,
- * 不放每个骨架目录 —— 同一个类出现两次就编译不过)。`.cs.meta` 带固定 GUID,prefab 靠它认组件。
+ * 共用的运行时文件(带脚本模式的 AnimatorGoSkins.cs、被遮罩遮住的 SkinnedMeshRenderer 用的着色器),随产物拷进工程
+ * **一次**(放在输出目录下 AnimatorGoRuntime/,不放每个骨架目录 —— 同一个类出现两次就编译不过,同一个 GUID 出现两次
+ * Unity 会改掉一个)。`.meta` 带固定 GUID,prefab / 材质靠它认。内容没变就不碰
  */
-function installRuntime(outDir: string): string {
+function installRuntime(outDir: string, names: readonly string[]): string {
   const src = fileURLToPath(new URL('../../tools/unity/runtime/', import.meta.url))
   const dir = join(outDir, 'AnimatorGoRuntime')
   mkdirSync(dir, { recursive: true })
-  for (const file of ['AnimatorGoSkins.cs', 'AnimatorGoSkins.cs.meta']) copyFileSync(join(src, file), join(dir, file))
+  for (const file of names.flatMap((n) => [n, `${n}.meta`])) {
+    const target = join(dir, file)
+    if (existsSync(target) && readFileSync(target).equals(readFileSync(join(src, file)))) continue
+    copyFileSync(join(src, file), target)
+  }
   return dir
 }
 
@@ -241,8 +246,9 @@ function main(): void {
   const projectRoot = findUnityProject(parsed.out)
   if (parsed.skins === 'script') {
     if (parsed.dryRun) console.log('皮肤:带脚本模式(试运行,不拷运行时脚本)')
-    else console.log(`皮肤:带脚本模式,运行时脚本已放到 ${installRuntime(parsed.out)}(游戏启动时接 AnimatorGoSkins.LoadAsset)`)
+    else console.log(`皮肤:带脚本模式,运行时脚本已放到 ${installRuntime(parsed.out, ['AnimatorGoSkins.cs'])}(游戏启动时接 AnimatorGoSkins.LoadAsset)`)
   }
+  const installed = new Set<string>()
 
   for (const file of files) {
     const base = stemOf(file)
@@ -295,6 +301,11 @@ function main(): void {
         }
         if (rewritten < result.files.length) {
           console.log(`    → ${result.files.length} 个文件,${rewritten} 个有变化已写入,其余内容相同未动`)
+        }
+        const missing = result.runtime.filter((r) => !installed.has(r))
+        if (missing.length > 0) {
+          console.log(`    ℹ ${missing.join('、')} 已放到 ${installRuntime(parsed.out, missing)}`)
+          for (const r of missing) installed.add(r)
         }
       }
 

@@ -60,18 +60,15 @@ func frame_camera() -> void:
 	var hi := Vector2(-INF, -INF)
 	for node in scene.find_children("*", "Polygon2D", true, false):
 		var poly := node as Polygon2D
-		if not poly.is_visible_in_tree() or poly.get_bone_count() > 0:
+		# clipping 遮罩(下面挂着被遮的部件)不画,不算
+		if not poly.is_visible_in_tree() or poly.get_child_count() > 0:
 			continue
+		# 蒙皮网格的 polygon 在绑定空间,就是 setup 姿势下的位置(rest = setup);不蒙皮的在节点局部
 		var xf := poly.get_global_transform()
 		for p in poly.polygon:
 			var q: Vector2 = xf * p
 			lo = lo.min(q)
 			hi = hi.max(q)
-	# 蒙皮网格的顶点不好直接取,用骨骼位置代表它们的范围
-	for node in scene.find_children("*", "Bone2D", true, false):
-		var gp: Vector2 = (node as Bone2D).global_position
-		lo = lo.min(gp)
-		hi = hi.max(gp)
 	var cam := Camera2D.new()
 	cam.position = (lo + hi) / 2
 	var extent := maxf(hi.x - lo.x, hi.y - lo.y) * 1.6

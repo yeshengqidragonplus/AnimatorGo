@@ -199,8 +199,9 @@ public static class AnimatorGoRender
     /// 相机框住所有亮着的渲染器;给了 focus 就只框那个物体(放大看局部)
     static void Frame(Camera cam, GameObject root, string focus = null)
     {
+        // SpriteMask 也是 Renderer,但它不画东西(「不遮」的那个铺得很大,算进来相机就拉远了)
         Renderer[] renderers = root.GetComponentsInChildren<Renderer>(false)
-            .Where(r => r.enabled && r.gameObject.activeInHierarchy)
+            .Where(r => r.enabled && r.gameObject.activeInHierarchy && !(r is SpriteMask))
             .Where(r => string.IsNullOrEmpty(focus) || r.name == focus)
             .ToArray();
         if (renderers.Length == 0) return;
@@ -218,7 +219,7 @@ public static class AnimatorGoRender
     {
         var sb = new System.Text.StringBuilder();
         Renderer[] renderers = root.GetComponentsInChildren<Renderer>(false)
-            .Where(r => r.enabled && r.gameObject.activeInHierarchy)
+            .Where(r => r.enabled && r.gameObject.activeInHierarchy && !(r is SpriteMask))
             .OrderBy(r => r.sortingOrder)
             .ToArray();
         if (renderers.Length > 0)

@@ -209,6 +209,8 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
   const byPath = new Map<string, TransformNode>()
   for (const n of order) if (!byPath.has(n.path)) byPath.set(n.path, n)
   const renderer = (n: TransformNode) => n.components.find((c) => c.type === 'SpriteRenderer' || c.type === 'SkinnedMeshRenderer')
+  /** SpriteMask(我们把 Spine 的 clipping 导成它):不是骨骼也不是部件,还没读 */
+  const isMask = (n: TransformNode) => n.components.some((c) => c.type === 'SpriteMask')
   const spriteSkin = (n: TransformNode) => n.components.find((c) => c.type === 'MonoBehaviour' && ref(c.data['m_Script']).guid === SPRITE_SKIN_SCRIPT_GUID)
   const parentOf = (n: TransformNode) => (n.parent === null ? undefined : nodes.get(n.parent))
   /** 自己和各级父物体(不含根物体),由内到外 */
@@ -279,9 +281,13 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
 
   // ── 骨骼 ──
   const isBone = (n: TransformNode) =>
-    n !== container &&
+    n !== container && !isMask(n) &&
     (renderer(n) === undefined || n.children.some((c) => nodes.has(c)) || transformDriven.has(n.path) || referencedAsBone.has(n.id))
   const boneNodes = order.filter(isBone)
+  const masks = order.filter(isMask)
+  if (masks.length > 0) {
+    issues.add('loss', 'SpriteMask', `${masks.length} 个 SpriteMask 遮罩没有读(Unity → Spine 的 clipping 还没做),被遮的部件按整张画`)
+  }
   const boneName = new Map<string, string>()
   const used = new Set<string>()
   const claim = (taken: Set<string>, wanted: string) => {
@@ -755,6 +761,8 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
         const perNode = blend.get(n.id) ?? new Map()
         blend.set(n.id, perNode)
         perNode.set(attribute.slice('blendShape.'.length), keys)
+      } else if (n !== undefined && isMask(n)) {
+        // 遮罩没读,上面整体报过
       } else {
         issues.add('loss', `${attribute}.${path || '(根物体)'}`, n === undefined ? '曲线指向的物体不存在,没转' : `属性 ${attribute} 的曲线没转`)
       }

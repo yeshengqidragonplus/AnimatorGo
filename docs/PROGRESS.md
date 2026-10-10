@@ -1,4 +1,4 @@
-# 开发进度与交接(2026-10-09)
+# 开发进度与交接(2026-10-10)
 
 ## 产品定位
 
@@ -114,7 +114,7 @@ Unity.exe -batchmode -quit -nographics -projectPath <工程>           -executeM
 | 95 | 每顶点 >4 根骨骼 | Unity 的 `BoneWeight` 硬限制 |
 | ~~38~~ | ~~网格在绑定姿势下就非刚性~~ | ✅ **已解**:这类网格也走 SkinnedMeshRenderer,Mesh 的绑定矩阵是任意 4×4 |
 | ~~29~~ | ~~加权网格之间缩放不一致~~ | ✅ **已解**:同上,Mesh 的顶点与 UV 各自独立 |
-| 22 | clipping 遮罩 | 无对应物 |
+| ~~22~~ | ~~clipping 遮罩~~ | ✅ **已解**(2026-10-10):Unity 走 SpriteMask、Godot 走 `clip_children`,见下文 |
 | 20 | 贝塞尔控制点贴端点 | 退化为线性 |
 | ~~16~~ | ~~逐帧绘制顺序~~ | ✅ **已解**(2026-09-10):挪过位的 slot 每条动画一条 `m_SortingOrder` 阶梯曲线,见 [UNITY-2D.md](UNITY-2D.md) 第 12 节 |
 | 9 | `transformMode` 非默认继承 | 无对应物 |
@@ -397,6 +397,23 @@ pnpm from-unity <Unity 产物目录> --to godot|json [--out 目录] [--ppu 100] 
 | 与原 Spine 粗检 | setup 在 Unity 导出自己的分流判据内 |
 | Unity YAML 解析器 | 3000 个真实 Unity 文件(45975 个对象)0 异常 |
 | Unity → Godot 渲染 | MX2_cat 与 Spine 直出 Godot 的渲染一致 |
+
+### ✅ clipping 遮罩(2026-10-10)
+
+MergeCooking2 里 22 个骨架用到,之前两个引擎都整个丢弃。范围 / 形状 / 开关的求值两边共用(`src/spine-convert/clipping.ts`)。
+
+- **Unity**:SpriteMask,形状是 sprite 的自定义网格(实测 SpriteMask 用导入 sprite 的网格)。SpriteMask 的形状、范围,渲染器的「只在遮罩里显示」
+  都**不能被动画驱动**(实测),所以每种形状一个 SpriteMask 物体、外加一个「不遮」的,`m_Enabled` 互斥地切。被遮的 SkinnedMeshRenderer
+  用自带的 `AnimatorGoMaskedMesh.shader`(URP 自带的着色器在 SRP Batcher 下遮不住它,实测)。细节见 [UNITY-2D.md](UNITY-2D.md) 第 17 节
+- **Godot**:`clip_children` 的 Polygon2D,被遮的部件挂在它下面(子节点 z 必须和遮罩相同,实测)。见 [GODOT.md](GODOT.md) 第 12 节
+- 两边的端到端测试都逐时刻核对遮罩形状和开关;两个引擎里渲染出来同一时刻逐帧一致。MC2 535 个骨架两边全部导出成功
+
+⚠️ 做的过程中查出的 Godot 导出问题(之前就有,不是遮罩引起的):
+
+- **同一属性的轨道类型在各动画里不一致**(有的值轨道、有的贝塞尔),Godot 里没碰这个属性的动画回不到 RESET,读出 0 ——
+  Stage_rewards 的 5 号宝箱整个缩成一个点。修之前 MC2 有 504 个骨架混着、396 个有动画要回落到 RESET。已修(统一写成贝塞尔)并加了用例。
+  端到端测试一直没抓到:它按我们理解的 Godot 规则求值,而这条规则是 Godot 自己的缓存行为
+- **multiply 混合在 Godot 里透明处变黑**(Easter_card 兔子的影子是黑框;MC2 13 个骨架 / 17 个 slot)。还没修
 
 ### ⚠️ 两个渲染工具都画错过(2026-10-09 修)
 

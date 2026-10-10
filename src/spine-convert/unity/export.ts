@@ -24,7 +24,9 @@ import { writeNativeMeta, writePrefabMeta, writeTextureMeta, type MetaBone, type
 import { unityGuid, internalId, uniqueIds } from '../../unity/ids.ts'
 import { encodePng, type Image } from '../../unity/png.ts'
 import { writeMesh, MESH_FILE_ID, type BlendShape, type BoneInfluence, type MeshVertex } from '../../unity/writeMesh.ts'
-import { writeSpriteMaterial, MATERIAL_FILE_ID, TEXTURE_FILE_ID } from '../../unity/writeMaterial.ts'
+import { writeSpriteMaterial, MASKED_MESH_SHADER_FILE, MATERIAL_FILE_ID, TEXTURE_FILE_ID } from '../../unity/writeMaterial.ts'
+import { attachmentVertices } from '../../spine-eval/vertices.ts'
+import { clipDeformOf, clipGroups, clipOnSteps, clipPolygonAt, clipToggled, triangulatePolygon, type ClipGroup, type Point } from '../clipping.ts'
 import { skinWeightsLabel, UNLIMITED_SKIN_WEIGHTS, type QualityLevel } from '../../unity/qualitySettings.ts'
 import { bindSlots, compactSlots, truncateVertex, type BoundMesh, type PosePair } from '../skinSlots.ts'
 import { toAbsoluteBezier } from '../../spine-format/bezier.ts'
@@ -78,7 +80,6 @@ import { sequenceCycle, sequenceFrameAt, sequenceRegionName, sequenceSteps, type
  *
  * - path / transform 约束、IK(也没有烘进曲线)
  * - 两色染色(dark color)
- * - clipping 遮罩
  *
  * 逐帧绘制顺序(drawOrder)→ 挪过位的 slot 每条动画一条 `m_SortingOrder` 阶梯曲线。
  * 皮肤 → 全部导进一个 prefab,Animator 皮肤层切。linkedmesh → 导出前展开成独立网格(linkedMesh.ts)。
@@ -138,6 +139,11 @@ export interface UnityFile {
 export interface UnityExportResult {
   readonly files: readonly UnityFile[]
   readonly issues: readonly ConversionIssue[]
+  /**
+   * 产物用到的共用文件(`tools/unity/runtime/` 下的文件名,连同 `.meta`),要拷进工程的 `AnimatorGoRuntime/` 一次。
+   * 现在只有被遮罩遮住的 SkinnedMeshRenderer 用的着色器
+   */
+  readonly runtime: readonly string[]
 }
 
 /** Spine 打包的 0xRRGGBBAA → 0..1 */
@@ -545,7 +551,7 @@ export function exportToUnity(
         } else if (attachment.type === 'linkedmesh') {
           // 能展开的都已变成 mesh;剩下的是父网格找不到的,resolveLinkedMeshes 已报过 loss
         } else if (attachment.type === 'clipping') {
-          issues.loss(`attachment.${attachment.key}`, 'Unity 没有 clipping 遮罩的对应物,已丢弃')
+          // 遮罩在 prefab 节点之前统一处理(clipGroups)
         } else if (attachment.type === 'path' || attachment.type === 'boundingbox' || attachment.type === 'point') {
           issues.add('info', `attachment.${attachment.key}`, `${attachment.type} 不参与渲染,已跳过`)
         }
@@ -987,6 +993,75 @@ export function exportToUnity(
     })
   }
 
+  // ── 3½. clipping 遮罩 → SpriteMask ──
+  //
+  // 遮罩的形状是 sprite 的网格:一张 16×16 的白图,每种形状一个 sprite,顶点就是多边形(导入的 sprite 自带的自定义网格,
+  // 实测 SpriteMask 用它;运行时 OverrideGeometry 的不用)。同一个遮罩的各种形状归一到同一个包围盒里,节点变换都一样。
+  // ⚠️ 实测:SpriteMask 的 m_Sprite、排序范围,渲染器的 m_MaskInteraction 都**不能被动画驱动**,能动的只有 m_Enabled ——
+  //   - deform:每种形状一个 SpriteMask 物体,m_Enabled 互斥地切。关键帧之间插值的按 30 fps 逐帧取形状
+  //   - 开关:Spine 里遮罩没挂着时范围里的部件照常画,而渲染器的「只在遮罩里显示」改不了 —— 换成一个铺满的「不遮」遮罩
+  const clips = clipGroups(part, issues)
+  const CLIP_RECT = 16
+  interface MaskBuild {
+    readonly group: ClipGroup
+    readonly base: string
+    /** 各种形状,骨骼局部坐标(Spine 坐标) */
+    readonly shapes: Point[][]
+    /** 每条动画里形状的阶梯:时刻 → 形状下标(没有 deform 的动画不在里面) */
+    readonly shapeSteps: Map<string, { t: number; shape: number }[]>
+    readonly min: Point
+    readonly size: Point
+    /** prefab 节点:各形状一个,最后是「不遮」的 */
+    readonly nodes: number[]
+  }
+  const maskBuilds: MaskBuild[] = []
+  const shapeOf = (shapes: Point[][], poly: Point[]): number => {
+    const found = shapes.findIndex((s) => s.every((p, i) => Math.abs(p.x - poly[i]!.x) < 0.01 && Math.abs(p.y - poly[i]!.y) < 0.01))
+    if (found >= 0) return found
+    shapes.push(poly)
+    return shapes.length - 1
+  }
+  for (const g of clips) {
+    const slot = part.slots[g.slot]!
+    const path = `clipping.${slot.name}/${g.key}`
+    const shapes: Point[][] = [[...g.polygon]]
+    const shapeSteps = new Map<string, { t: number; shape: number }[]>()
+    let sampled = false
+    for (const anim of part.animations) {
+      const frames = clipDeformOf(part, g, lastPerProperty(anim.timelines).kept)
+      if (frames === undefined || frames.length === 0) continue
+      const keyTimes = frames.map((f) => Number(f['time'] ?? 0))
+      const times = new Set<number>([0, ...keyTimes])
+      frames.slice(0, -1).forEach((f, i) => {
+        if (f['curve'] === 'stepped') return
+        const a = clipPolygonAt(part, g, frames, keyTimes[i]!), b = clipPolygonAt(part, g, frames, keyTimes[i + 1]! - 1e-6)
+        if (a.every((p, j) => Math.hypot(p.x - b[j]!.x, p.y - b[j]!.y) < 0.01)) return
+        sampled = true
+        for (let t = keyTimes[i]! + 1 / 30; t < keyTimes[i + 1]! - 1e-6; t += 1 / 30) times.add(Number(t.toFixed(6)))
+      })
+      shapeSteps.set(anim.name, [...times].sort((x, y) => x - y).map((t) => ({ t, shape: shapeOf(shapes, clipPolygonAt(part, g, frames, t)) })))
+    }
+    const xs = shapes.flat().map((p) => p.x), ys = shapes.flat().map((p) => p.y)
+    const min = { x: Math.min(...xs), y: Math.min(...ys) }
+    const size = { x: Math.max(...xs) - min.x, y: Math.max(...ys) - min.y }
+    if (size.x < 1e-6 || size.y < 1e-6) {
+      issues.loss(path, '遮罩多边形面积为 0,没有转(范围里的部件照常画)')
+      continue
+    }
+    if (sampled) issues.add('approximated', path, '遮罩形状在关键帧之间插值,SpriteMask 的形状不能插值 —— 按 30 fps 逐帧换一种形状(每种一个 SpriteMask 物体)')
+    const base = sanitize(g.key === slot.name ? slot.name : `${slot.name}__${g.key}`)
+    maskBuilds.push({ group: g, base, shapes, shapeSteps, min, size, nodes: [] })
+  }
+  /** 被遮的 slot → 它的遮罩 */
+  const maskOfSlot = new Map<number, MaskBuild>()
+  for (const b of maskBuilds) for (const s of b.group.clipped) maskOfSlot.set(s, b)
+  // 被遮的 SkinnedMeshRenderer 要用自带的着色器(只有 URP 的),材质按图集页另写一份
+  const maskedMeshes = options.renderPipeline === 'urp'
+  const maskedPages = new Set<number>()
+  const maskedMaterialGuids = pageNames.map((p) => unityGuid(`${name}/material-clip/${p}`))
+  const maskTextureGuid = unityGuid(`${name}/texture/clip`)
+  const maskSpriteId = (b: number, k: number) => internalId(`${name}/clip/${b}/${k}`)
+
   // ── 4. prefab 节点 ──
   const nodes: PrefabNode[] = [
     {
@@ -1042,6 +1117,8 @@ export function exportToUnity(
       const geo = skinnedByItem.get(item)!
       item.node = nodes.length
       geo.nodeIndex = item.node
+      const masked = maskOfSlot.has(item.slot) && maskedMeshes
+      if (masked) maskedPages.add(info.page)
       nodes.push({
         name: claimName(0, attachmentNodeName(item, slot.name)),
         parent: 0,
@@ -1055,7 +1132,7 @@ export function exportToUnity(
         skinnedMesh: {
           mesh: { fileID: MESH_FILE_ID, guid: meshGuidOf(item.spriteName) },
           // 带脚本模式下换装件不硬引用材质(材质引用着贴图),由 AnimatorGoSkins 切到时装上
-          material: scriptMode && !isDefaultSkin(item.skin) ? null : { fileID: MATERIAL_FILE_ID, guid: materialGuids[info.page]! },
+          material: scriptMode && !isDefaultSkin(item.skin) ? null : { fileID: MATERIAL_FILE_ID, guid: (masked ? maskedMaterialGuids : materialGuids)[info.page]! },
           // 换图那一维:setup pose 只亮 attachmentName 那一个(序列帧只亮 setup 帧)
           enabled: enabledAtSetup(item),
           bones: geo.slots.map((s) => boneNode[s.bone]!),
@@ -1063,6 +1140,7 @@ export function exportToUnity(
           blendShapeCount: 0, // 动画转完再补
           sortingOrder: item.slot,
           quality: skinQuality,
+          ...(masked ? { maskInteraction: 1 as const } : {}),
         },
       })
       continue
@@ -1077,6 +1155,7 @@ export function exportToUnity(
       color,
       // 换图那一维:setup pose 只亮 attachmentName 那一个;表情变体初始是灭的;序列帧只亮 setup 帧
       enabled: enabledAtSetup(item),
+      ...(maskOfSlot.has(item.slot) ? { maskInteraction: 1 as const } : {}),
     }
 
     let parent: number
@@ -1139,6 +1218,78 @@ export function exportToUnity(
       // 皮肤那一维:属于初始皮肤才亮。换图那一维在 renderer.enabled 上
       active: visibleUnderSkin(item, initialSkin),
     })
+  }
+
+  // 遮罩节点:挂在遮罩 slot 的骨骼下,包围盒的左下角 + 包围盒大小(sprite 是 1×1 单位,见 CLIP_RECT);
+  // 「不遮」的挂在根下(放在骨骼下的话骨骼缩放到 0 时它也没了),盖住被遮的部件在 setup 和全部动画里画到的范围再放大
+  // 1.5 倍 —— 不用一个大到离谱的方块:编辑器里「聚焦」会被它拉到极远
+  const reachOf = (g: ClipGroup): { center: Point; size: Point } => {
+    const lo = { x: Infinity, y: Infinity }, hi = { x: -Infinity, y: -Infinity }
+    const items = used.filter((u) => g.clipped.includes(u.slot))
+    const eat = (pose: readonly Affine[], anim: AnimationData | null, t: number) => {
+      for (const u of items) {
+        let vs: { x: number; y: number }[]
+        try { vs = attachmentVertices(part, atlas, u.attachment, u.skin, u.slot, pose, anim, t) } catch { continue }
+        for (const p of vs) { lo.x = Math.min(lo.x, p.x); lo.y = Math.min(lo.y, p.y); hi.x = Math.max(hi.x, p.x); hi.y = Math.max(hi.y, p.y) }
+      }
+    }
+    eat(setupSpine, null, 0)
+    for (const anim of part.animations) {
+      const kept = { ...anim, timelines: lastPerProperty(anim.timelines).kept }
+      for (const t of sampleTimesOf(anim)) eat(poseAt(part, kept, t), kept, t)
+    }
+    if (!Number.isFinite(lo.x)) return { center: { x: 0, y: 0 }, size: { x: 1e4, y: 1e4 } }
+    const pad = Math.max(hi.x - lo.x, hi.y - lo.y) * 0.25 + 10
+    return { center: { x: (lo.x + hi.x) / 2, y: (lo.y + hi.y) / 2 }, size: { x: hi.x - lo.x + 2 * pad, y: hi.y - lo.y + 2 * pad } }
+  }
+  maskBuilds.forEach((b, bi) => {
+    const g = b.group
+    const slot = part.slots[g.slot]!
+    const on = clipOnSteps(part, g, null)[0]!.on
+    const range = { back: g.slot, front: g.clipped[g.clipped.length - 1]!, sortingOrder: g.slot }
+    b.shapes.forEach((_, k) => {
+      const parent = boneNode[slot.bone]!
+      b.nodes.push(nodes.length)
+      nodes.push({
+        name: claimName(parent, k === 0 ? b.base : `${b.base} #${k}`),
+        parent,
+        position: { x: b.min.x * scale, y: b.min.y * scale, z: 0 },
+        rotation: { x: 0, y: 0, z: 0, w: 1 },
+        scale: { x: b.size.x * scale, y: b.size.y * scale, z: 1 },
+        renderer: null,
+        skin: null,
+        mask: { sprite: { fileID: maskSpriteId(bi, k), guid: maskTextureGuid }, ...range, enabled: on && k === 0 },
+      })
+    })
+    const reach = reachOf(g)
+    b.nodes.push(nodes.length)
+    nodes.push({
+      name: claimName(0, `${b.base} (off)`),
+      parent: 0,
+      position: { x: reach.center.x * scale, y: reach.center.y * scale, z: 0 },
+      rotation: { x: 0, y: 0, z: 0, w: 1 },
+      scale: { x: reach.size.x * scale, y: reach.size.y * scale, z: 1 },
+      renderer: null,
+      skin: null,
+      mask: { sprite: { fileID: maskSpriteId(bi, -1), guid: maskTextureGuid }, ...range, enabled: !on },
+    })
+    const smr = used.filter((u) => g.clipped.includes(u.slot) && sprites.get(u.spriteName)?.skinned === true).length
+    issues.add('info', `clipping.${slot.name}/${g.key}`, `遮罩 → SpriteMask(${b.shapes.length} 种形状),${g.clipped.length} 个 slot 的部件只在遮罩里显示` +
+      (smr > 0 && maskedMeshes ? `;其中 ${smr} 个走 SkinnedMeshRenderer 的换成 AnimatorGoMaskedMesh 着色器(拷进 AnimatorGoRuntime/)` : ''))
+    if (smr > 0 && !maskedMeshes) issues.add('approximated', `clipping.${slot.name}/${g.key}`, `内置管线下 ${smr} 个走 SkinnedMeshRenderer 的部件不受遮罩影响(遮罩用的着色器只有 URP 的)`)
+    // 范围按 setup 的排序值写死(排序范围不能被动画驱动,实测):绘制顺序动画挪动了遮罩或被遮的 slot,范围就对不上了 ——
+    // 被挪出范围的部件「只在遮罩里显示」又没有遮罩,整个不见
+    for (const anim of part.animations) {
+      const drawOrder = lastPerProperty(anim.timelines).kept.find((t) => t.kind === 'drawOrder')
+      const moved = drawOrder?.frames.some((f) => {
+        const layer = layerOfSlot(drawOrderOf(part.slots.length, (f['offsets'] as DrawOrderOffset[] | undefined) ?? []))
+        return [g.slot, ...g.clipped].some((s) => layer[s] !== s)
+      })
+      if (moved === true) issues.add('approximated', `${anim.name}.clipping.${slot.name}`, 'SpriteMask 的排序范围不能动画,这条动画挪动了遮罩范围里的 slot —— 被挪出范围的部件会整个不见')
+    }
+  })
+  if (maskBuilds.length > 0) {
+    issues.add('info', 'clipping', 'SpriteMask 按排序值生效、不分角色:同一 Sorting Layer 里放几个这样的实例时,遮罩会互相叠加(Sorting Group 隔不开,实测)。要隔开就给实例用不同的 Sorting Layer')
   }
 
   // 动画路径:相对根物体,不含根自己
@@ -1803,7 +1954,9 @@ export function exportToUnity(
           const geos = (skinnedByKey.get(`${skinNameOf(d.skin)}/${t.owner}/${d.attachment}`) ?? []).filter((g) => g.nodeIndex >= 0)
           if (geos.length === 0) {
             const type = attachmentTypeOf(skinNameOf(d.skin), t.owner, d.attachment)
-            if (type !== null && type !== 'mesh' && type !== 'linkedmesh') {
+            if (type === 'clipping') {
+              // 遮罩的形状变化在 SpriteMask 那边转(每种形状一个物体),见 maskBuilds
+            } else if (type !== null && type !== 'mesh' && type !== 'linkedmesh') {
               // 实测 MergeCooking2 的 wave:deform 打在 path 上(路径约束用),没有可渲染的东西
               issues.add('info', `deform[${t.owner}]`, `deform 指向的 "${d.attachment}" 是 ${type},不参与渲染,已跳过`)
             } else {
@@ -1868,6 +2021,31 @@ export function exportToUnity(
             })
           }
         }
+      }
+
+      // 遮罩:开关 + 换形状,都落在各个 SpriteMask 物体的 m_Enabled 上,同一时刻只亮一个
+      for (const b of maskBuilds) {
+        const steps = b.shapeSteps.get(anim.name)
+        if (!clipToggled(anim, b.group) && steps === undefined) continue
+        const onSteps = clipOnSteps(part, b.group, anim)
+        const shapeSteps = steps ?? [{ t: 0, shape: 0 }]
+        const at = <T,>(list: readonly { t: number }[], t: number, pick: (i: number) => T): T => {
+          let i = 0
+          for (let k = 0; k < list.length; k++) if (list[k]!.t <= t + 1e-9) i = k
+          return pick(i)
+        }
+        const times = [...new Set([...onSteps.map((s) => s.t), ...shapeSteps.map((s) => s.t)])].sort((x, y) => x - y)
+        const active = times.map((t) => (at(onSteps, t, (i) => onSteps[i]!.on) ? at(shapeSteps, t, (i) => shapeSteps[i]!.shape) : -1))
+        b.nodes.forEach((node, k) => {
+          const me = k === b.nodes.length - 1 ? -1 : k
+          const keys: UnityKeyframe[] = []
+          times.forEach((t, i) => {
+            const v = active[i] === me ? 1 : 0
+            if (keys.length > 0 && keys[keys.length - 1]!.value === v) return
+            keys.push(key(t, v, true))
+          })
+          floats.push({ path: paths[node]!, attribute: 'm_Enabled', classID: 331, keys })
+        })
       }
 
       writeSequenceCurves(anim, timelines, floats)
@@ -1942,6 +2120,49 @@ export function exportToUnity(
     })
     files.push({ path: `${pageName}.mat.meta`, content: writeNativeMeta(materialGuids[page]!, MATERIAL_FILE_ID) })
   }
+  // 遮罩贴图:16×16 全白,每种形状一个 sprite(网格 = 多边形,归一到包围盒里),外加一个整块的给「不遮」用
+  if (maskBuilds.length > 0) {
+    const sprites: MetaSprite[] = []
+    const unweighted = (n: number): MetaWeight[] => Array.from({ length: n }, () => ({ weights: [1, 0, 0, 0] as const, bones: [0, 0, 0, 0] as const }))
+    maskBuilds.forEach((b, bi) => {
+      b.shapes.forEach((shape, k) => {
+        sprites.push({
+          name: `${b.base}_${k}`,
+          rect: { x: 0, y: 0, width: CLIP_RECT, height: CLIP_RECT },
+          pivot: { x: 0, y: 0 },
+          spriteID: unityGuid(`${name}/clip-spriteid/${bi}/${k}`),
+          internalID: maskSpriteId(bi, k),
+          vertices: shape.map((p) => ({ x: ((p.x - b.min.x) / b.size.x) * CLIP_RECT, y: ((p.y - b.min.y) / b.size.y) * CLIP_RECT })),
+          triangles: triangulatePolygon(shape),
+          bones: [],
+          weights: unweighted(shape.length),
+        })
+      })
+      sprites.push({
+        name: `${b.base}_off`,
+        rect: { x: 0, y: 0, width: CLIP_RECT, height: CLIP_RECT },
+        pivot: { x: 0.5, y: 0.5 },
+        spriteID: unityGuid(`${name}/clip-spriteid/${bi}/off`),
+        internalID: maskSpriteId(bi, -1),
+        vertices: [{ x: 0, y: 0 }, { x: CLIP_RECT, y: 0 }, { x: CLIP_RECT, y: CLIP_RECT }, { x: 0, y: CLIP_RECT }],
+        triangles: [0, 1, 2, 0, 2, 3],
+        bones: [],
+        weights: unweighted(4),
+      })
+    })
+    const white = { width: CLIP_RECT, height: CLIP_RECT, data: new Uint8Array(CLIP_RECT * CLIP_RECT * 4).fill(255) }
+    files.push({ path: `${name}@clip.png`, content: options.skipImages === true ? '' : encodePng(white) })
+    files.push({ path: `${name}@clip.png.meta`, content: writeTextureMeta({ guid: maskTextureGuid, pixelsPerUnit: CLIP_RECT, sprites }) })
+  }
+  for (const page of maskedPages) {
+    const pageName = pageNames[page]!
+    files.push({
+      path: `${pageName}@clip.mat`,
+      content: writeSpriteMaterial({ name: `${pageName}@clip`, renderPipeline: options.renderPipeline, texture: { fileID: TEXTURE_FILE_ID, guid: textureGuids[page]! }, masked: true }),
+    })
+    files.push({ path: `${pageName}@clip.mat.meta`, content: writeNativeMeta(maskedMaterialGuids[page]!, MATERIAL_FILE_ID) })
+  }
+
   if (skinned.length > 0) {
     const shapes = skinned.reduce((n, g) => n + g.shapes.length, 0)
     issues.add(
@@ -2064,7 +2285,7 @@ export function exportToUnity(
     files.push({ path: `${name}.controller.meta`, content: writeNativeMeta(controllerGuid, 9100000) })
   }
 
-  return { files, issues: issues.all }
+  return { files, issues: issues.all, runtime: maskedPages.size > 0 ? [MASKED_MESH_SHADER_FILE] : [] }
 }
 
 /**

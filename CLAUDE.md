@@ -102,6 +102,11 @@ deform 变成 Blend Shape。绑完又改过顶点的网格,**同一根骨骼在 
 渲染器写 Bone4 也盖不过(实测;SpriteSkin 不受影响),工程各档要设成 Four Bones —— 导出时从输出目录往上找
 `ProjectSettings/QualitySettings.asset` 逐档查,截到就报。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 11 节。
 
+**clipping 遮罩 → SpriteMask**:形状是导入 sprite 的自定义网格,被遮的渲染器「只在遮罩里显示」。⚠️ SpriteMask 的形状 / 范围、渲染器的
+`m_MaskInteraction` 都**不能被动画驱动**(实测),所以每种形状一个 SpriteMask 物体 + 一个「不遮」的,`m_Enabled` 互斥地切;被遮的
+SkinnedMeshRenderer 要用自带的 `AnimatorGoMaskedMesh.shader`(URP 自带的在 SRP Batcher 下遮不住它),CLI 拷进 `AnimatorGoRuntime/`。
+范围按排序值生效、Sorting Group 隔不开(实测)。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 17 节。
+
 导出到 Godot 4(Godot 4.7 原生节点 + AnimationPlayer,零运行时脚本):
 
 ```bash
@@ -111,8 +116,9 @@ pnpm godot <骨架文件或目录> [--out 目录] [--atlas 图集] [--skin 初�
 ⚠️ **Godot 2D 的绑定姿势是 `Bone2D.rest`,每根骨骼一个、全场景共用**(Unity 是每个 sprite / Mesh 一套)。
 不在 setup 下绑的网格靠辅助子骨骼表达;绑完又改过顶点的网格,同一根骨骼下挂多根辅助子骨骼、每个影响原样表达(与 Unity 共用
 `spine-convert/skinSlots.ts`)。⚠️ Polygon2D 每顶点只用权重最大的 4 根(源码写死),超过的挑留哪 4 根并拟合坐标。
-**离散轨道要 `callback_mode_discrete = 2`、换动画回 setup 要 `deterministic` + RESET、节点名不能含 `@`** ——
-三条都是探针实测出来的,不看实测一定写错。详见 [docs/GODOT.md](docs/GODOT.md)。
+**离散轨道要 `callback_mode_discrete = 2`、换动画回 setup 要 `deterministic` + RESET、节点名不能含 `@`、同一属性在所有动画(含 RESET)里
+轨道类型要一致(值 / 贝塞尔混着的话回不到 RESET,读出 0)** —— 都是实测出来的,不看实测一定写错。clipping 遮罩 → `clip_children` 的
+Polygon2D,被遮的挂在它下面,⚠️ 子节点 z 必须和遮罩相同才会被裁。详见 [docs/GODOT.md](docs/GODOT.md)。
 
 Godot 侧的验证:`tools/godot/` 的探针 / 自检 / 渲染脚本拷进一个 Godot 工程根,本机 Godot 在
 `E:/Tools/Godot_v4.7.2-stable_win64/Godot_v4.7.2-stable_win64_console.exe`(`--import` 先导入贴图;

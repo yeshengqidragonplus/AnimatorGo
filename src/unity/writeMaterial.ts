@@ -16,6 +16,14 @@ export const MATERIAL_FILE_ID = 2100000
 /** Texture2D 主对象的 fileID(classID 28 × 100000) */
 export const TEXTURE_FILE_ID = 2800000
 
+/**
+ * 被 clipping 遮罩遮住的 SkinnedMeshRenderer 用的着色器(`tools/unity/runtime/AnimatorGoMaskedMesh.shader`,
+ * 随产物拷进 `AnimatorGoRuntime/` 一次)。GUID 写死在它的 `.shader.meta` 里 —— 改了这里就得同步改那个 meta。
+ * 只有 URP 的(自带的 Sprite-Unlit-Default 兼容 SRP Batcher,遮罩对 SkinnedMeshRenderer 不生效,见那个文件头)
+ */
+export const MASKED_MESH_SHADER_GUID = '8d2c6a1e4b7f49a3a5e0c9b8d7f6e1a2'
+export const MASKED_MESH_SHADER_FILE = 'AnimatorGoMaskedMesh.shader'
+
 const SHADERS: Record<RenderPipeline, string> = {
   urp: '{fileID: 4800000, guid: 13c02b14c4d048fa9653293d54f6e0e1, type: 3}',
   builtin: '{fileID: 10753, guid: 0000000000000000f000000000000000, type: 0}',
@@ -26,6 +34,8 @@ export interface SpriteMaterialOptions {
   readonly renderPipeline: RenderPipeline
   /** 图集页的纹理(fileID 取 TEXTURE_FILE_ID) */
   readonly texture: AssetRef
+  /** 用 AnimatorGoMaskedMesh 着色器(被遮罩遮住的 SkinnedMeshRenderer;只有 URP) */
+  readonly masked?: boolean
 }
 
 export function writeSpriteMaterial(options: SpriteMaterialOptions): string {
@@ -49,7 +59,7 @@ export function writeSpriteMaterial(options: SpriteMaterialOptions): string {
     '  m_PrefabInstance: {fileID: 0}',
     '  m_PrefabAsset: {fileID: 0}',
     `  m_Name: ${options.name}`,
-    `  m_Shader: ${SHADERS[options.renderPipeline]}`,
+    `  m_Shader: ${options.masked === true ? `{fileID: 4800000, guid: ${MASKED_MESH_SHADER_GUID}, type: 3}` : SHADERS[options.renderPipeline]}`,
     '  m_ShaderKeywords: ETC1_EXTERNAL_ALPHA',
     '  m_LightmapFlags: 4',
     '  m_EnableInstancingVariants: 0',

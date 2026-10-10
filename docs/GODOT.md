@@ -33,6 +33,8 @@ godot --path <工程> --script res://AnimatorGoProbeSkin.gd
 | `self_modulate` / `rotation` 值轨道 | 线性插值 |
 | 同一时刻两个键 | ⚠️ **恰好在那一刻取第一个**(0 秒写 [setup, 第一帧] 两个键,`seek(0)` 时两张图一起亮,每次循环回到起点也是)。写出时同一时刻(7 位有效数字)只留最后一个键 |
 | ⚠️ 每顶点最多几根骨骼 | **4 根**(`scene/2d/polygon_2d.cpp` 写死 4 个槽:按 `bones` 数组的顺序逐个插入,只留权重最大的 4 个,权重相同时先来的优先,再归一)。之前导出没管,一声不响地被截掉 —— 见第 6 节 |
+| ⚠️ 同一属性的轨道类型 | **所有动画(含 RESET)里必须是同一种**(都值轨道或都贝塞尔轨道)。混着的话,没碰这个属性的动画回不到 RESET,读出 0 —— Stage_rewards 的 `b_box` 骨骼在 `5_open2` 里是贝塞尔、RESET 里是值轨道,别的动画里它缩成一个点,整个宝箱不见。现在某条动画用了贝塞尔的属性,其他动画和 RESET 里也写成贝塞尔(直线段控制柄放三分点,值不变)。修之前 MC2 有 504 个骨架混着、396 个有动画要回落到 RESET(是否显形取决于 Godot 内部建缓存的顺序) |
+| ⚠️ `clip_children` | 子节点的 `z_index` **必须和遮罩相同**(相对 0)才会被裁 —— 写了别的 z 就画在裁剪之外。遮罩可以是蒙皮的 Polygon2D,子节点也可以是蒙皮的 |
 | 节点名 | ⚠️ **不能含 `@`**(以及 `.` `:` `/` `"` `%`)—— 探针里 `a@mesh` 被改名,骨骼路径对不上,网格直接不画。Unity 导出那套 `@皮肤名` 命名不能照搬 |
 
 ## 2. `.tscn` 的写法(取自 Godot 自己写出的文件)
@@ -221,5 +223,25 @@ MergeCooking2 的 7 个本地样本存在才跑(加权 deform、全靠 deform、
 ## 11. 转不过去的(都会报出来)
 
 - IK / transform / path 约束 —— 没转,受约束的骨骼停在自己的关键帧上(与 Unity 导出一致)
-- clipping 遮罩、Spine 事件、两色染色的暗色、非默认继承模式、screen 混合
+- Spine 事件、两色染色的暗色、非默认继承模式、screen 混合
+- ⚠️ multiply 混合:`CanvasItemMaterial` 的 MUL 不看透明度,透明的地方乘成黑色(Easter_card 的影子是黑框,MC2 13 个骨架 / 17 个 slot)。**还没修**
+- clipping:绘制顺序动画改了遮罩的范围、两个遮罩范围重叠、加权的遮罩多边形 —— 都报 approximated(第 12 节)
 - 每顶点超过 4 根骨骼:Godot 只用 4 根。挑留哪 4 根、拟合坐标后仍超 0.5 像素的报 approximated(第 6 节)
+
+## 12. clipping 遮罩 → `clip_children`(2026-10-10)
+
+规则与 Unity 导出共用(`src/spine-convert/clipping.ts`,UNITY-2D.md 第 17 节)。
+
+- 遮罩 = 场景根下一个 Polygon2D(`<slot>__<键名>`),蒙皮到遮罩 slot 的骨骼、权重 1,`clip_children = 1`(只当遮罩用)。
+  多边形在骨骼局部,乘上骨骼的 rest 换到绑定空间 —— 遮罩的 deform 直接对它的 `polygon` 打关键帧,不用反解
+- 被遮的部件挂在遮罩下面。⚠️ 实测子节点的 `z_index` 必须和遮罩相同才会被裁,所以被遮的都**不写 z_index**,先后靠节点顺序(按 slot 排);
+  原来挂在骨骼下的刚性部件(region、不加权网格)改成蒙皮到同一根骨骼、权重 1,几何完全等价
+- 开关:Spine 里遮罩没挂着时部件照常画,而藏起遮罩节点会连子节点一起藏 —— 改成切 `clip_children`(1 / 0)和遮罩自己的
+  `self_modulate`(关的时候透明)。遮罩 slot 被绘制顺序动画挪过位的,遮罩的 `z_index` 跟着挪
+- 范围按 setup 的绘制顺序定;绘制顺序动画改了范围(或范围里的先后)、两个遮罩范围重叠、加权的遮罩多边形,都报 approximated
+
+验证:端到端测试加了 Easter_card(deform + 开关、46 个 slot)、clown_npc(两个遮罩)、Stage_rewards(setup 里关着、每条动画换形状),
+逐时刻核对遮罩在世界里的多边形和开关与 Spine 一致、被遮的都在遮罩下面且没写 z_index、节点顺序 = slot 顺序。Godot 4.7 自检通过
+(`AnimatorGoVerify.gd` 不再要求遮罩有贴图);渲染出来与不裁的旧版逐帧比,裁掉的正是框外那部分,与 Unity 同一时刻逐帧一致。
+MC2 全部 535 个骨架导出成功,没有遮罩相关的 loss。
+

@@ -19,6 +19,16 @@ export const CLASS_ANIMATOR = 95
 export const CLASS_MONO_BEHAVIOUR = 114
 export const CLASS_SPRITE_RENDERER = 212
 export const CLASS_SKINNED_MESH_RENDERER = 137
+export const CLASS_SPRITE_MASK = 331
+
+/**
+ * SpriteMask 的默认材质。URP 的随包发布(`Runtime/Materials/SpriteMask-Default.mat`,guid 跨工程稳定,取自 Unity 6000.3
+ * 存出来的 SpriteMask);内置管线的是内置资源 Sprites-Mask —— **这条没有实测**,验证工程是 URP 的
+ */
+export const SPRITE_MASK_MATERIALS = {
+  builtin: '{fileID: 10758, guid: 0000000000000000f000000000000000, type: 0}',
+  urp: '{fileID: 2100000, guid: 15d0c3709176029428a0da2f8cecf0b5, type: 2}',
+} as const
 
 /**
  * `SpriteSkin` 脚本的 GUID。
@@ -68,6 +78,23 @@ export interface RendererSpec {
    * `m_IsActive`(见 PrefabNode.active),两个开关是 AND,各由 Animator 的一层驱动。
    */
   readonly enabled?: boolean
+  /** 被 clipping 遮罩遮住:1 = 只在遮罩里显示(VisibleInsideMask)。不给就是 0。⚠️ 这个属性不能被动画驱动(实测) */
+  readonly maskInteraction?: 0 | 1
+}
+
+/**
+ * Spine 的 clipping 遮罩。形状是 sprite 的网格(导入的 sprite 自带的自定义网格,实测 SpriteMask 用它)。
+ * 只遮排序值在 (back, front] 之间的、`maskInteraction = 1` 的渲染器 —— ⚠️ 不分角色:同一 Sorting Layer 里别的物体
+ * 只要排序值落在范围里也会被它影响,Sorting Group 隔不开(实测)
+ */
+export interface SpriteMaskSpec {
+  readonly sprite: AssetRef
+  readonly back: number
+  readonly front: number
+  /** 遮罩自己的排序值(不影响范围,实测;取遮罩 slot 的,方便在 Inspector 里认) */
+  readonly sortingOrder: number
+  /** `m_Enabled`,能被动画驱动(形状 / 开关都靠它切) */
+  readonly enabled: boolean
 }
 
 /** 蒙皮网格才需要。骨骼下标指向 nodes 数组 */
@@ -94,6 +121,8 @@ export interface SkinnedMeshSpec {
   readonly sortingOrder: number
   /** 与 RendererSpec.enabled 同义:换图那一维的初始开关 */
   readonly enabled?: boolean
+  /** 与 RendererSpec.maskInteraction 同义;⚠️ 材质要用 AnimatorGoMaskedMesh 着色器才生效(实测) */
+  readonly maskInteraction?: 0 | 1
   /**
    * 每顶点用几根骨骼蒙皮。**4 = Bone4,写死,外观不随工程 Quality 档位变**(学 Spine);
    * 0 = Auto 跟随 Quality —— 真实工程的 Low/Medium/High 档往往只有 2 根,会比 SpriteSkin 还差。
@@ -113,6 +142,7 @@ export interface PrefabNode {
   readonly renderer: RendererSpec | null
   readonly skin: SkinSpec | null
   readonly skinnedMesh?: SkinnedMeshSpec | null
+  readonly mask?: SpriteMaskSpec | null
   /**
    * 物体初始是否激活(`m_IsActive`)。不给就是激活。
    *
@@ -171,6 +201,7 @@ interface Ids {
   readonly renderer: number
   readonly skin: number
   readonly skinnedMesh: number
+  readonly mask: number
   readonly animator: number
   readonly skins: number
 }
@@ -200,6 +231,7 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
       renderer: fileId(`${key}/sr`),
       skin: fileId(`${key}/sk`),
       skinnedMesh: fileId(`${key}/smr`),
+      mask: fileId(`${key}/mask`),
       animator: fileId(`${key}/an`),
       skins: fileId(`${key}/skins`),
     }
@@ -218,6 +250,7 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
     if (node.renderer !== null) components.push(`  - component: {fileID: ${id.renderer}}`)
     if (node.skin !== null) components.push(`  - component: {fileID: ${id.skin}}`)
     if (node.skinnedMesh) components.push(`  - component: {fileID: ${id.skinnedMesh}}`)
+    if (node.mask) components.push(`  - component: {fileID: ${id.mask}}`)
     if (i === 0 && options.controller !== null) components.push(`  - component: {fileID: ${id.animator}}`)
     if (i === 0 && options.skins) components.push(`  - component: {fileID: ${id.skins}}`)
 
@@ -302,7 +335,7 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
           '  m_SortingLayerID: 0',
           '  m_SortingLayer: 0',
           `  m_SortingOrder: ${r.sortingOrder}`,
-          '  m_MaskInteraction: 0',
+          `  m_MaskInteraction: ${r.maskInteraction ?? 0}`,
           `  m_Sprite: ${r.sprite === null ? '{fileID: 0}' : ref(r.sprite, 3)}`,
           `  m_Color: {r: ${num(r.color.r)}, g: ${num(r.color.g)}, b: ${num(r.color.b)}, a: ${num(r.color.a)}}`,
           '  m_FlipX: 0',
@@ -392,7 +425,7 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
           '  m_SortingLayerID: 0',
           '  m_SortingLayer: 0',
           `  m_SortingOrder: ${m.sortingOrder}`,
-          '  m_MaskInteraction: 0',
+          `  m_MaskInteraction: ${m.maskInteraction ?? 0}`,
           '  serializedVersion: 2',
           `  m_Quality: ${m.quality}`,
           '  m_UpdateWhenOffscreen: 0',
@@ -409,6 +442,71 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
           '    m_Center: {x: 0, y: 0, z: 0}',
           '    m_Extent: {x: 0, y: 0, z: 0}',
           '  m_DirtyAABB: 1',
+        ].join('\n'),
+      )
+    }
+
+    if (node.mask) {
+      const k = node.mask
+      // 字段取自 Unity 6000.3 存出来的 SpriteMask;阴影关掉与 SpriteRenderer 一致
+      docs.push(
+        [
+          `--- !u!${CLASS_SPRITE_MASK} &${id.mask}`,
+          'SpriteMask:',
+          ...COMMON_HEADER,
+          `  m_GameObject: {fileID: ${id.go}}`,
+          `  m_Enabled: ${k.enabled ? 1 : 0}`,
+          '  m_CastShadows: 0',
+          '  m_ReceiveShadows: 0',
+          '  m_DynamicOccludee: 1',
+          '  m_StaticShadowCaster: 0',
+          '  m_MotionVectors: 1',
+          '  m_LightProbeUsage: 1',
+          '  m_ReflectionProbeUsage: 1',
+          '  m_RayTracingMode: 0',
+          '  m_RayTraceProcedural: 0',
+          '  m_RayTracingAccelStructBuildFlagsOverride: 0',
+          '  m_RayTracingAccelStructBuildFlags: 1',
+          '  m_SmallMeshCulling: 1',
+          '  m_ForceMeshLod: -1',
+          '  m_MeshLodSelectionBias: 0',
+          '  m_RenderingLayerMask: 1',
+          '  m_RendererPriority: 0',
+          '  m_Materials:',
+          `  - ${SPRITE_MASK_MATERIALS[options.renderPipeline]}`,
+          '  m_StaticBatchInfo:',
+          '    firstSubMesh: 0',
+          '    subMeshCount: 0',
+          '  m_StaticBatchRoot: {fileID: 0}',
+          '  m_ProbeAnchor: {fileID: 0}',
+          '  m_LightProbeVolumeOverride: {fileID: 0}',
+          '  m_ScaleInLightmap: 1',
+          '  m_ReceiveGI: 1',
+          '  m_PreserveUVs: 0',
+          '  m_IgnoreNormalsForChartDetection: 0',
+          '  m_ImportantGI: 0',
+          '  m_StitchLightmapSeams: 1',
+          '  m_SelectedEditorRenderState: 3',
+          '  m_MinimumChartSize: 4',
+          '  m_AutoUVMaxDistance: 0.5',
+          '  m_AutoUVMaxAngle: 89',
+          '  m_LightmapParameters: {fileID: 0}',
+          '  m_GlobalIlluminationMeshLod: 0',
+          '  m_SortingLayerID: 0',
+          '  m_SortingLayer: 0',
+          `  m_SortingOrder: ${k.sortingOrder}`,
+          '  m_MaskInteraction: 0',
+          `  m_Sprite: ${ref(k.sprite, 3)}`,
+          '  m_MaskAlphaCutoff: 0.2',
+          '  m_FrontSortingLayerID: 0',
+          '  m_BackSortingLayerID: 0',
+          '  m_FrontSortingLayer: 0',
+          '  m_BackSortingLayer: 0',
+          `  m_FrontSortingOrder: ${k.front}`,
+          `  m_BackSortingOrder: ${k.back}`,
+          '  m_IsCustomRangeActive: 1',
+          '  m_SpriteSortPoint: 0',
+          '  m_MaskSource: 0',
         ].join('\n'),
       )
     }

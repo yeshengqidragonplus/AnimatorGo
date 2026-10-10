@@ -13,6 +13,7 @@ import { drawOrderOf, layerOfSlot, type DrawOrderOffset } from '../../spine-eval
 import { sequenceCycle, sequenceFrameAt, sequenceRegionName, sequenceSteps, type SequenceKey } from '../../spine-eval/sequence.ts'
 import { slotColorAt } from '../../spine-eval/color.ts'
 import { IssueCollector, type ConversionIssue } from '../types.ts'
+import { clipGroups, clipOnSteps, clipToggled, type ClipGroup } from '../clipping.ts'
 import * as G from '../../godot/tscn.ts'
 
 /**
@@ -49,6 +50,7 @@ import * as G from '../../godot/tscn.ts'
  * - 骨骼:贝塞尔轨道精确表达 Spine 的贝塞尔(控制柄是相对偏移,实测);全线性的用普通值轨道
  * - 换图 → 各挂图节点 `visible`;slot 颜色 → `self_modulate`;逐帧绘制顺序 → `z_index`
  * - deform → 直接对 `polygon` 打关键帧(Godot 会插值,且天然「加完再蒙皮」)
+ * - clipping 遮罩 → 打开 `clip_children` 的 Polygon2D,被遮的部件挂在它下面(docs/GODOT.md 第 12 节)
  * - 换动画回 setup:`deterministic = true` + `RESET` 动画(实测,默认档位会留着上一条动画的值)
  * - 离散轨道:`callback_mode_discrete = 2`,否则往回拖不重新求值(实测)
  */
@@ -265,6 +267,25 @@ function floatTrack(
   return { path, kind: 'bezier', times: expanded.map((k) => k.t), values: expanded.map((k) => k.v), handles }
 }
 
+/** 数值的值轨道 → 等价的贝塞尔轨道:直线段的控制柄放在三分点上(与 floatTrack 里直线段的写法一致) */
+function asBezier(t: Track): Track {
+  if (t.kind === 'bezier') return t
+  const values = t.values.map((v) => (typeof v === 'number' ? v : (v as { value: number }).value))
+  const handles = values.map(() => [0, 0, 0, 0] as [number, number, number, number])
+  values.forEach((v, i) => {
+    if (i + 1 >= values.length) return
+    const dt = t.times[i + 1]! - t.times[i]!
+    const dv = values[i + 1]! - v
+    handles[i]![2] = dt / 3
+    handles[i]![3] = dv / 3
+    handles[i + 1]![0] = -dt / 3
+    handles[i + 1]![1] = -dv / 3
+  })
+  return { path: t.path, kind: 'bezier', times: t.times, values, handles }
+}
+
+const asBezierIf = (yes: boolean, t: Track): Track => (yes ? asBezier(t) : t)
+
 /** 离散值轨道,相邻相同的值合并 */
 function stepTrack(path: string, steps: readonly { t: number; v: G.GodotValue }[]): Track {
   // 同一时刻的几步只留最后一步。⚠️ 实测:Godot 在恰好那一刻取的是**第一个**键 —— 0 秒先写 setup 值、再写第一帧的话,
@@ -402,6 +423,11 @@ interface AttachmentNode {
   }
   /** 不蒙皮时挂在哪根骨骼下;顶点在它的局部空间 */
   readonly parentBone?: number
+  /**
+   * 被遮罩遮住的刚性部件(以及遮罩自己):不能挂在骨骼下,改成蒙皮到 parentBone、权重 1。
+   * `polygon` 仍是骨骼局部坐标,写出时乘上这个矩阵(那根骨骼的 rest 世界矩阵)换到绑定空间 —— 几何完全等价
+   */
+  readonly rigidBind?: Affine
   /** rest 空间(或骨骼局部)的顶点,Godot 坐标 */
   readonly polygon: readonly number[]
   /** 4.1 序列帧 attachment 的第几帧(每帧一个节点) */
@@ -409,6 +435,28 @@ interface AttachmentNode {
 }
 
 /** setup 姿势下这个挂图节点亮不亮:slot 挂的是它,且(序列帧)是 setup 那一帧 */
+/** 写出去的 polygon:刚性改蒙皮的,骨骼局部 → 绑定空间 */
+function outPolygon(node: Pick<AttachmentNode, 'rigidBind'>, local: readonly number[]): number[] {
+  const m = node.rigidBind
+  if (m === undefined) return [...local]
+  const out: number[] = []
+  for (let i = 0; i + 1 < local.length; i += 2) {
+    const p = apply(m, local[i]!, local[i + 1]!)
+    out.push(p.x, p.y)
+  }
+  return out
+}
+
+/** 节点到场景根下 Skeleton2D 的相对路径(节点路径有几段就退几层) */
+function skeletonPathFrom(path: string): string {
+  return `${'../'.repeat(path.split('/').length)}Skeleton2D`
+}
+
+/** 遮罩开关:开 = clip_children 只当遮罩用;关 = 不裁、遮罩自己透明(不能藏节点 —— 子节点会跟着藏起来) */
+const CLIP_ON = 1
+const CLIP_OFF = 0
+const clipModulate = (on: boolean) => (on ? G.color(1, 1, 1, 1) : G.color(1, 1, 1, 0))
+
 function setupVisible(slot: { attachmentName: string | null }, node: { key: string; frame?: { index: number; sequence: Sequence } }): boolean {
   if (slot.attachmentName !== node.key) return false
   return node.frame === undefined || node.frame.index === sequenceFrameAt(undefined, node.frame.sequence, 0)
@@ -523,6 +571,20 @@ export function exportToGodot(
   }
   const wrappers: { path: string; node: { skin: string; slot: number; key: string } }[] = []
 
+  // ── clipping 遮罩 ──
+  //
+  // 遮罩 = 场景根下一个 Polygon2D,蒙皮到遮罩 slot 的骨骼(权重 1),clip_children 只当遮罩用;被遮的部件挂在它下面。
+  // ⚠️ 实测:子节点的 z_index 必须和遮罩相同(相对 0)才会被裁 —— 范围里的先后只能靠节点顺序,所以按 slot 排。
+  // 刚性部件也改成单骨骼蒙皮(挂在骨骼下就不是遮罩的子节点了)
+  const clips = clipGroups(part, issues)
+  const masks = clips.map((g) => {
+    const slot = part.slots[g.slot]!
+    const name = names.claim('.', g.key === slot.name ? slot.name : `${slot.name}__${g.key}`)
+    return { group: g, path: name, children: [] as { slot: number; decl: G.NodeDecl }[] }
+  })
+  const maskOfSlot = new Map<number, (typeof masks)[number]>()
+  for (const m of masks) for (const s of m.group.clipped) maskOfSlot.set(s, m)
+
   const emit = (skin: (typeof part.skins)[number], slotIndex: number, a: Attachment, frame?: { index: number; sequence: Sequence }) => {
     const slot = part.slots[slotIndex]!
     const regionName = frame === undefined ? regionNameOf(a) : sequenceRegionName(regionNameOf(a), frame.sequence, frame.index)
@@ -543,6 +605,9 @@ export function exportToGodot(
     let parent: string
     const common = { slot: slotIndex, skin: skin.name, key: a.key, attachment: a, ...(frame === undefined ? {} : { frame }) }
     let node: Omit<AttachmentNode, 'path'>
+    const mask = maskOfSlot.get(slotIndex)
+    /** 被遮的节点进遮罩的子节点列表(之后按 slot 排),其余照常 */
+    const push = (decl: G.NodeDecl) => (mask === undefined ? nodes.push(decl) : mask.children.push({ slot: slotIndex, decl }))
 
     if (a.type === 'region') {
       polygon = regionCorners(a, region).flatMap((p) => [p.x, -p.y])
@@ -550,8 +615,8 @@ export function exportToGodot(
       const h = region.height
       uv = [toPage(region, 0, h), toPage(region, w, h), toPage(region, w, 0), toPage(region, 0, 0)].flat()
       triangles = [[0, 1, 2], [0, 2, 3]]
-      parent = bonePath[slot.bone]!
-      node = { ...common, parentBone: slot.bone, polygon }
+      parent = mask?.path ?? bonePath[slot.bone]!
+      node = { ...common, parentBone: slot.bone, polygon, ...(mask === undefined ? {} : { rigidBind: restWorld[slot.bone]! }) }
     } else {
       const count = a.data['vertexCount'] as number
       const uvs = a.data['uvs'] as number[]
@@ -569,10 +634,10 @@ export function exportToGodot(
           const w = verts.weighted ? (verts.weights[i]!.find((e) => e.bone === single) ?? verts.weights[i]![0]!) : null
           polygon.push(w === null ? verts.positions[i * 2]! : w.x, -(w === null ? verts.positions[i * 2 + 1]! : w.y))
         }
-        parent = bonePath[single]!
-        node = { ...common, parentBone: single, polygon }
+        parent = mask?.path ?? bonePath[single]!
+        node = { ...common, parentBone: single, polygon, ...(mask === undefined ? {} : { rigidBind: restWorld[single]! }) }
       } else {
-        parent = '.'
+        parent = mask?.path ?? '.'
         const bound = bindWeighted(verts, uv, restWorld, a.name, issues, checkPoses)
         polygon = bound.polygon
         node = { ...common, polygon, skinned: { slots: bound.slots, weights: bound.weights } }
@@ -586,7 +651,7 @@ export function exportToGodot(
       const wrapperName = names.claim(parent, `${base} (${skin.name})`)
       container = parent === '.' ? wrapperName : `${parent}/${wrapperName}`
       const props: [string, G.GodotValue][] = shownInSkin(common, initialSkin) ? [] : [['visible', false]]
-      nodes.push({ name: wrapperName, type: 'Node2D', parent, properties: props })
+      push({ name: wrapperName, type: 'Node2D', parent, properties: props })
       wrappers.push({ path: container, node: common })
     }
     const name = names.claim(container, base)
@@ -597,14 +662,14 @@ export function exportToGodot(
 
     const props: [string, G.GodotValue][] = []
     if (!setupVisible(slot, finalNode)) props.push(['visible', false])
-    // 绘制顺序:slot 下标就是层号(祖先骨骼的 z 都是 0,相对值即绝对值)
-    if (slotIndex !== 0) props.push(['z_index', slotIndex])
+    // 绘制顺序:slot 下标就是层号(祖先骨骼的 z 都是 0,相对值即绝对值)。被遮的跟遮罩同层(见上)
+    if (slotIndex !== 0 && mask === undefined) props.push(['z_index', slotIndex])
     if (!isWhite(slotColor)) props.push(['self_modulate', colorValue(slotColor)])
     props.push(['texture', G.extResource(texture)])
     if (!isWhite(color)) props.push(['color', colorValue(color)])
-    // 蒙皮网格挂在根下(或根下的皮肤包装节点里),骨架路径相对它自己
-    if (finalNode.skinned !== undefined) props.push(['skeleton', G.nodePath(skinDependent ? '../../Skeleton2D' : '../Skeleton2D')])
-    props.push(['polygon', G.packedVector2(polygon)], ['uv', G.packedVector2(uv)])
+    // 蒙皮网格挂在根下(或根下的皮肤包装节点、遮罩里),骨架路径相对它自己
+    if (finalNode.skinned !== undefined || finalNode.rigidBind !== undefined) props.push(['skeleton', G.nodePath(skeletonPathFrom(path))])
+    props.push(['polygon', G.packedVector2(outPolygon(finalNode, polygon))], ['uv', G.packedVector2(uv)])
     props.push(['polygons', triangles.map((t) => G.packedInt32(t))])
     if (finalNode.skinned !== undefined) {
       const s = finalNode.skinned
@@ -631,6 +696,8 @@ export function exportToGodot(
         boneList.push(target, G.packedFloat32(s.weights.map((ws) => ws.filter((w) => w.slot === k).reduce((n, w) => n + w.weight, 0))))
       })
       props.push(['bones', boneList])
+    } else if (finalNode.rigidBind !== undefined) {
+      props.push(['bones', [bonePath[finalNode.parentBone!]!.slice('Skeleton2D/'.length), G.packedFloat32(new Array<number>(polygon.length / 2).fill(1))]])
     }
     const blend = slot.blendMode
     if (blend !== 0) {
@@ -640,15 +707,14 @@ export function exportToGodot(
       if (!subResources.some((r) => r.id === id)) subResources.push({ id, type: 'CanvasItemMaterial', properties: [['blend_mode', mode]] })
       props.push(['material', G.subResource(id)])
     }
-    nodes.push({ name, type: 'Polygon2D', parent: container, properties: props })
+    push({ name, type: 'Polygon2D', parent: container, properties: props })
   }
 
   for (const skin of part.skins) {
     for (const entry of skin.slots) {
       for (const a of entry.attachments) {
         if (a.type !== 'region' && a.type !== 'mesh') {
-          if (a.type === 'clipping') issues.loss(`attachment.${a.name}`, 'clipping 遮罩在 Godot 2D 里没有对应物(CanvasGroup 的裁剪不是任意多边形),已丢弃')
-          else if (a.type !== 'boundingbox' && a.type !== 'point' && a.type !== 'path') issues.loss(`attachment.${a.name}`, `不支持的 attachment 类型 ${a.type}`)
+          if (a.type !== 'clipping' && a.type !== 'boundingbox' && a.type !== 'point' && a.type !== 'path') issues.loss(`attachment.${a.name}`, `不支持的 attachment 类型 ${a.type}`)
           continue
         }
         // 4.1 序列帧:每帧一个节点(换物体而不是换贴图),显示 =「attachment 亮着」且「当前是这一帧」
@@ -659,6 +725,25 @@ export function exportToGodot(
     }
   }
   for (const slot of part.slots) if (slot.darkColor !== -1) issues.loss(`slot.${slot.name}`, '两色染色(dark color)在 Godot 里没有对应物,只保留亮色')
+
+  // 遮罩节点 + 被遮的部件(按 slot 排:同层的先后靠节点顺序)
+  for (const m of masks) {
+    const g = m.group
+    const slot = part.slots[g.slot]!
+    const local = g.polygon.flatMap((p) => [p.x, -p.y])
+    const maskNode: AttachmentNode = { slot: g.slot, skin: g.skin, key: g.key, attachment: g.attachment, path: m.path, parentBone: slot.bone, polygon: local, rigidBind: restWorld[slot.bone]! }
+    attachmentNodes.push(maskNode)
+    const on = clipOnSteps(part, g, null)[0]!.on
+    const props: [string, G.GodotValue][] = []
+    if (g.slot !== 0) props.push(['z_index', g.slot])
+    props.push(['clip_children', on ? CLIP_ON : CLIP_OFF])
+    if (!on) props.push(['self_modulate', clipModulate(false)])
+    props.push(['skeleton', G.nodePath(skeletonPathFrom(m.path))], ['polygon', G.packedVector2(outPolygon(maskNode, local))])
+    props.push(['bones', [bonePath[slot.bone]!.slice('Skeleton2D/'.length), G.packedFloat32(new Array<number>(g.polygon.length).fill(1))]])
+    nodes.push({ name: m.path, type: 'Polygon2D', parent: '.', properties: props })
+    for (const c of [...m.children].sort((x, y) => x.slot - y.slot)) nodes.push(c.decl)
+    issues.add('info', `clipping.${slot.name}/${g.key}`, `遮罩 → clip_children 的 Polygon2D,${g.clipped.length} 个 slot 的部件挂在它下面`)
+  }
   if (named.length > 0) {
     issues.add('info', 'skin', `${part.skins.length} 套皮肤全部导进一个场景,运行时 \`$SkinPlayer.play("皮肤名")\` 切换,初始是 "${initialSkin}"`)
   }
@@ -674,22 +759,29 @@ export function exportToGodot(
   const resetValues = new Map<string, { value: G.GodotValue; discrete: boolean }>()
   const setupOf = (node: AttachmentNode, property: string): G.GodotValue => {
     const slot = part.slots[node.slot]!
+    if (node.attachment.type === 'clipping') {
+      const on = slot.attachmentName === node.key
+      if (property === 'clip_children') return on ? CLIP_ON : CLIP_OFF
+      if (property === 'self_modulate') return clipModulate(on)
+    }
     switch (property) {
       case 'visible': return setupVisible(slot, node)
       case 'z_index': return node.slot
       case 'self_modulate': return colorValue(unpackRgba(slot.color))
-      default: return G.packedVector2(node.polygon)
+      default: return G.packedVector2(outPolygon(node, node.polygon))
     }
   }
 
+  const animTracks: { id: string; anim: AnimationData; tracks: Track[] }[] = []
   part.animations.forEach((anim, ai) => {
     const tracks: Track[] = []
     const { kept, dropped } = lastPerProperty(anim.timelines)
     issues.scoped(anim.name, () => {
       for (const d of dropped) if (!d.identical) issues.add('approximated', describeTimeline(part, d.timeline), DUPLICATE_TIMELINE_MESSAGE)
       tracks.push(...boneTracks(part, anim, kept, bonePath, is38, issues))
-      tracks.push(...slotTracks(part, anim, kept, nodesOfSlot, is38, issues))
+      tracks.push(...slotTracks(part, anim, kept, nodesOfSlot, maskOfSlot, is38, issues))
       tracks.push(...deformTracks(part, anim, kept, attachmentNodes, timelineParents, is38, issues))
+      tracks.push(...clipTracks(part, anim, kept, masks))
       if (kept.some((t) => t.kind === 'event')) issues.loss('events', 'Spine 事件没有转(Godot 的方法轨道要有脚本接)')
     })
     for (const t of tracks) {
@@ -701,14 +793,21 @@ export function exportToGodot(
         continue
       }
       const node = attachmentNodes.find((n) => n.path === nodePathPart)
-      if (node !== undefined) resetValues.set(t.path, { value: setupOf(node, property), discrete: property === 'visible' || property === 'z_index' })
+      if (node !== undefined) resetValues.set(t.path, { value: setupOf(node, property), discrete: property === 'visible' || property === 'z_index' || property === 'clip_children' })
     }
     const id = `Animation_${ai}`
     animationIds.push(id)
-    subResources.push(animationResource(id, anim.name, durationOf(anim), true, tracks))
+    animTracks.push({ id, anim, tracks })
   })
 
-  const reset: Track[] = [...resetValues.entries()].map(([path, r]) => ({ path, kind: 'value', discrete: r.discrete, times: [0], values: [r.value] }))
+  // ⚠️ 同一个属性在所有动画(含 RESET)里必须是同一种轨道(实测):Stage_rewards 的 b_box 骨骼在 5_open2 里是贝塞尔轨道、
+  // RESET 里是值轨道,别的动画里它回不到 RESET,位置和缩放全是 0(骨骼缩成一个点,整个宝箱不见)。
+  // 某条动画用了贝塞尔的属性,其他动画和 RESET 里也写成贝塞尔(直线段的控制柄放三分点,值不变)
+  const bezierPaths = new Set(animTracks.flatMap((a) => a.tracks.filter((t) => t.kind === 'bezier').map((t) => t.path)))
+  for (const { id, anim, tracks } of animTracks) {
+    subResources.push(animationResource(id, anim.name, durationOf(anim), true, tracks.map((t) => (bezierPaths.has(t.path) ? asBezier(t) : t))))
+  }
+  const reset: Track[] = [...resetValues.entries()].map(([path, r]) => asBezierIf(bezierPaths.has(path), { path, kind: 'value', discrete: r.discrete, times: [0], values: [r.value] }))
   subResources.push(animationResource('Animation_RESET', 'RESET', 0.001, false, reset))
   const lib: Record<string, G.GodotValue> = { '&"RESET"': G.subResource('Animation_RESET') }
   part.animations.forEach((anim, i) => { lib[`&${JSON.stringify(anim.name)}`] = G.subResource(animationIds[i]!) })
@@ -930,6 +1029,7 @@ function slotTracks(
   anim: AnimationData,
   timelines: readonly Timeline[],
   nodesOfSlot: ReadonlyMap<number, readonly AttachmentNode[]>,
+  maskOfSlot: ReadonlyMap<number, unknown>,
   is38: boolean,
   issues: IssueCollector,
 ): Track[] {
@@ -1017,9 +1117,39 @@ function slotTracks(
       layer: layerOfSlot(drawOrderOf(part.slots.length, (f['offsets'] as DrawOrderOffset[] | undefined) ?? [])),
     }))
     for (let s = 0; s < part.slots.length; s++) {
-      if (layers.every((l) => l.layer[s] === s)) continue
+      // 被遮的跟遮罩同层,先后靠节点顺序(范围变了 clipGroups 会报)
+      if (layers.every((l) => l.layer[s] === s) || maskOfSlot.has(s)) continue
       const steps = [{ t: 0, v: s as G.GodotValue }, ...layers.map((l) => ({ t: l.t, v: l.layer[s]! as G.GodotValue }))]
       for (const node of nodesOfSlot.get(s) ?? []) out.push(stepTrack(`${node.path}:z_index`, steps))
+    }
+  }
+  return out
+}
+
+/**
+ * 遮罩的开关和层号。开关打在 `clip_children` + 遮罩自己的 `self_modulate` 上(不能藏节点,见 CLIP_ON);
+ * 遮罩 slot 被绘制顺序动画挪过位的,遮罩跟着挪(被遮的部件是它的子节点,一起走)
+ */
+function clipTracks(
+  part: SkeletonPart,
+  anim: AnimationData,
+  timelines: readonly Timeline[],
+  masks: readonly { group: ClipGroup; path: string }[],
+): Track[] {
+  const out: Track[] = []
+  const drawOrder = timelines.find((t) => t.kind === 'drawOrder')
+  for (const { group: g, path } of masks) {
+    if (clipToggled(anim, g)) {
+      const steps = clipOnSteps(part, g, anim)
+      out.push(stepTrack(`${path}:clip_children`, steps.map((s) => ({ t: s.t, v: s.on ? CLIP_ON : CLIP_OFF }))))
+      out.push(stepTrack(`${path}:self_modulate`, steps.map((s) => ({ t: s.t, v: clipModulate(s.on) }))))
+    }
+    if (drawOrder !== undefined) {
+      const layers = drawOrder.frames.map((f) => ({
+        t: Number(f['time'] ?? 0),
+        layer: layerOfSlot(drawOrderOf(part.slots.length, (f['offsets'] as DrawOrderOffset[] | undefined) ?? []))[g.slot]!,
+      }))
+      if (layers.some((l) => l.layer !== g.slot)) out.push(stepTrack(`${path}:z_index`, [{ t: 0, v: g.slot }, ...layers.map((l) => ({ t: l.t, v: l.layer }))]))
     }
   }
   return out
@@ -1077,8 +1207,12 @@ function deformTracks(
     })
     for (const node of targets) {
       const a = node.attachment
-      if (a.type !== 'mesh') continue
+      if (a.type !== 'mesh' && a.type !== 'clipping') continue
       const verts = a.data['vertices'] as Vertices
+      if (a.type === 'clipping' && verts.weighted) {
+        issues.add('approximated', `deform[${a.name}]`, '加权遮罩多边形上的 deform 没有转')
+        continue
+      }
       const count = a.data['vertexCount'] as number
       const flatLength = verts.weighted ? verts.weights.reduce((n, w) => n + w.length * 2, 0) : count * 2
       const frames = d.frames
@@ -1115,15 +1249,16 @@ function deformTracks(
       const asTimeline = [{ kind: 'deform', owner: t.owner, frames, bezierCount: -1 }]
       const times = curved || node.skinned !== undefined ? sampleTimes(durationOf(anim), asTimeline) : keyTimesWithSteps(asTimeline)
       const values = times.map((time) => {
-        if (time < keyTimes[0]!) return G.packedVector2(node.skinned === undefined ? node.polygon : polygonAt(new Array<number>(flatLength).fill(0), time))
+        const pack = (local: readonly number[]) => G.packedVector2(outPolygon(node, local))
+        if (time < keyTimes[0]!) return pack(node.skinned === undefined ? node.polygon : polygonAt(new Array<number>(flatLength).fill(0), time))
         let i = frames.length - 1
         for (let k = 0; k < frames.length - 1; k++) if (time < keyTimes[k + 1]!) { i = k; break }
         const f0 = offsetsOf(frames[i]!)
-        if (i === frames.length - 1) return G.packedVector2(polygonAt(f0, time))
+        if (i === frames.length - 1) return pack(polygonAt(f0, time))
         const f1 = offsetsOf(frames[i + 1]!)
         // deform 的曲线是 0..1 的进度(两版一致,见 bezier.ts)
         const p = valueBetween([{ ...frames[i]!, v: 0 }, { ...frames[i + 1]!, v: 1 }], 0, 'v', time, is38)
-        return G.packedVector2(polygonAt(f0.map((x, j) => x + (f1[j]! - x) * p), time))
+        return pack(polygonAt(f0.map((x, j) => x + (f1[j]! - x) * p), time))
       })
       if (curved) issues.add('approximated', `deform[${a.name}]`, `deform 曲线按 ${SAMPLE_FPS} fps 采样成线性关键帧`)
       out.push({ path: `${node.path}:polygon`, kind: 'value', times, values })

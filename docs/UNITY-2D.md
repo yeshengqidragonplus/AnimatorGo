@@ -25,7 +25,7 @@
 | 4.1 序列帧(sequence) | 每帧一个节点,m_Enabled =「attachment 亮着」且「是这一帧」的阶梯曲线 | ✅ 可映射,见第 15 节 |
 | **path / transform 约束** | —— | ❌ 没有 |
 | **两色染色(dark)** | —— | ❌ 没有 |
-| **clipping 遮罩** | —— | ❌ 没有 |
+| clipping 遮罩 | `SpriteMask`(形状 = sprite 的自定义网格)+ 渲染器「只在遮罩里显示」 | ✅ 可映射,见第 17 节 |
 
 > 📌 **纠正一处早期判断**:曾认为「Unity 没有 slot / skin 的对应物」。
 > 实际有 —— `SpriteLibrary` + `SpriteResolver` 就是换装与换图机制。
@@ -818,6 +818,7 @@ region 也读成四顶点 mesh。图集每个 sprite 一个区域(Unity 的矩�
 | z 坐标的动画(只影响同层同序谁先画,没转) | approximated |
 | 同一时刻同一 slot 亮着几个挂图节点(Spine 一个 slot 只挂一个) | approximated |
 | 几套具名皮肤的挂图物体同时亮着(取第一套当初始皮肤) | approximated |
+| SpriteMask 遮罩(我们把 Spine 的 clipping 导成它,第 17 节):还不读,遮罩物体不当骨骼,被遮的部件按整张画 | loss |
 
 **还读不了的**(都会在上表里报出来,不静默):SpriteLibrary + SpriteResolver 换装(`m_SpriteHash` 曲线);Unity 2D IK
 (IK 目标通常在场景里,不在 prefab 里);`.anim` 里用 `m_Sprite` 引用 PSD Importer 角色里、名字表里没有的 sprite(见 16.6)。
@@ -884,7 +885,45 @@ Photoshop 文件自己读(`src/psd/readPsd.ts`):8 位 RGB / 灰度,原始 / RLE 
 导出脚本要 Play 前先把样本的 `.meta` 改成不压缩、可读(`textureCompression: 0`、`isReadable: 1`)才能比像素;
 `SampleAnimation` 不复原没碰的属性,**每条动画要一个新实例**,不然上一条的姿势会混进来 —— 两条都是踩过的。
 
-## 17. 待确认
+## 17. clipping 遮罩 → SpriteMask(2026-10-10)
+
+MergeCooking2 里 22 个骨架用到(之前整个丢弃)。共用的范围 / 形状 / 开关求值在 `src/spine-convert/clipping.ts`(Godot 也用)。
+
+**Spine 的规则**:画到挂着 clipping attachment 的 slot 时开始裁,之后画的 slot 都按这个多边形裁,画完 `endSlot` 结束;
+`endSlot` 不在它后面(含就是它自己,rukou_pet)就一直裁到最后。同一时间只有一个遮罩。遮罩没挂着时范围里的部件照常画。
+
+**Unity 侧的实测**(探针都在 Unity 6000.3 + URP 2D Renderer 里跑):
+
+| 问题 | 结论 |
+|---|---|
+| 遮罩形状 | **导入的 sprite 自带的自定义网格**(`.meta` 里的 vertices / indices)SpriteMask 照用 —— 三角形 sprite 遮出来正好是三角形。⚠️ 运行时 `Sprite.OverrideGeometry` 的**不用**(遮的是整个矩形) |
+| 范围 | 自定义范围遮排序值在 **(back, front]** 的渲染器;遮罩自己的 Order in Layer 不影响。⚠️ 用脚本设时先设 back 会被夹到旧的 front 上 —— YAML 里直接写两个值没这个问题 |
+| Sorting Group | ⚠️ **隔不开**:别的组里排序值落在范围里的渲染器照样被遮。同一 Sorting Layer 里放几个实例,遮罩会叠加 |
+| 能被动画驱动的 | ⚠️ SpriteMask 只有 `m_Enabled` / `m_SortingOrder` / `m_MaskAlphaCutoff`;**`m_Sprite`、排序范围不行**。渲染器的 **`m_MaskInteraction` 也不行**(SpriteRenderer、SkinnedMeshRenderer 都是;`AnimationUtility.GetAnimatableBindings` 查的) |
+| SkinnedMeshRenderer | `m_MaskInteraction` 存在,但用 URP 的 Sprite-Unlit-Default **不生效**:引擎给 MeshRenderer 套遮罩的模板状态,在 **SRP Batcher 下不起作用**(URP 自带的 Mesh2D 着色器里 `_White` 那行注释就是这个绕法)。Mesh2D 着色器本身不能用:背面剔除(Spine 的三角形朝向不固定)、写深度(透明处挡住后画的、更远的 sprite)、不乘顶点色 —— 三条都实测过 |
+
+**导出**:
+
+- 每个遮罩一张 16×16 白图上的 sprite(`<骨架>@clip.png`),网格 = 多边形(耳切三角化),归一到这个遮罩所有形状的包围盒里;
+  遮罩物体挂在遮罩 slot 的骨骼下,位置 = 包围盒左下角,缩放 = 包围盒大小(sprite 是 1×1 单位)。范围 = (遮罩 slot, 最后一个被遮的 slot]
+- 被遮的 slot 的渲染器 `m_MaskInteraction: 1`。走 SkinnedMeshRenderer 的换成 `<图集页>@clip.mat`,用自带的
+  `AnimatorGoMaskedMesh.shader`(`tools/unity/runtime/`,CLI 拷进 `AnimatorGoRuntime/` 一次,GUID 写死在 `.meta` 里):
+  照 Sprite-Unlit-Default 只改两处 —— 打断 SRP Batcher、去掉 sprite 专用的翻转和颜色(不走合批时它们是 0,顶点塌成一点)。只有 URP 的
+- **deform**(遮罩形状在动):`m_Sprite` 不能动画,所以每种形状一个 SpriteMask 物体,`m_Enabled` 互斥地切。关键帧之间插值的按 30 fps
+  逐帧取形状,报 approximated(MC2 只有 1 个骨架;多数是「整条动画一种形状」)
+- **开关**(换图时间轴把遮罩换掉):渲染器的「只在遮罩里显示」改不了,所以多一个「不遮」的遮罩 `<名字> (off)`,挂在根下,盖住被遮部件在
+  setup 和全部动画里画到的范围再放大 1.5 倍(不用无限大的方块:编辑器里「聚焦」会被拉到极远),遮罩关着时亮它
+- 绘制顺序动画挪动了遮罩范围里的 slot:范围不能动画,报 approximated(被挪出范围的部件会整个不见;MC2 1 个骨架)
+- Sorting Group 隔不开的那条报 info,让用户知道几个实例要放不同的 Sorting Layer
+
+读回端(第 16 节)还不读 SpriteMask:报 loss,遮罩物体不当骨骼,被遮的部件按整张画。
+
+**验证**:端到端测试(Easter_card、clown_npc、Stage_rewards、race_haibao)逐时刻核对「同一时刻只亮一个遮罩物体、开关与 Spine 一致、
+亮着的形状与 Spine 的多边形一致(插值段允许一帧的移动量)」、被遮的渲染器都设了交互、被遮的 SkinnedMeshRenderer 用自带着色器;
+突变(所有形状初始都亮)能抓到。Unity 自检通过;6 个样本在 Unity 里按 Animator 渲染,与 Godot 同一时刻逐帧对照一致
+(含遮罩关着的动画、范围里 20 个 SkinnedMeshRenderer 的 race_haibao)。MC2 全部 535 个骨架导出成功。
+
+## 18. 待确认
 
 - `.anim` 里驱动 `SpriteResolver` 的曲线具体形态(尚无样本)。
   目前换 attachment 走的是**一个 attachment 一个物体 + `m_IsActive` 阶梯曲线**,
