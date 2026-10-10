@@ -115,6 +115,8 @@ Unity.exe -batchmode -quit -nographics -projectPath <工程>           -executeM
 | ~~38~~ | ~~网格在绑定姿势下就非刚性~~ | ✅ **已解**:这类网格也走 SkinnedMeshRenderer,Mesh 的绑定矩阵是任意 4×4 |
 | ~~29~~ | ~~加权网格之间缩放不一致~~ | ✅ **已解**:同上,Mesh 的顶点与 UV 各自独立 |
 | ~~22~~ | ~~clipping 遮罩~~ | ✅ **已解**(2026-10-10):Unity 走 SpriteMask、Godot 走 `clip_children`,见下文 |
+| ~~15 / 13~~ | ~~slot 混合模式(additive / multiply)~~ | ✅ **已解**(2026-10-10):之前 Unity 一律按 normal 画、Godot 的 multiply 透明处涂黑,都没报;见下文 |
+| ~~6~~ | ~~attachment 自己的颜色~~ | ✅ **已解**(2026-10-10):之前 Unity 导出一声不响丢掉,见下文 |
 | 20 | 贝塞尔控制点贴端点 | 退化为线性 |
 | ~~16~~ | ~~逐帧绘制顺序~~ | ✅ **已解**(2026-09-10):挪过位的 slot 每条动画一条 `m_SortingOrder` 阶梯曲线,见 [UNITY-2D.md](UNITY-2D.md) 第 12 节 |
 | 9 | `transformMode` 非默认继承 | 无对应物 |
@@ -398,6 +400,17 @@ pnpm from-unity <Unity 产物目录> --to godot|json [--out 目录] [--ppu 100] 
 | Unity YAML 解析器 | 3000 个真实 Unity 文件(45975 个对象)0 异常 |
 | Unity → Godot 渲染 | MX2_cat 与 Spine 直出 Godot 的渲染一致 |
 
+### 2026-10-10 并行分支合入 main
+
+同一天 7 个独立任务分支(Godot multiply、批量同名覆盖、Unity 混合模式、attachment 颜色 / 顶点色色彩空间 ×2、测试样本挪进 `beforeAll` ×2)
+按顺序 cherry-pick 成线性历史。两个颜色分支做了同一件事,取改得更全的那个,另一个的长处移植过来(见下文「attachment 颜色」一节)。
+测试分支把样本挪进 `beforeAll` 之后,其余分支新加的用例也照改。合并后:
+
+- `pnpm test` 624 个全过,`pnpm check:unity` 全过;MC2 535 个骨架 Unity / Godot 两边试导全部成功(自动认出 MC2 是 Gamma 工程)
+- Unity(URP + Linear 的临时工程)自检、Godot 自检都通过。7 个样本按 Animator / AnimationPlayer 渲染,与合并前逐帧比,
+  变的只有这次修的部件:Easter_card 的 multiply 影子(两边)、race_haibao 的半透明影子(Unity)、Stage_rewards 5 号宝箱的 additive 光
+  (Unity;比 Godot 亮一点,是 Linear 工程在线性空间混合,见「Unity:slot 混合模式」一节);其余骨架逐帧相同
+
 ### ✅ clipping 遮罩(2026-10-10)
 
 MergeCooking2 里 22 个骨架用到,之前两个引擎都整个丢弃。范围 / 形状 / 开关的求值两边共用(`src/spine-convert/clipping.ts`)。
@@ -417,10 +430,8 @@ MergeCooking2 里 22 个骨架用到,之前两个引擎都整个丢弃。范围 
   Easter_card 兔子的影子是黑框(MC2 13 个骨架 / 17 个 slot)。改成内嵌 `blend_mul` 着色器,把透明度折进颜色:
   `COLOR = vec4(mix(vec3(1.0), COLOR.rgb, COLOR.a), 1.0)`,三种渲染器实测与 Spine 的公式差不超过 1/255。⚠️ fragment 的 `COLOR`
   已经乘过贴图(实测),写成 `texture(TEXTURE, UV) * COLOR` 是错的。见 [GODOT.md](GODOT.md) 第 13 节
-- ⚠️ 顺带发现(没修):**Unity 导出不看 slot 的混合模式**,additive / multiply / screen 一律按 normal 画,也没报 —— 违反「有损必须报告」。
-  Easter_card 的影子在 Unity 里看着是对的,其实是 normal 混合碰巧像
-- ⚠️ 顺带发现(没修):`pnpm godot` / `pnpm unity` 批量导出时输出目录按骨架名起,**不同目录下的同名骨架互相覆盖**、不报
-  (MC2 535 个骨架只写出 513 个场景;rukou_pet 就有 4 份)
+- ~~**Unity 导出不看 slot 的混合模式**~~ 已修(2026-10-10),见下文「Unity:slot 混合模式」
+- ~~批量导出时**不同目录下的同名骨架互相覆盖**~~ 已修(2026-10-10),见下文
 
 ### ✅ 批量导出时同名骨架互相覆盖(2026-10-10 修)
 
@@ -460,7 +471,7 @@ screen One/OneMinusSrcColor),两套管线各一个着色器(`tools/unity/runtime
 
 - **Linear 色彩空间的工程里所有混合都在线性空间做**(含 normal),与 Spine 编辑器 / Godot 的 gamma 空间不同,半透明叠加处偏亮,
   additive 最明显。是工程设置,spine-unity 也一样;MC2 是 Gamma 工程,结果与 Spine 一致
-- **SkinnedMeshRenderer 的 slot 颜色烘在顶点色里,Linear 工程不把顶点色换成线性**(探针实测),带颜色的这类网格在 Linear 工程里会稍偏
+- ~~**SkinnedMeshRenderer 的 slot 颜色烘在顶点色里,Linear 工程不把顶点色换成线性**~~ 已修(2026-10-10),见下一节
 - 内置管线的 Unity 临时工程放在 scratchpad 下,`com.unity.collections` 的 ILSupport.dll 路径超 260 字符,Burst 加载失败,
   SpriteSkin 校验直接抛异常、渲染工具挂掉(不只是日志噪音)。临时工程要放在路径短的地方
 
@@ -472,8 +483,11 @@ Spine 画 attachment 用 slot 颜色 × attachment 自己的颜色;Unity 导出�
 
 顺带实测出一个之前就有的问题:**线性工程里 SkinnedMeshRenderer 的顶点色 Unity 不做 sRGB 换算**,而 `m_Color` 做 ——
 同一个 `808080`,顶点色画成 `bcbcbc`。MC2 里 12 个走 SkinnedMeshRenderer 的网格带 slot 颜色,一直偏亮。现在线性工程先换成线性值再写,
-导出时从工程的 `ProjectSettings.asset` 认色彩空间(`--color-space` 可指定)。读回端(`readUnity.ts`)把每个物体的颜色拆成 slot × attachment,
+导出时从工程的 `ProjectSettings.asset` 认色彩空间(`--color-space` 可指定),认不出就按 Linear 写并报 approximated。读回端(`readUnity.ts`)把每个物体的颜色拆成 slot × attachment,
 同 slot 下不成比例的报近似(之前静默取第一个物体)。
+
+顶点色这件事有两个分支同时做了(另一版只修顶点色、没修 attachment 颜色),合并时取了这一版,另一版的「不知道色彩空间就报近似」
+和 `colorSpace.test.ts` 移植过来;另一版的分支 `claude/peaceful-allen-1cde36` 没有合进来。
 
 ### ⚠️ 两个渲染工具都画错过(2026-10-09 修)
 

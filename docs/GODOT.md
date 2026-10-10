@@ -273,7 +273,7 @@ Compatibility、Forward+(Vulkan)、Mobile 三种渲染器误差都不超过 1/25
 旧的 `CanvasItemMaterial` 差到 0.7,`texture(TEXTURE, UV) * COLOR` 的写法差到 0.2。
 贴图导出时已还原成直通 alpha(第 5 节),公式里的 `src.rgb` 就是直通的颜色。
 
-验证:MC2 里 13 个骨架 / 17 个 slot 用到(22401 的那个 slot 没有画得出的 attachment;rukou_pet 4 份同名,导出目录互相覆盖),
+验证:MC2 里 13 个骨架 / 17 个 slot 用到(22401 的那个 slot 没有画得出的 attachment;rukou_pet 4 份同名,当时导出目录互相覆盖,已修),
 写出 9 个场景,Godot 4.7 自检全部通过。与旧版(同一场景只把材质换回 `CanvasItemMaterial` MUL)逐帧比,不同的只有 multiply 部件那几块:
 旧版 9 个场景全有黑块 —— 小的是 Card_Interface 猫爪影子的两个角、Easter_card 兔子影子的黑框,大的是 34500 / 39400 整栋建筑大半涂黑、
 hot_air_balloon 猫脸被一块黑盖住;新版都没有,影子是柔和的一层暗色。

@@ -124,7 +124,8 @@ pnpm godot <骨架文件或目录> [--out 目录] [--atlas 图集] [--skin 初�
 `spine-convert/skinSlots.ts`)。⚠️ Polygon2D 每顶点只用权重最大的 4 根(源码写死),超过的挑留哪 4 根并拟合坐标。
 **离散轨道要 `callback_mode_discrete = 2`、换动画回 setup 要 `deterministic` + RESET、节点名不能含 `@`、同一属性在所有动画(含 RESET)里
 轨道类型要一致(值 / 贝塞尔混着的话回不到 RESET,读出 0)** —— 都是实测出来的,不看实测一定写错。clipping 遮罩 → `clip_children` 的
-Polygon2D,被遮的挂在它下面,⚠️ 子节点 z 必须和遮罩相同才会被裁。详见 [docs/GODOT.md](docs/GODOT.md)。
+Polygon2D,被遮的挂在它下面,⚠️ 子节点 z 必须和遮罩相同才会被裁。multiply 混合 → 内嵌 `blend_mul` 着色器,⚠️ `CanvasItemMaterial` 的 MUL
+不看透明度、透明处乘成黑(实测)。详见 [docs/GODOT.md](docs/GODOT.md)。
 
 Godot 侧的验证:`tools/godot/` 的探针 / 自检 / 渲染脚本拷进一个 Godot 工程根,本机 Godot 在
 `E:/Tools/Godot_v4.7.2-stable_win64/Godot_v4.7.2-stable_win64_console.exe`(`--import` 先导入贴图;

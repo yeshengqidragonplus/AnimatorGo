@@ -16,6 +16,9 @@ pnpm unity res/spine/4.1 --out UnityAnimationGo/Assets/AnimatorGo
 pnpm unity res/BBQ      --out UnityAnimationGo/Assets/AnimatorGo
 ```
 
+用到 clipping 遮罩或 additive / multiply / screen 混合的骨架,CLI 会把自带着色器拷进 `<--out>/AnimatorGoRuntime/`
+(零脚本模式也会,用到才拷)。**这个目录不能删** —— 删了那些部件画成品红、控制台不报;自检会逐个报出来。
+
 自检脚本在 [tools/unity/AnimatorGoVerify.cs](../tools/unity/AnimatorGoVerify.cs)
 (源码放那儿,因为这里的 `Assets/` 不进库),拷进来:
 
