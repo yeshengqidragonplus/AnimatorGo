@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { basename, dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { collectSkeletons, findAtlas, loadAtlas, readSkeleton, stemOf } from './skeletonInputs.ts'
+import { describeClashes, planOutputNames, skeletonContentKey } from './outputNames.ts'
 import { findGodotProject, godotResDir } from './godotProject.ts'
 import { exportToGodot } from '../spine-convert/godot/export.ts'
 import type { ConversionIssue } from '../spine-convert/types.ts'
@@ -14,6 +15,7 @@ import type { ConversionIssue } from '../spine-convert/types.ts'
  *
  * 每个骨架一个目录:`<名字>.tscn` + 图集页 PNG。输出目录在某个 Godot 工程里时(往上能找到
  * `project.godot`),贴图按 `res://` 路径引用,拖进去就能用。**不会覆盖输入** —— 默认写到 `<输入目录>_godot`。
+ * 不同目录下的同名骨架怎么起名见 `outputNames.ts`。
  */
 
 interface Options {
@@ -75,19 +77,40 @@ function main(): void {
     process.exitCode = 1
     return
   }
+  const root = statSync(parsed.input).isDirectory() ? parsed.input : dirname(parsed.input)
+  const rel = (file: string) => relative(root, file).split(sep).join('/')
+  const plan = planOutputNames(files, root, (file) => skeletonContentKey(file, parsed.atlas))
   const project = findGodotProject(parsed.out)
   console.log(`Spine → Godot 4,共 ${files.length} 个骨架`)
   console.log(`输出:${parsed.out}${parsed.dryRun ? '(试运行,不写文件)' : ''}`)
   console.log(project === null
     ? '⚠️ 输出目录不在 Godot 工程里,贴图按相对路径引用 —— 整个目录拷进工程后在 Godot 里打开场景即可'
     : `Godot 工程:${project}`)
+  for (const line of describeClashes(plan, root, parsed.out)) console.log(line)
   console.log()
 
   let failed = 0
+  let shared = 0
+  const failedFiles = new Set<string>()
   const counts: Record<string, number> = {}
-  for (const file of files) {
+  for (const { file, name, sameAs, clashes } of plan) {
     const stem = stemOf(file)
-    console.log(`  ${basename(file)}`)
+    console.log(`  ${clashes.length > 0 ? rel(file) : basename(file)}`)
+    if (sameAs !== null) {
+      if (failedFiles.has(sameAs)) {
+        failed++
+        console.log(`    ✗ 与 ${rel(sameAs)} 逐字节相同,它没转过去`)
+      } else {
+        shared++
+        counts['info'] = (counts['info'] ?? 0) + 1
+        console.log(`    ℹ 与 ${rel(sameAs)} 逐字节相同(骨架、图集、图集页),共用 ${name}/,不再导一遍`)
+      }
+      continue
+    }
+    if (name !== stem) {
+      counts['info'] = (counts['info'] ?? 0) + 1
+      console.log(`    ℹ 别的目录下有同名骨架、内容不同,产物改名为 ${name}`)
+    }
     try {
       const part = readSkeleton(file)
       if (part.failure !== null) throw new Error(`动画 "${part.failure.name}" 解析失败:${part.failure.message}`)
@@ -96,9 +119,9 @@ function main(): void {
       if (found.guessed) console.log(`    ℹ 图集不同名,用了 ${basename(found.path)}`)
       const { atlas, sources } = loadAtlas(found.path)
 
-      const dir = join(parsed.out, stem)
+      const dir = join(parsed.out, name)
       const resDir = godotResDir(project, dir)
-      const result = exportToGodot(part, atlas, sources, { name: stem, resDir, skipImages: parsed.dryRun, ...(parsed.skin === null ? {} : { skin: parsed.skin }) })
+      const result = exportToGodot(part, atlas, sources, { name, resDir, skipImages: parsed.dryRun, ...(parsed.skin === null ? {} : { skin: parsed.skin }) })
       if (!parsed.dryRun) {
         mkdirSync(dir, { recursive: true })
         for (const out of result.files) {
@@ -114,11 +137,13 @@ function main(): void {
       for (const issue of result.issues) console.log(describe(issue))
     } catch (error) {
       failed++
+      failedFiles.add(file)
       console.log(`    ✗ ${error instanceof Error ? error.message : String(error)}`)
     }
   }
   const summary = Object.entries(counts).map(([k, n]) => `${k} ${n}`).join(',')
-  console.log(`\n完成:${files.length - failed}/${files.length}${summary ? `,问题 ${summary}` : ''}`)
+  const sharedNote = shared > 0 ? `(其中 ${shared} 个与同名骨架逐字节相同,共用产物)` : ''
+  console.log(`\n完成:${files.length - failed}/${files.length}${sharedNote}${summary ? `,问题 ${summary}` : ''}`)
   if (failed > 0) process.exitCode = 1
 }
 

@@ -6,6 +6,7 @@ import { convertSkeleton, jsonIssues } from '../spine-convert/skel/convert.ts'
 import { toJsonText } from '../spine-format/json/toJson.ts'
 import { fromJsonText } from '../spine-format/json/fromJson.ts'
 import type { ConversionIssue } from '../spine-convert/types.ts'
+import { planConvertNames } from './outputNames.ts'
 
 /**
  * Spine `.skel` 批量版本转换的命令行入口。
@@ -89,6 +90,11 @@ function isJson(name: string): boolean {
   return name.endsWith(JSON_SUFFIX)
 }
 
+/** 这个文件要写成 JSON 吗 */
+function writesJson(file: string, format: OutputFormat): boolean {
+  return format === 'json' || (format === 'same' && isJson(file))
+}
+
 /** 骨骼文件:二进制或 JSON */
 function isSkeletonFile(name: string): boolean {
   return isSkel(name) || isJson(name)
@@ -127,7 +133,8 @@ interface FileResult {
   readonly issues: readonly ConversionIssue[]
 }
 
-function convertFile(file: string, options: Options, baseDir: string): FileResult {
+/** @param target 产物文件名(`planConvertNames` 定的)和撞名时的说明 */
+function convertFile(file: string, options: Options, baseDir: string, target: { name: string; note: string | null }): FileResult {
   const rel = relative(baseDir, file)
   const sourceIsJson = isJson(file)
 
@@ -151,7 +158,7 @@ function convertFile(file: string, options: Options, baseDir: string): FileResul
     }
   }
 
-  const asJson = options.format === 'json' || (options.format === 'same' && sourceIsJson)
+  const asJson = writesJson(file, options.format)
 
   // 版本相同**且**格式也没变才算无事可做 —— 否则「4.1 转 4.1 但导成 JSON」会被误跳过
   if (part.header.major === options.to && asJson === sourceIsJson) {
@@ -187,25 +194,24 @@ function convertFile(file: string, options: Options, baseDir: string): FileResul
   }
 
   if (!options.dryRun) {
-    // 换了格式就换扩展名,否则沿用原文件名
+    // 换了格式就换扩展名,否则沿用原文件名(同目录下换完撞名的另起名,见 planConvertNames)
     const base = skeletonBaseName(file)
-    const targetName = asJson === sourceIsJson ? basename(file) : base + (asJson ? '.json' : '.skel.bytes')
-    const target = join(options.out, dirname(rel) === '.' ? targetName : join(dirname(rel), targetName))
-    mkdirSync(dirname(target), { recursive: true })
-    writeFileSync(target, output)
+    const targetPath = join(options.out, dirname(rel), target.name)
+    mkdirSync(dirname(targetPath), { recursive: true })
+    writeFileSync(targetPath, output)
 
     // 图集与贴图不随版本变化,一并复制,让产物可直接使用
     for (const suffix of COMPANION_SUFFIXES) {
       const companion = join(dirname(file), base + suffix)
       if (existsSync(companion)) {
-        copyFileSync(companion, join(dirname(target), base + suffix))
+        copyFileSync(companion, join(dirname(targetPath), base + suffix))
       }
     }
   }
 
   return {
     file: rel, from: part.header.version, to: options.targetVersion,
-    status: 'converted', note: '', issues,
+    status: 'converted', note: target.note ?? '', issues,
   }
 }
 
@@ -281,7 +287,8 @@ function main(): number {
   const baseDir = statSync(parsed.input).isDirectory() ? parsed.input : dirname(parsed.input)
   console.log(`找到 ${files.length} 个骨骼文件,目标版本 ${parsed.targetVersion}`)
 
-  return report(files.map((f) => convertFile(f, parsed, baseDir)), parsed)
+  const names = planConvertNames(files, (f) => writesJson(f, parsed.format))
+  return report(files.map((f) => convertFile(f, parsed, baseDir, names.get(f)!)), parsed)
 }
 
 process.exit(main())

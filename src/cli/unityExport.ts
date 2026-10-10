@@ -2,6 +2,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileS
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { collectSkeletons, findAtlas, loadAtlas, readSkeleton, stemOf } from './skeletonInputs.ts'
+import { describeClashes, planOutputNames, skeletonContentKey } from './outputNames.ts'
 import { exportToUnity } from '../spine-convert/unity/export.ts'
 import type { RenderPipeline } from '../unity/writePrefab.ts'
 import type { ConversionIssue } from '../spine-convert/types.ts'
@@ -17,7 +18,7 @@ import { parseQualitySkinWeights, skinWeightsLabel, type QualityLevel } from '..
  * 每个骨架产出一套可以**直接拖进 Assets 就能播**的资源:
  * 烘焙后的图集 PNG + `.meta`、prefab、每条动画一个 `.anim`、一个 AnimatorController。
  *
- * **不会覆盖输入** —— 默认写到 `<输入目录>_unity`。
+ * **不会覆盖输入** —— 默认写到 `<输入目录>_unity`。不同目录下的同名骨架怎么起名见 `outputNames.ts`。
  */
 
 interface Options {
@@ -204,6 +205,10 @@ function main(): void {
     return
   }
 
+  const root = statSync(parsed.input).isDirectory() ? parsed.input : dirname(parsed.input)
+  const rel = (file: string) => relative(root, file).split(sep).join('/')
+  const plan = planOutputNames(files, root, (file) => skeletonContentKey(file, parsed.atlas))
+
   const detected = detectRenderPipeline(parsed.out)
   const pipeline = parsed.renderPipeline ?? detected.pipeline
 
@@ -224,9 +229,12 @@ function main(): void {
     const why = quality === null ? '输出目录不在 Unity 工程里' : `${quality.from} 里读不出各档的 Skin Weights`
     console.log(`蒙皮根数:${why},没法检查 —— 有网格走 SkinnedMeshRenderer 时,工程 Quality 各档要设成 Four Bones(SpriteSkin 不受影响)`)
   }
+  for (const line of describeClashes(plan, root, parsed.out)) console.log(line)
   console.log()
 
   let failed = 0
+  let shared = 0
+  const failedFiles = new Set<string>()
   const counts: Record<string, number> = {}
   const issueTally = new Map<string, Tally>()
   const failTally = new Map<string, Tally>()
@@ -250,10 +258,28 @@ function main(): void {
   }
   const installed = new Set<string>()
 
-  for (const file of files) {
+  for (const { file, name: stem, sameAs, clashes } of plan) {
     const base = stemOf(file)
-    const stem = base
-    console.log(`  ${basename(file)}${parsed.skin === null ? '' : `(初始皮肤 ${parsed.skin})`}`)
+    console.log(`  ${clashes.length > 0 ? rel(file) : basename(file)}${parsed.skin === null ? '' : `(初始皮肤 ${parsed.skin})`}`)
+    if (sameAs !== null) {
+      if (failedFiles.has(sameAs)) {
+        failed++
+        console.log(`    ✗ 与 ${rel(sameAs)} 逐字节相同,它没转过去`)
+        tally(failTally, 'loss', '与同名骨架逐字节相同,那个没转过去', file)
+      } else {
+        shared++
+        const message = `与 ${rel(sameAs)} 逐字节相同(骨架、图集、图集页),共用 ${stem}/,不再导一遍`
+        counts['info'] = (counts['info'] ?? 0) + 1
+        tally(issueTally, 'info', '与同名骨架逐字节相同,共用产物', file)
+        console.log(`    ℹ ${message}`)
+      }
+      continue
+    }
+    if (stem !== base) {
+      counts['info'] = (counts['info'] ?? 0) + 1
+      tally(issueTally, 'info', '别的目录下有同名骨架、内容不同,产物改名', file)
+      console.log(`    ℹ 别的目录下有同名骨架、内容不同,产物改名为 ${stem}(Unity 的 GUID 也随名字换,不和它们撞)`)
+    }
     // 软引用要写 Assets/ 下的路径;输出目录不在工程里就只写文件名
     const assetFolder = projectRoot === null ? '' : relative(projectRoot, join(parsed.out, stem)).split(sep).join('/')
 
@@ -319,6 +345,7 @@ function main(): void {
       for (const issue of result.issues) console.log(describe(issue))
     } catch (error) {
       failed++
+      failedFiles.add(file)
       const message = error instanceof Error ? error.message : String(error)
       console.log(`    ✗ ${message}`)
       tally(failTally, 'loss', message, file)
@@ -340,7 +367,8 @@ function main(): void {
   const summary = Object.entries(counts)
     .map(([kind, n]) => `${kind} ${n}`)
     .join(',')
-  console.log(`\n完成:${files.length - failed}/${files.length}${summary ? `,问题 ${summary}` : ''}`)
+  const sharedNote = shared > 0 ? `(其中 ${shared} 个与同名骨架逐字节相同,共用产物)` : ''
+  console.log(`\n完成:${files.length - failed}/${files.length}${sharedNote}${summary ? `,问题 ${summary}` : ''}`)
   if (failed > 0) process.exitCode = 1
 }
 
