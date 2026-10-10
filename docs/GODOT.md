@@ -10,6 +10,7 @@
 |---|---|---|
 | `AnimatorGoProbe.gd` | `--headless --script` | 用 Godot 的 API 搭样例存成 `.tscn` —— **文件格式以它写出的为准**;轨道插值语义 |
 | `AnimatorGoProbeSkin.gd` | `--script`(**要渲染,不能 `--headless`**) | 渲染到 SubViewport 量质心:蒙皮公式、绑定姿势、deform 顺序 |
+| `AnimatorGoProbeBlend.gd` | `--script`(要渲染;`--rendering-method forward_plus` / `mobile` 换渲染器) | 读回像素:multiply 混合的公式(第 13 节) |
 
 ```bash
 godot --headless --path <工程> --script res://AnimatorGoProbe.gd
@@ -35,6 +36,8 @@ godot --path <工程> --script res://AnimatorGoProbeSkin.gd
 | ⚠️ 每顶点最多几根骨骼 | **4 根**(`scene/2d/polygon_2d.cpp` 写死 4 个槽:按 `bones` 数组的顺序逐个插入,只留权重最大的 4 个,权重相同时先来的优先,再归一)。之前导出没管,一声不响地被截掉 —— 见第 6 节 |
 | ⚠️ 同一属性的轨道类型 | **所有动画(含 RESET)里必须是同一种**(都值轨道或都贝塞尔轨道)。混着的话,没碰这个属性的动画回不到 RESET,读出 0 —— Stage_rewards 的 `b_box` 骨骼在 `5_open2` 里是贝塞尔、RESET 里是值轨道,别的动画里它缩成一个点,整个宝箱不见。现在某条动画用了贝塞尔的属性,其他动画和 RESET 里也写成贝塞尔(直线段控制柄放三分点,值不变)。修之前 MC2 有 504 个骨架混着、396 个有动画要回落到 RESET(是否显形取决于 Godot 内部建缓存的顺序) |
 | ⚠️ `clip_children` | 子节点的 `z_index` **必须和遮罩相同**(相对 0)才会被裁 —— 写了别的 z 就画在裁剪之外。遮罩可以是蒙皮的 Polygon2D,子节点也可以是蒙皮的 |
+| ⚠️ multiply 混合 | `CanvasItemMaterial` 的 MUL 是 `dst · src.rgb`,**贴图和 modulate 的透明度都不看**,透明的地方乘成黑色。Spine 的是 `dst · lerp(1, src.rgb, src.a)` —— 改用 `blend_mul` 的着色器,见第 13 节 |
+| 着色器 fragment 里读到的 `COLOR` | **已经是「贴图 × 顶点色 × modulate」**(Compatibility / Forward+ / Mobile 三种渲染器都是)—— 再乘 `texture(TEXTURE, UV)` 就成了贴图的平方 |
 | 节点名 | ⚠️ **不能含 `@`**(以及 `.` `:` `/` `"` `%`)—— 探针里 `a@mesh` 被改名,骨骼路径对不上,网格直接不画。Unity 导出那套 `@皮肤名` 命名不能照搬 |
 
 ## 2. `.tscn` 的写法(取自 Godot 自己写出的文件)
@@ -131,7 +134,8 @@ pnpm godot <骨架文件或目录> [--out 目录] [--atlas 图集] [--skin 初�
 
 - **绘制顺序**:`z_index` = slot 下标(祖先骨骼的 z 都是 0,相对值即绝对值)
 - **颜色**:slot 颜色 → `self_modulate`(可动画);attachment 自己的颜色 → Polygon2D 的 `color`
-- **混合模式**:additive / multiply → `CanvasItemMaterial.blend_mode`;screen 没有,按 additive 报近似
+- **混合模式**:additive → `CanvasItemMaterial`(ADD);multiply → 内嵌 `blend_mul` 着色器的 `ShaderMaterial`(第 13 节,
+  `CanvasItemMaterial` 的 MUL 不看透明度);screen 没有,按 additive 报近似。着色器不是脚本,零运行时脚本照旧
 - **坐标**:数据层面翻 Y(`y → −y`,旋转取反,`skew = shearX − shearY`),不给根节点挂 `scale.y = −1` ——
   那样用户往骨骼上挂的新东西全是倒的
 
@@ -224,7 +228,6 @@ MergeCooking2 的 7 个本地样本存在才跑(加权 deform、全靠 deform、
 
 - IK / transform / path 约束 —— 没转,受约束的骨骼停在自己的关键帧上(与 Unity 导出一致)
 - Spine 事件、两色染色的暗色、非默认继承模式、screen 混合
-- ⚠️ multiply 混合:`CanvasItemMaterial` 的 MUL 不看透明度,透明的地方乘成黑色(Easter_card 的影子是黑框,MC2 13 个骨架 / 17 个 slot)。**还没修**
 - clipping:绘制顺序动画改了遮罩的范围、两个遮罩范围重叠、加权的遮罩多边形 —— 都报 approximated(第 12 节)
 - 每顶点超过 4 根骨骼:Godot 只用 4 根。挑留哪 4 根、拟合坐标后仍超 0.5 像素的报 approximated(第 6 节)
 
@@ -245,3 +248,32 @@ MergeCooking2 的 7 个本地样本存在才跑(加权 deform、全靠 deform、
 (`AnimatorGoVerify.gd` 不再要求遮罩有贴图);渲染出来与不裁的旧版逐帧比,裁掉的正是框外那部分,与 Unity 同一时刻逐帧一致。
 MC2 全部 535 个骨架导出成功,没有遮罩相关的 loss。
 
+## 13. multiply 混合 → `blend_mul` 着色器(2026-10-10)
+
+Spine 的 multiply 看透明度:`dst · lerp(1, src.rgb, src.a)`(预乘贴图下就是 `src = DST_COLOR, dst = ONE_MINUS_SRC_ALPHA`)。
+之前写的是 `CanvasItemMaterial` 的 MUL,实测它是 `dst · src.rgb`,贴图的透明度、`self_modulate` 的透明度都不看 ——
+透明的像素(rgb 是 0)把背后乘成黑色。Easter_card 三只兔子的影子(R2_shadow / R_shadow / M_shadow)画成黑框。
+
+现在每个场景内嵌一个着色器(`Shader` + `ShaderMaterial` 两个 sub_resource,所有 multiply 的 slot 共用):
+
+```glsl
+shader_type canvas_item;
+render_mode blend_mul;
+void fragment() {
+	COLOR = vec4(mix(vec3(1.0), COLOR.rgb, COLOR.a), 1.0);
+}
+```
+
+透明度折进颜色,alpha 写 1(`blend_mul` 的 alpha 是 `src.a · dst.a`,dst 的 alpha 不动)。⚠️ fragment 里读到的 `COLOR` 已经乘过贴图
+(实测),**不能**写成 `texture(TEXTURE, UV) * COLOR` —— 那样贴图乘了两遍,半透明处偏暗、不透明处变成平方。
+
+实测(`tools/godot/AnimatorGoProbeBlend.gd`:背景色已知,贴图四种 texel × slot 颜色 / attachment 颜色 / 半透明 modulate,读回像素和公式比):
+Compatibility、Forward+(Vulkan)、Mobile 三种渲染器误差都不超过 1/255(Compatibility 下透明背景的 SubViewport 也一样);
+旧的 `CanvasItemMaterial` 差到 0.7,`texture(TEXTURE, UV) * COLOR` 的写法差到 0.2。
+贴图导出时已还原成直通 alpha(第 5 节),公式里的 `src.rgb` 就是直通的颜色。
+
+验证:MC2 里 13 个骨架 / 17 个 slot 用到(22401 的那个 slot 没有画得出的 attachment;rukou_pet 4 份同名,导出目录互相覆盖),
+写出 9 个场景,Godot 4.7 自检全部通过。与旧版(同一场景只把材质换回 `CanvasItemMaterial` MUL)逐帧比,不同的只有 multiply 部件那几块:
+旧版 9 个场景全有黑块 —— 小的是 Card_Interface 猫爪影子的两个角、Easter_card 兔子影子的黑框,大的是 34500 / 39400 整栋建筑大半涂黑、
+hot_air_balloon 猫脸被一块黑盖住;新版都没有,影子是柔和的一层暗色。
+端到端测试加了用例:multiply 的 slot 挂 `blend_mul` 着色器、着色器写在材质前面、不再采一次贴图。

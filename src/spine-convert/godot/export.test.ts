@@ -72,6 +72,8 @@ function transform2d(v: ParsedValue | undefined): Affine {
 class GodotScene {
   readonly nodes = new Map<string, Node>()
   readonly animations = new Map<string, ParsedSection>()
+  /** 全部 sub_resource,按 id,保持文件里的先后 */
+  readonly resources = new Map<string, ParsedSection>()
 
   constructor(text: string) {
     for (const s of parseScene(text)) {
@@ -80,8 +82,9 @@ class GodotScene {
         const name = s.attrs['name']!
         const path = parent === null ? '' : parent === '.' ? name : `${parent}/${name}`
         this.nodes.set(path, { name, type: s.attrs['type']!, path, parent, props: s.props })
-      } else if (s.kind === 'sub_resource' && s.attrs['type'] === 'Animation') {
-        this.animations.set(s.props.get('resource_name') as string, s)
+      } else if (s.kind === 'sub_resource') {
+        this.resources.set(s.attrs['id']!, s)
+        if (s.attrs['type'] === 'Animation') this.animations.set(s.props.get('resource_name') as string, s)
       }
     }
   }
@@ -403,6 +406,32 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
           const on = slotAttachmentsAt(part, anim === null ? null : { ...anim, timelines: kept }, t)[g.slot] === g.key
           expect(values.get(`${name}:clip_children`) ?? mask.props.get('clip_children'), at).toBe(on ? 1 : 0)
         }
+      }
+    }
+  })
+
+  it('⭐ 混合模式:multiply → blend_mul 着色器,透明度折进颜色(实测 CanvasItemMaterial 的 MUL 不看透明度,透明处乘成黑);additive → CanvasItemMaterial', () => {
+    const ids = [...scene.resources.keys()]
+    const idOf = (v: ParsedValue | undefined) => args(v)[0] as unknown as string
+    for (const { a, slot, node } of pairs) {
+      const blend = part.slots[slot]!.blendMode
+      if (blend === 0) {
+        expect(node.props.has('material'), a.name).toBe(false)
+        continue
+      }
+      const mat = scene.resources.get(idOf(node.props.get('material')))!
+      if (blend === 2) {
+        expect(mat.attrs['type'], a.name).toBe('ShaderMaterial')
+        const shaderId = idOf(mat.props.get('shader'))
+        expect(ids.indexOf(shaderId), '着色器写在引用它的材质前面').toBeLessThan(ids.indexOf(mat.attrs['id']!))
+        const code = scene.resources.get(shaderId)!.props.get('code') as string
+        expect(code).toContain('render_mode blend_mul;')
+        // fragment 里的 COLOR 已经是「贴图 × 顶点色 × modulate」(实测)—— 再采一次贴图就成了平方
+        expect(code).toContain('COLOR = vec4(mix(vec3(1.0), COLOR.rgb, COLOR.a), 1.0);')
+        expect(code).not.toContain('texture(')
+      } else {
+        expect(mat.attrs['type'], a.name).toBe('CanvasItemMaterial')
+        expect(mat.props.get('blend_mode'), a.name).toBe(1)
       }
     }
   })

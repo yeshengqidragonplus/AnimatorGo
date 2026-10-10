@@ -413,7 +413,14 @@ MergeCooking2 里 22 个骨架用到,之前两个引擎都整个丢弃。范围 
 - **同一属性的轨道类型在各动画里不一致**(有的值轨道、有的贝塞尔),Godot 里没碰这个属性的动画回不到 RESET,读出 0 ——
   Stage_rewards 的 5 号宝箱整个缩成一个点。修之前 MC2 有 504 个骨架混着、396 个有动画要回落到 RESET。已修(统一写成贝塞尔)并加了用例。
   端到端测试一直没抓到:它按我们理解的 Godot 规则求值,而这条规则是 Godot 自己的缓存行为
-- **multiply 混合在 Godot 里透明处变黑**(Easter_card 兔子的影子是黑框;MC2 13 个骨架 / 17 个 slot)。还没修
+- ~~**multiply 混合在 Godot 里透明处变黑**~~ 已修(2026-10-10):`CanvasItemMaterial` 的 MUL 是 `dst · src.rgb`,透明度不看(实测),
+  Easter_card 兔子的影子是黑框(MC2 13 个骨架 / 17 个 slot)。改成内嵌 `blend_mul` 着色器,把透明度折进颜色:
+  `COLOR = vec4(mix(vec3(1.0), COLOR.rgb, COLOR.a), 1.0)`,三种渲染器实测与 Spine 的公式差不超过 1/255。⚠️ fragment 的 `COLOR`
+  已经乘过贴图(实测),写成 `texture(TEXTURE, UV) * COLOR` 是错的。见 [GODOT.md](GODOT.md) 第 13 节
+- ⚠️ 顺带发现(没修):**Unity 导出不看 slot 的混合模式**,additive / multiply / screen 一律按 normal 画,也没报 —— 违反「有损必须报告」。
+  Easter_card 的影子在 Unity 里看着是对的,其实是 normal 混合碰巧像
+- ⚠️ 顺带发现(没修):`pnpm godot` / `pnpm unity` 批量导出时输出目录按骨架名起,**不同目录下的同名骨架互相覆盖**、不报
+  (MC2 535 个骨架只写出 513 个场景;rukou_pet 就有 4 份)
 
 ### ⚠️ 两个渲染工具都画错过(2026-10-09 修)
 

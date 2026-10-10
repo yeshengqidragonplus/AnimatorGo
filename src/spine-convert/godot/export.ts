@@ -457,6 +457,24 @@ const CLIP_ON = 1
 const CLIP_OFF = 0
 const clipModulate = (on: boolean) => (on ? G.color(1, 1, 1, 1) : G.color(1, 1, 1, 0))
 
+/**
+ * multiply 混合。Spine 的 multiply 看透明度:`dst · lerp(1, src.rgb, src.a)`;`CanvasItemMaterial` 的 MUL 是
+ * `dst · src.rgb`,贴图和 modulate 的透明度都不看(实测),透明的地方乘成黑色。改用 `blend_mul` 的着色器,
+ * 把透明度折进颜色里、alpha 写 1(dst 的 alpha 不动)。
+ * ⚠️ fragment 里读到的 `COLOR` 已经是「贴图 × 顶点色 × modulate」(实测,Compatibility / Forward+ / Mobile 三种
+ * 渲染器都是)—— 再乘一遍 `texture(TEXTURE, UV)` 就成了贴图的平方。实测与 Spine 的公式差不超过 1/255。
+ */
+const MULTIPLY_SHADER = [
+  'shader_type canvas_item;',
+  'render_mode blend_mul;',
+  '',
+  '// Spine 的 multiply:dst · lerp(1, src.rgb, src.a)(AnimatorGo 导出)',
+  'void fragment() {',
+  '\tCOLOR = vec4(mix(vec3(1.0), COLOR.rgb, COLOR.a), 1.0);',
+  '}',
+  '',
+].join('\n')
+
 function setupVisible(slot: { attachmentName: string | null }, node: { key: string; frame?: { index: number; sequence: Sequence } }): boolean {
   if (slot.attachmentName !== node.key) return false
   return node.frame === undefined || node.frame.index === sequenceFrameAt(undefined, node.frame.sequence, 0)
@@ -701,10 +719,15 @@ export function exportToGodot(
     }
     const blend = slot.blendMode
     if (blend !== 0) {
-      const mode = blend === 1 ? 1 : blend === 2 ? 3 : 1
       if (blend === 3) issues.add('approximated', `slot.${slot.name}`, 'Godot 没有 screen 混合模式,按 additive 处理')
       const id = `mat_${blend}`
-      if (!subResources.some((r) => r.id === id)) subResources.push({ id, type: 'CanvasItemMaterial', properties: [['blend_mode', mode]] })
+      if (!subResources.some((r) => r.id === id)) {
+        if (blend === 2) {
+          // 着色器要写在引用它的材质前面
+          subResources.push({ id: 'shader_multiply', type: 'Shader', properties: [['code', MULTIPLY_SHADER]] })
+          subResources.push({ id, type: 'ShaderMaterial', properties: [['shader', G.subResource('shader_multiply')]] })
+        } else subResources.push({ id, type: 'CanvasItemMaterial', properties: [['blend_mode', 1]] })
+      }
       props.push(['material', G.subResource(id)])
     }
     push({ name, type: 'Polygon2D', parent: container, properties: props })
