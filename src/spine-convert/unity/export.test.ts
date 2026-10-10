@@ -15,7 +15,9 @@ import { slotAttachmentsAt } from '../../spine-eval/slots.ts'
 import { lastPerProperty } from '../../spine-format/duplicateTimelines.ts'
 import { clipDeformOf, clipGroups, clipPolygonAt } from '../clipping.ts'
 import { IssueCollector } from '../types.ts'
-import { MASKED_MESH_SHADER_FILE, MASKED_MESH_SHADER_GUID } from '../../unity/writeMaterial.ts'
+import { BLEND_FACTORS, BLEND_SHADER_FILES, BLEND_SHADER_GUIDS, MASKED_MESH_SHADER_FILE, MASKED_MESH_SHADER_GUID, type SpineBlend } from '../../unity/writeMaterial.ts'
+import { SPRITE_MATERIALS, type RenderPipeline } from '../../unity/writePrefab.ts'
+import type { SkeletonPart } from '../../spine-format/binary/readSkeleton.ts'
 
 /**
  * Spine → Unity 的**端到端校验**。
@@ -331,6 +333,66 @@ function readSkinnedRenderers(text: string): { name: string; meshGuid: string; m
     })
   }
   return out
+}
+
+const BLEND_OF_MODE: readonly (SpineBlend | null)[] = [null, 'additive', 'multiply', 'screen']
+
+/**
+ * 混合模式:逐个渲染器(SpriteRenderer / SkinnedMeshRenderer)查它的材质是不是它那个 slot 该用的 ——
+ * normal 的 SpriteRenderer 挂管线的默认材质、SkinnedMeshRenderer 挂图集页的材质(不写混合因子);
+ * 别的模式挂自带着色器的材质(被遮的 SkinnedMeshRenderer 在 URP 下用 AnimatorGoMaskedMesh),`_SrcBlend` / `_DstBlend`
+ * 是 Spine 的因子,SkinnedMeshRenderer 的要带贴图、SpriteRenderer 的不带。返回每个 slot 查过的渲染器数
+ */
+function checkBlendMaterials(part: SkeletonPart, files: readonly UnityFile[], prefabPath: string, rp: RenderPipeline): { checked: Map<string, number>; runtime: Set<string>; shadersOf: Map<string, Set<string>> } {
+  const text = (path: string) => files.find((f) => f.path === path)!.content as string
+  const matOfGuid = new Map<string, string>()
+  for (const f of files) if (f.path.endsWith('.mat.meta')) matOfGuid.set(/guid: (\w+)/.exec(f.content as string)![1]!, f.path.slice(0, -'.meta'.length))
+  const docs = text(prefabPath).split(/^--- /m).slice(1)
+  const goName = new Map<string, string>()
+  for (const d of docs) if (d.startsWith('!u!1 ')) goName.set(/^!u!1 &(\d+)/.exec(d)![1]!, /m_Name: (.*)/.exec(d)![1]!.trim())
+  const sanitize = (n: string) => n.replace(/[\\/:*?"<>|]/g, '_')
+  const slotOfNode = (name: string) => part.slots.map((s, i) => ({ n: sanitize(s.name), i }))
+    .filter(({ n }) => name === n || name.startsWith(`${n}__`) || name.startsWith(`${n}#`) || name.startsWith(`${n}@`) || name.startsWith(`${n}_`))
+    .sort((x, y) => y.n.length - x.n.length)[0]?.i
+  const checked = new Map<string, number>()
+  /** 混合材质用到的着色器 → 它在 tools/unity/runtime/ 的文件名(产物的 runtime 必须带上) */
+  const runtime = new Set<string>()
+  /** slot 名 → 它的渲染器用到的着色器文件(info 里要报的就是这些) */
+  const shadersOf = new Map<string, Set<string>>()
+  for (const d of docs) {
+    const cls = /^!u!(212|137) &/.exec(d)?.[1]
+    if (cls === undefined) continue
+    const go = goName.get(/m_GameObject: \{fileID: (\d+)}/.exec(d)![1]!)!
+    const slot = slotOfNode(go)
+    if (slot === undefined) continue
+    const blend = BLEND_OF_MODE[part.slots[slot]!.blendMode] ?? null
+    const matRef = /m_Materials:\n {2}- (\{[^}]*})/.exec(d)?.[1] ?? ''
+    const label = `${go}(${cls === '212' ? 'SpriteRenderer' : 'SkinnedMeshRenderer'},${blend ?? 'normal'})`
+    if (cls === '212' && blend === null) {
+      expect(matRef, label).toBe(SPRITE_MATERIALS[rp])
+    } else {
+      const mat = matOfGuid.get(/guid: (\w+)/.exec(matRef)?.[1] ?? '')
+      expect(mat, label).toBeDefined()
+      const matText = text(mat!)
+      const src = /_SrcBlend: (\d+)/.exec(matText)?.[1]
+      const dst = /_DstBlend: (\d+)/.exec(matText)?.[1]
+      const shader = /m_Shader: \{fileID: \d+, guid: (\w+)/.exec(matText)![1]
+      const masked = /m_MaskInteraction: 1/.test(d) && rp === 'urp'
+      if (blend === null) {
+        expect([src, dst], label).toEqual([undefined, undefined])
+      } else {
+        expect([Number(src), Number(dst)], label).toEqual([BLEND_FACTORS[blend].src, BLEND_FACTORS[blend].dst])
+        expect(shader, label).toBe(cls === '137' && masked ? MASKED_MESH_SHADER_GUID : BLEND_SHADER_GUIDS[rp])
+        const file = cls === '137' && masked ? MASKED_MESH_SHADER_FILE : BLEND_SHADER_FILES[rp]
+        runtime.add(file)
+        shadersOf.set(part.slots[slot]!.name, (shadersOf.get(part.slots[slot]!.name) ?? new Set()).add(file))
+        // SpriteRenderer 自己塞纹理,材质不带;SkinnedMeshRenderer 不会,材质必须带
+        expect(/_MainTex:\n\s+m_Texture: \{fileID: (\d+)/.exec(matText)![1], label).toBe(cls === '137' ? '2800000' : '0')
+      }
+    }
+    checked.set(part.slots[slot]!.name, (checked.get(part.slots[slot]!.name) ?? 0) + 1)
+  }
+  return { checked, runtime, shadersOf }
 }
 
 // ─── 用例 ────────────────────────────────────────────────────────────────────
@@ -899,17 +961,31 @@ describe.skipIf(!hasAssets)('Spine → Unity 端到端', () => {
     expect(degraded).toEqual([])
   })
 
-  it('⭐ 非 normal 的混合模式逐个 slot 报出来,不静默(之前一律按 normal 画、不报)', () => {
+  it('⭐ 混合模式:每个渲染器挂它那个 slot 该用的材质,因子是 Spine 的;没有 loss,运行时带上着色器(URP / 内置)', () => {
     expect(part.slots.every((s) => s.blendMode === 0)).toBe(true)
-    expect(result.issues.some((i) => i.path.startsWith('slot.') && i.message.includes('混合'))).toBe(false)
-    // 挑三个画得出东西的 slot,分别改成 additive / multiply / screen
-    const drawn = part.slots.map((s, i) => ({ s, i })).filter(({ s }) => s.attachmentName !== null).slice(0, 3)
-    const modes = ['additive', 'multiply', 'screen']
-    const blended = { ...part, slots: part.slots.map((s, i) => { const k = drawn.findIndex((d) => d.i === i); return k < 0 ? s : { ...s, blendMode: k + 1 } }) }
-    const issues = exportToUnity(blended, atlas, sources, { name: 'MX2_cat', pixelsPerUnit: 100, renderPipeline: 'urp', skipImages: true }).issues
-    const reported = issues.filter((i) => i.path.startsWith('slot.') && i.message.includes('混合'))
-    expect(reported.map((i) => i.path)).toEqual(drawn.map(({ s }) => `slot.${s.name}`))
-    reported.forEach((i, k) => expect(i.message).toContain(modes[k]))
+    // 全是 normal:不写混合材质、不带混合着色器
+    expect(result.files.some((f) => /@(additive|multiply|screen)\.mat$/.test(f.path))).toBe(false)
+    expect(result.runtime.some((r) => r.startsWith('AnimatorGoBlend'))).toBe(false)
+    // slot 轮流改成 normal / additive / multiply / screen —— SpriteRenderer 和 SkinnedMeshRenderer 都轮得到
+    const blended = { ...part, slots: part.slots.map((s, i) => ({ ...s, blendMode: i % 4 })) }
+    for (const rp of ['urp', 'builtin'] as const) {
+      const out = exportToUnity(blended, atlas, sources, { name: 'MX2_cat', pixelsPerUnit: 100, renderPipeline: rp, skipImages: true })
+      const { checked, runtime } = checkBlendMaterials(blended, out.files, 'MX2_cat.prefab', rp)
+      for (const r of runtime) expect(out.runtime).toContain(r)
+      const prefab = out.files.find((f) => f.path === 'MX2_cat.prefab')!.content as string
+      expect(prefab.split('!u!137 ').length - 1, '样本里要有 SkinnedMeshRenderer').toBeGreaterThan(0)
+      for (const mode of [1, 2, 3]) {
+        const slots = blended.slots.filter((s) => s.blendMode === mode && checked.has(s.name))
+        expect(slots.length, `${rp} ${BLEND_OF_MODE[mode]}`).toBeGreaterThan(0)
+        for (const s of slots) {
+          const issue = out.issues.find((i) => i.path === `slot.${s.name}`)
+          expect(issue?.level, s.name).toBe('info')
+          expect(issue!.message).toContain(BLEND_OF_MODE[mode])
+        }
+      }
+      expect(out.issues.some((i) => i.level === 'loss' && i.path.startsWith('slot.'))).toBe(false)
+      expect(runtime).toContain(BLEND_SHADER_FILES[rp])
+    }
   })
 
   it('两次导出逐字节相同 —— 否则 Unity 里的引用会断', () => {
@@ -1718,7 +1794,8 @@ describe.skipIf(!existsSync(`${stem}.skel.bytes`))(`clipping → SpriteMask(${la
 // ─── slot 的混合模式:MergeCooking2 的本地样本(不在库里,存在才跑)─────────────────────────────────────
 
 const BLEND_SAMPLES = [
-  ['Easter_card(3 个 multiply 的影子)', `${MC2_ROOT}/CardCollectMain/Easter_card`, ['R2_shadow', 'R_shadow', 'M_shadow']],
+  ['Easter_card(3 个 multiply 的影子,被遮的 SpriteRenderer)', `${MC2_ROOT}/CardCollectMain/Easter_card`, ['R2_shadow', 'R_shadow', 'M_shadow']],
+  ['rukou_pet(multiply 的影子,被遮的 SkinnedMeshRenderer)', `${MC2_ROOT}/../../Activity/PetMerge/Spine/rukou_pet`, ['shadow']],
   ['34500(multiply 的整栋建筑影子)', `${MC2_ROOT}/../../World/Map7/Spine/34500`, ['shadow_F']],
   ['Multiple_Energy(24 个 additive 的粒子)', `${MC2_ROOT}/../../Public/System/MultipleEnergy/Spine/Multiple_Energy`, ['particle', 'particle24']],
 ] as const
@@ -1730,21 +1807,34 @@ describe.skipIf(!existsSync(`${stem}.skel.bytes`))(`混合模式(${label})`, () 
   const dir = stem.slice(0, stem.lastIndexOf('/'))
   const sources = new Map<string, Image>()
   for (const page of atlas.pages) sources.set(page.name, decodePng(new Uint8Array(readFileSync(`${dir}/${page.name}`))))
-  const result = exportToUnity(part, atlas, sources, { name: 'b', pixelsPerUnit: 100, renderPipeline: 'urp', skipImages: true })
   const drawn = (slot: number) => part.skins.some((s) => s.slots.some((e) => e.slot === slot && e.attachments.some((a) => a.type === 'region' || a.type === 'mesh')))
+  const blended = part.slots.map((s, i) => ({ s, i })).filter(({ s, i }) => s.blendMode !== 0 && drawn(i))
 
-  it('每个画得出东西、混合模式不是 normal 的 slot 都报了,带 slot 名和模式名', () => {
-    const names = ['normal', 'additive', 'multiply', 'screen']
-    const blended = part.slots.map((s, i) => ({ s, i })).filter(({ s, i }) => s.blendMode !== 0 && drawn(i))
-    for (const name of expected) expect(blended.map(({ s }) => s.name)).toContain(name)
-    for (const { s } of blended) {
-      const issue = result.issues.find((i) => i.path === `slot.${s.name}` && i.message.includes('混合'))
-      expect(issue, s.name).toBeDefined()
-      expect(issue!.message).toContain(names[s.blendMode])
-    }
-    // normal 的不报
-    const normal = new Set(part.slots.filter((s) => s.blendMode === 0).map((s) => `slot.${s.name}`))
-    expect(result.issues.some((i) => normal.has(i.path) && i.message.includes('混合'))).toBe(false)
-  })
+  for (const rp of ['urp', 'builtin'] as const) {
+    const result = exportToUnity(part, atlas, sources, { name: 'b', pixelsPerUnit: 100, renderPipeline: rp, skipImages: true })
+
+    it(`${rp}:每个画得出东西、混合模式不是 normal 的 slot 都报了 info(带 slot 名和模式名),normal 的不报`, () => {
+      for (const name of expected) expect(blended.map(({ s }) => s.name)).toContain(name)
+      for (const { s } of blended) {
+        const issue = result.issues.find((i) => i.path === `slot.${s.name}`)
+        expect(issue?.level, s.name).toBe('info')
+        expect(issue!.message).toContain(BLEND_OF_MODE[s.blendMode])
+      }
+      const normal = new Set(part.slots.filter((s) => s.blendMode === 0).map((s) => `slot.${s.name}`))
+      expect(result.issues.some((i) => normal.has(i.path) && i.message.includes('混合'))).toBe(false)
+    })
+
+    it(`${rp}:⭐ 每个渲染器的材质与它的 slot 的混合模式对得上(被遮的 SkinnedMeshRenderer 在 URP 下用 AnimatorGoMaskedMesh)`, () => {
+      const { checked, runtime, shadersOf } = checkBlendMaterials(part, result.files, 'b.prefab', rp)
+      for (const name of expected) expect(checked.get(name), name).toBeGreaterThan(0)
+      expect(runtime.size).toBeGreaterThan(0)
+      for (const r of runtime) expect(result.runtime).toContain(r)
+      // info 报的着色器就是它的渲染器真用的(被遮的 SkinnedMeshRenderer 在 URP 下是 AnimatorGoMaskedMesh)
+      for (const [slot, files] of shadersOf) {
+        const message = result.issues.find((i) => i.path === `slot.${slot}`)!.message
+        for (const f of files) expect(message, slot).toContain(f)
+      }
+    })
+  }
 })
 }

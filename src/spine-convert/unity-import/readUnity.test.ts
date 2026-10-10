@@ -187,6 +187,29 @@ for (const sample of SAMPLES) {
  * 直接改文本(改关键帧取值、插一个默认切线的新关键帧、挪 prefab 里骨骼的位置),
  * 读回来要逐点符合 Unity 的规则,而且改动要落在对应的骨骼 / 时间轴上。
  */
+describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('混合模式读回来(MX2_cat 4.1,slot 轮流改成四种模式)', () => {
+  const part = readSkeletonPart(new Uint8Array(readFileSync('res/spine/4.1/MX2_cat.skel.bytes')))
+  const atlas = parseAtlas(readFileSync('res/spine/4.1/MX2_cat.atlas.txt', 'utf8'))
+  const sources = new Map<string, Image>(atlas.pages.map((p) => [p.name, decodePng(new Uint8Array(readFileSync(`res/spine/4.1/${p.name}`)))]))
+  const blended = { ...part, slots: part.slots.map((s, i) => ({ ...s, blendMode: i % 4 })) }
+
+  for (const rp of ['urp', 'builtin'] as const) {
+    it(`⭐ ${rp}:我们导出的混合材质读回成 slot 的 blend,与原来逐个相同(SpriteRenderer、SkinnedMeshRenderer 都有)`, () => {
+      const unity = exportToUnity(blended, atlas, sources, { name: 'x', pixelsPerUnit: PPU, renderPipeline: rp })
+      const back = fromJson(importUnity(new Map(unity.files.map((f) => [f.path, f.content])), { pixelsPerUnit: PPU }).json)
+      expect(back.slots.length).toBeGreaterThan(10)
+      const modes = new Set<number>()
+      for (const s of back.slots) {
+        const original = blended.slots.find((o) => o.name === s.name)
+        expect(original, s.name).toBeDefined()
+        expect(s.blendMode, s.name).toBe(original!.blendMode)
+        modes.add(s.blendMode)
+      }
+      expect([...modes].sort()).toEqual([0, 1, 2, 3])
+    })
+  }
+})
+
 describe.skipIf(!existsSync('res/spine/4.1/MX2_cat.skel.bytes'))('Unity 产物在 Unity 里改过之后 → Spine(MX2_cat 4.1)', () => {
   const part = readSkeletonPart(new Uint8Array(readFileSync('res/spine/4.1/MX2_cat.skel.bytes')))
   const atlas = parseAtlas(readFileSync('res/spine/4.1/MX2_cat.atlas.txt', 'utf8'))

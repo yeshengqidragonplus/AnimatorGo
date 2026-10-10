@@ -13,6 +13,7 @@ import {
 import { writeAnim, type FloatCurve, type Vector3Curve } from '../../unity/writeAnim.ts'
 import {
   writePrefab,
+  type AssetRef,
   type PrefabNode,
   type RenderPipeline,
   type RendererSpec,
@@ -24,7 +25,7 @@ import { writeNativeMeta, writePrefabMeta, writeTextureMeta, type MetaBone, type
 import { unityGuid, internalId, uniqueIds } from '../../unity/ids.ts'
 import { encodePng, type Image } from '../../unity/png.ts'
 import { writeMesh, MESH_FILE_ID, type BlendShape, type BoneInfluence, type MeshVertex } from '../../unity/writeMesh.ts'
-import { writeSpriteMaterial, MASKED_MESH_SHADER_FILE, MATERIAL_FILE_ID, TEXTURE_FILE_ID } from '../../unity/writeMaterial.ts'
+import { writeSpriteMaterial, BLEND_SHADER_FILES, MASKED_MESH_SHADER_FILE, MATERIAL_FILE_ID, TEXTURE_FILE_ID, type SpineBlend } from '../../unity/writeMaterial.ts'
 import { attachmentVertices } from '../../spine-eval/vertices.ts'
 import { clipDeformOf, clipGroups, clipOnSteps, clipPolygonAt, clipToggled, triangulatePolygon, type ClipGroup, type Point } from '../clipping.ts'
 import { skinWeightsLabel, UNLIMITED_SKIN_WEIGHTS, type QualityLevel } from '../../unity/qualitySettings.ts'
@@ -141,7 +142,7 @@ export interface UnityExportResult {
   readonly issues: readonly ConversionIssue[]
   /**
    * 产物用到的共用文件(`tools/unity/runtime/` 下的文件名,连同 `.meta`),要拷进工程的 `AnimatorGoRuntime/` 一次。
-   * 现在只有被遮罩遮住的 SkinnedMeshRenderer 用的着色器
+   * 现在是两个着色器:混合模式不是 normal 的 slot 用的(按管线二选一)、被遮罩遮住的 SkinnedMeshRenderer 用的
    */
   readonly runtime: readonly string[]
 }
@@ -156,8 +157,8 @@ function unpackColor(packed: number): { r: number; g: number; b: number; a: numb
   }
 }
 
-/** `SlotRecord.blendMode` 的取值 → Spine 里的名字 */
-const BLEND_MODE_NAMES = ['normal', 'additive', 'multiply', 'screen']
+/** `SlotRecord.blendMode` 的取值 → Unity 这边要自己的材质的那三种(normal 是 null,走默认 sprite 材质) */
+const BLEND_OF_MODE: readonly (SpineBlend | null)[] = [null, 'additive', 'multiply', 'screen']
 
 /** 逐帧修正里,阶梯跳变前补的那个采样离跳变多远(秒) */
 const STEP_EPSILON = 1e-4
@@ -562,11 +563,17 @@ export function exportToUnity(
     }
   }
   // slot 的混合模式:Unity 的默认 sprite 材质只有 normal(直通 alpha 混合)。之前一声不响地全按 normal 画 ——
-  // additive 的光效变成不透明的一块,multiply 的影子变成盖上去的一层。只报画得出东西的 slot
+  // additive 的光效变成不透明的一块,multiply 的影子变成盖上去的一层。现在这些 slot 挂自带着色器的材质,
+  // 混合因子取 Spine 自己的(writeMaterial.ts 的 BLEND_FACTORS);建完节点按 slot 报一条 info(blendShaders)
+  const blendOfSlot = (slot: number): SpineBlend | null => BLEND_OF_MODE[part.slots[slot]!.blendMode] ?? null
   part.slots.forEach((slot, i) => {
-    if (slot.blendMode === 0 || !used.some((u) => u.slot === i)) return
-    issues.loss(`slot.${slot.name}`, `Spine 的 ${BLEND_MODE_NAMES[slot.blendMode] ?? slot.blendMode} 混合在 Unity 的默认 sprite 材质里没有对应物,按 normal 画`)
+    if (slot.blendMode !== 0 && blendOfSlot(i) === null && used.some((u) => u.slot === i)) {
+      issues.loss(`slot.${slot.name}`, `不认识的混合模式 ${slot.blendMode},按 normal 画`)
+    }
   })
+  /** 混合模式不是 normal 的 slot → 它的渲染器用到的着色器(tools/unity/runtime/ 的文件名) */
+  const blendShaders = new Map<number, Set<string>>()
+  const useBlendShader = (slot: number, file: string) => blendShaders.set(slot, (blendShaders.get(slot) ?? new Set()).add(file))
 
   // ── 2. 烘焙图集 ──
   // Spine 导给 spine-unity 的图集默认是预乘 alpha,Unity 的 sprite 材质按直通 alpha 混合 ——
@@ -1069,6 +1076,27 @@ export function exportToUnity(
   const maskedPages = new Set<number>()
   const maskedMaterialGuids = pageNames.map((p) => unityGuid(`${name}/material-clip/${p}`))
   const maskTextureGuid = unityGuid(`${name}/texture/clip`)
+  // 混合模式不是 normal 的 slot 的材质:SpriteRenderer 每种模式一个(<骨架>@sprite@<模式>,不带贴图,SpriteRenderer 自己塞);
+  // SkinnedMeshRenderer 每张图集页 × 遮没遮 × 模式一个(<页>[@clip]@<模式>,要带贴图,被遮的用 AnimatorGoMaskedMesh)。
+  // ⚠️ SpriteRenderer 的不能叫 <骨架>@<模式>:默认皮肤只有一页时页名就是骨架名,会和那一页的撞成一个文件。文件名 → 怎么写
+  const blendMaterials = new Map<string, { page: number | null; masked: boolean; blend: SpineBlend; guid: string }>()
+  const blendMaterialOf = (page: number | null, masked: boolean, blend: SpineBlend): { file: string; ref: AssetRef } => {
+    const file = `${page === null ? `${name}@sprite` : pageNames[page]!}${masked ? '@clip' : ''}@${blend}.mat`
+    const guid = unityGuid(`${name}/material-blend/${file}`)
+    blendMaterials.set(file, { page, masked, blend, guid })
+    return { file, ref: { fileID: MATERIAL_FILE_ID, guid } }
+  }
+  /** SkinnedMeshRenderer 用哪个材质(文件名 + 引用) */
+  const skinnedMaterialOf = (item: SlotAttachment, page: number): { file: string; ref: AssetRef } => {
+    const masked = maskOfSlot.has(item.slot) && maskedMeshes
+    const blend = blendOfSlot(item.slot)
+    if (blend !== null) {
+      useBlendShader(item.slot, masked ? MASKED_MESH_SHADER_FILE : BLEND_SHADER_FILES[options.renderPipeline])
+      return blendMaterialOf(page, masked, blend)
+    }
+    if (masked) maskedPages.add(page)
+    return { file: `${pageNames[page]!}${masked ? '@clip' : ''}.mat`, ref: { fileID: MATERIAL_FILE_ID, guid: (masked ? maskedMaterialGuids : materialGuids)[page]! } }
+  }
   const maskSpriteId = (b: number, k: number) => internalId(`${name}/clip/${b}/${k}`)
 
   // ── 4. prefab 节点 ──
@@ -1127,7 +1155,7 @@ export function exportToUnity(
       item.node = nodes.length
       geo.nodeIndex = item.node
       const masked = maskOfSlot.has(item.slot) && maskedMeshes
-      if (masked) maskedPages.add(info.page)
+      const material = skinnedMaterialOf(item, info.page)
       nodes.push({
         name: claimName(0, attachmentNodeName(item, slot.name)),
         parent: 0,
@@ -1141,7 +1169,7 @@ export function exportToUnity(
         skinnedMesh: {
           mesh: { fileID: MESH_FILE_ID, guid: meshGuidOf(item.spriteName) },
           // 带脚本模式下换装件不硬引用材质(材质引用着贴图),由 AnimatorGoSkins 切到时装上
-          material: scriptMode && !isDefaultSkin(item.skin) ? null : { fileID: MATERIAL_FILE_ID, guid: (masked ? maskedMaterialGuids : materialGuids)[info.page]! },
+          material: scriptMode && !isDefaultSkin(item.skin) ? null : material.ref,
           // 换图那一维:setup pose 只亮 attachmentName 那一个(序列帧只亮 setup 帧)
           enabled: enabledAtSetup(item),
           bones: geo.slots.map((s) => boneNode[s.bone]!),
@@ -1156,7 +1184,7 @@ export function exportToUnity(
     }
 
     const color = unpackColor(slot.color)
-    const renderer: RendererSpec = {
+    let renderer: RendererSpec = {
       // 带脚本模式下换装件不硬引用 sprite,由 AnimatorGoSkins 切到时装上
       sprite: scriptMode && !isDefaultSkin(item.skin) ? null : { fileID: info.internalID, guid: textureGuids[info.page]! },
       // Spine 的 slots 数组顺序就是绘制顺序,先画的在下层
@@ -1165,6 +1193,12 @@ export function exportToUnity(
       // 换图那一维:setup pose 只亮 attachmentName 那一个;表情变体初始是灭的;序列帧只亮 setup 帧
       enabled: enabledAtSetup(item),
       ...(maskOfSlot.has(item.slot) ? { maskInteraction: 1 as const } : {}),
+    }
+    const blend = blendOfSlot(item.slot)
+    // 不带贴图,带脚本模式下也能硬引用
+    if (blend !== null) {
+      renderer = { ...renderer, material: blendMaterialOf(null, false, blend).ref }
+      useBlendShader(item.slot, BLEND_SHADER_FILES[options.renderPipeline])
     }
 
     let parent: number
@@ -1227,6 +1261,10 @@ export function exportToUnity(
       // 皮肤那一维:属于初始皮肤才亮。换图那一维在 renderer.enabled 上
       active: visibleUnderSkin(item, initialSkin),
     })
+  }
+
+  for (const [slot, files] of [...blendShaders].sort(([a], [b]) => a - b)) {
+    issues.add('info', `slot.${part.slots[slot]!.name}`, `Spine 的 ${blendOfSlot(slot)} 混合 → 自带的 ${[...files].sort().join(' / ')} 着色器(拷进 AnimatorGoRuntime/),混合因子与 Spine 相同`)
   }
 
   // 遮罩节点:挂在遮罩 slot 的骨骼下,包围盒的左下角 + 包围盒大小(sprite 是 1×1 单位,见 CLIP_RECT);
@@ -2171,6 +2209,19 @@ export function exportToUnity(
     })
     files.push({ path: `${pageName}@clip.mat.meta`, content: writeNativeMeta(maskedMaterialGuids[page]!, MATERIAL_FILE_ID) })
   }
+  for (const [file, m] of [...blendMaterials].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    files.push({
+      path: file,
+      content: writeSpriteMaterial({
+        name: file.slice(0, -'.mat'.length),
+        renderPipeline: options.renderPipeline,
+        texture: m.page === null ? null : { fileID: TEXTURE_FILE_ID, guid: textureGuids[m.page]! },
+        masked: m.masked,
+        blend: m.blend,
+      }),
+    })
+    files.push({ path: `${file}.meta`, content: writeNativeMeta(m.guid, MATERIAL_FILE_ID) })
+  }
 
   if (skinned.length > 0) {
     const shapes = skinned.reduce((n, g) => n + g.shapes.length, 0)
@@ -2244,14 +2295,15 @@ export function exportToUnity(
       const info = sprites.get(item.spriteName)
       if (info === undefined) continue
       const page = pageNames[info.page]!
+      const material = info.skinned ? skinnedMaterialOf(item, info.page) : null
       componentNodes.push({
         node: item.node,
         skin: item.skin,
         spriteAsset: `${folder}${page}.png`,
         spriteGuid: textureGuids[info.page]!,
         spriteName: info.skinned ? '' : item.spriteName,
-        materialAsset: info.skinned ? `${folder}${page}.mat` : '',
-        materialGuid: info.skinned ? materialGuids[info.page]! : '',
+        materialAsset: material === null ? '' : `${folder}${material.file}`,
+        materialGuid: material === null ? '' : material.ref.guid,
       })
     }
     skinsComponent = {
@@ -2294,7 +2346,12 @@ export function exportToUnity(
     files.push({ path: `${name}.controller.meta`, content: writeNativeMeta(controllerGuid, 9100000) })
   }
 
-  return { files, issues: issues.all, runtime: maskedPages.size > 0 ? [MASKED_MESH_SHADER_FILE] : [] }
+  const blendMats = [...blendMaterials.values()]
+  const runtime = [
+    ...(maskedPages.size > 0 || blendMats.some((m) => m.masked) ? [MASKED_MESH_SHADER_FILE] : []),
+    ...(blendMats.some((m) => !m.masked) ? [BLEND_SHADER_FILES[options.renderPipeline]] : []),
+  ]
+  return { files, issues: issues.all, runtime }
 }
 
 /**

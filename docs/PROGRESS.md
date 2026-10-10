@@ -439,6 +439,31 @@ MergeCooking2 里 22 个骨架用到,之前两个引擎都整个丢弃。范围 
 - 另外两个命令:`pnpm convert` 照搬源目录结构,跨目录不撞;但同一目录下 `--format` 换后缀会撞(`hero.skel.bytes` + `hero.json`
   转成 JSON 都叫 `hero.json`),换了格式的那个改名 `hero__skel_bytes.json` 并在报告里说明。`pnpm from-unity` 一次只读一个角色,不会撞
 
+### ✅ Unity:slot 混合模式(2026-10-10)
+
+之前 Unity 导出**根本没读 `slot.blendMode`**:additive / multiply / screen 一律挂默认 sprite 材质按 normal 画,也不报 ——
+违反「有损必须报告」。MC2 里 additive 15 个骨架 / 57 个 slot(光效、粒子),multiply 13 / 17(影子),screen 0。
+Easter_card 兔子脚下的影子在 Unity 里是一片发白的雾,之前以为「看着是对的」,其实是 normal 混合碰巧不显眼。
+
+现在这些 slot 挂自带着色器的材质,混合因子取 Spine 自己的(预乘颜色:additive One/One、multiply DstColor/OneMinusSrcAlpha、
+screen One/OneMinusSrcColor),两套管线各一个着色器(`tools/unity/runtime/AnimatorGoBlend*.shader`,CLI 用到才拷进
+`AnimatorGoRuntime/`);被遮罩遮住的 SkinnedMeshRenderer(rukou_pet 的影子)用 `AnimatorGoMaskedMesh`,它也加了同样两个属性,
+默认值就是原来的 normal。读回时按材质的因子认回 slot 的 blend。
+
+- 探针 `tools/unity/AnimatorGoProbeBlend.cs`(读像素和公式比):URP + Linear、URP + Gamma、内置 + Gamma 三种工程,
+  所有「模式 × 渲染器」组合误差 ≤ 1/255,全透明的地方 multiply 不变暗
+- Animator 渲染与旧版逐帧比,变的只有混合部件;Unity 自检新加「材质的着色器在不在」(没拷 `AnimatorGoRuntime/` 就是品红、控制台不报)
+- 端到端测试:MX2_cat 改出四种模式、MC2 四个样本,逐个渲染器查材质;读回 blend 逐个相同
+- 细节见 [UNITY-2D.md](UNITY-2D.md) 第 18 节
+
+⚠️ 顺带记下的(没改):
+
+- **Linear 色彩空间的工程里所有混合都在线性空间做**(含 normal),与 Spine 编辑器 / Godot 的 gamma 空间不同,半透明叠加处偏亮,
+  additive 最明显。是工程设置,spine-unity 也一样;MC2 是 Gamma 工程,结果与 Spine 一致
+- **SkinnedMeshRenderer 的 slot 颜色烘在顶点色里,Linear 工程不把顶点色换成线性**(探针实测),带颜色的这类网格在 Linear 工程里会稍偏
+- 内置管线的 Unity 临时工程放在 scratchpad 下,`com.unity.collections` 的 ILSupport.dll 路径超 260 字符,Burst 加载失败,
+  SpriteSkin 校验直接抛异常、渲染工具挂掉(不只是日志噪音)。临时工程要放在路径短的地方
+
 ### ⚠️ 两个渲染工具都画错过(2026-10-09 修)
 
 **产物没问题,是验证用的渲染工具错了。** 起因是 `female_lead` 的 `jump_4` 在 Unity 和 Godot 里渲出来第 10、15 帧姿势不一样。

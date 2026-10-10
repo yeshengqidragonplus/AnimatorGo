@@ -80,6 +80,8 @@ export interface RendererSpec {
   readonly enabled?: boolean
   /** 被 clipping 遮罩遮住:1 = 只在遮罩里显示(VisibleInsideMask)。不给就是 0。⚠️ 这个属性不能被动画驱动(实测) */
   readonly maskInteraction?: 0 | 1
+  /** 材质(fileID 取 MATERIAL_FILE_ID)。不给就是管线的默认 sprite 材质(SPRITE_MATERIALS);混合模式不是 normal 的 slot 用自己的 */
+  readonly material?: AssetRef
 }
 
 /**
@@ -314,7 +316,7 @@ export function writePrefab(nodes: readonly PrefabNode[], options: PrefabOptions
           '  m_RenderingLayerMask: 1',
           '  m_RendererPriority: 0',
           '  m_Materials:',
-          `  - ${SPRITE_MATERIALS[options.renderPipeline]}`,
+          `  - ${r.material === undefined ? SPRITE_MATERIALS[options.renderPipeline] : ref(r.material, 2)}`,
           '  m_StaticBatchInfo:',
           '    firstSubMesh: 0',
           '    subMeshCount: 0',

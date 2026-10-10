@@ -26,6 +26,7 @@
 | **path / transform 约束** | —— | ❌ 没有 |
 | **两色染色(dark)** | —— | ❌ 没有 |
 | clipping 遮罩 | `SpriteMask`(形状 = sprite 的自定义网格)+ 渲染器「只在遮罩里显示」 | ✅ 可映射,见第 17 节 |
+| slot 混合模式(additive / multiply / screen) | 自带着色器的材质,混合因子取 Spine 自己的 | ✅ 可映射,见第 18 节 |
 
 > 📌 **纠正一处早期判断**:曾认为「Unity 没有 slot / skin 的对应物」。
 > 实际有 —— `SpriteLibrary` + `SpriteResolver` 就是换装与换图机制。
@@ -372,6 +373,8 @@ Spine 图集里的区域可以躺着放(`rotate: true`,省空间),
 
 URP 工程里可能要换成 `Sprite-Unlit-Default`。这属于一眼能看出来(粉红)、
 一键能改掉的问题,不像几何错误那样会悄悄错。
+
+混合模式不是 normal 的 slot 不用默认材质,用自带着色器的材质(第 18 节)。
 
 ⚠️ **`SkinnedMeshRenderer` 不会像 `SpriteRenderer` 那样自动把 sprite 的纹理塞给材质** ——
 挂默认材质渲染出来是纯白(实测)。所以走第 11 节那条路的网格,每张图集页要写一个自己的
@@ -770,6 +773,7 @@ mesh 各帧的顶点、pivot、绑定都跟着图走,换 sprite 换不动网格;
 | `m_Sprite` 曲线(引用曲线,阶梯) | 每张图一个 attachment(按图名),换图时间轴 | 逐帧动画的标准写法。Single 模式的贴图(引用 fileID 固定 21300000,`.meta` 里没有顶点)用整个矩形 —— Unity 的紧凑网格只是裁掉透明像素,画出来一样 |
 | 绘制顺序:Sorting Group → Sorting Layer → Order in Layer → z(远的先画)→ 层级先后 | slot 顺序 + drawOrder 时间轴 | 每层一组 `[层, 序, −z, 层级先后]`,由外到内依次比。`m_SortingOrder` 曲线(渲染器 212 / 137、Sorting Group 210)→ drawOrder |
 | prefab 里亮着的那套具名皮肤 | `initialSkin` | `pnpm from-unity --to godot` 不给 `--skin` 就用它 |
+| 渲染器材质的 `_SrcBlend` / `_DstBlend` 正好是 Spine 某种混合模式的因子(第 18 节) | slot 的 `blend` | 我们导出的混合材质就是这样;默认材质和别的材质按 normal |
 
 sprite 引用的三种写法(真实文件里都见过,`src/unity/spriteMeta.ts`):Single 模式固定 21300000;Multiple 2019.3 之后是 sprite 的
 `internalID`;更早是 21300000、21300002…… 经 `fileIDToRecycleName` 映射到 sprite 名。轴心:`alignment` 不是 9(Custom)时按预设算。
@@ -923,7 +927,70 @@ MergeCooking2 里 22 个骨架用到(之前整个丢弃)。共用的范围 / 形
 突变(所有形状初始都亮)能抓到。Unity 自检通过;6 个样本在 Unity 里按 Animator 渲染,与 Godot 同一时刻逐帧对照一致
 (含遮罩关着的动画、范围里 20 个 SkinnedMeshRenderer 的 race_haibao)。MC2 全部 535 个骨架导出成功。
 
-## 18. 待确认
+## 18. 混合模式 → 自带着色器的材质(2026-10-10)
+
+MergeCooking2 里 additive 15 个骨架 / 57 个 slot(光效、粒子),multiply 13 / 17(影子),screen 没有。之前导出根本没读
+`slot.blendMode`,一律挂默认 sprite 材质按 normal 画,也不报 —— additive 的光效画成一团盖上去的颜色,multiply 的影子画成
+一层灰(Easter_card 兔子脚下的影子是一片发白的雾)。
+
+**Spine 的公式**(src = 贴图 × slot 颜色,直通 alpha;`S = src.rgb × src.a`):
+
+| 模式 | 结果 | 颜色的混合因子(预乘输出) |
+|---|---|---|
+| normal | S + dst·(1 − a) | One, OneMinusSrcAlpha |
+| additive | S + dst | One, One |
+| multiply | dst · lerp(1, src.rgb, a) | DstColor, OneMinusSrcAlpha |
+| screen | S + dst·(1 − S) | One, OneMinusSrcColor |
+
+alpha 一律 `One, <颜色的 dst 因子>`(Spine 的运行时也是)。因子表在 `src/unity/writeMaterial.ts` 的 `BLEND_FACTORS`。
+
+**导出**:
+
+- 着色器两套管线各一个,在 `tools/unity/runtime/`,CLI 按管线拷一个进 `AnimatorGoRuntime/`(用到才拷),GUID 写死在 `.meta`:
+  - URP:`AnimatorGoBlend.shader`,照 Sprite-Unlit-Default 只改两处 —— 混合因子是材质属性 `_SrcBlend` / `_DstBlend`;
+    输出预乘颜色。SRP Batcher 兼容(SpriteRenderer 的颜色 / 翻转靠它)、SpriteSkin 的 GPU 蒙皮(`SKINNED_SPRITE`)原样保留
+  - 内置:`AnimatorGoBlendBuiltin.shader`,照 Sprites/Default 只改混合因子(`UnitySprites.cginc` 本来就输出预乘颜色)
+- 材质:SpriteRenderer 每种模式一个 `<骨架>@sprite@<模式>.mat`(不带贴图,SpriteRenderer 自己塞,带脚本模式也能硬引用);
+  SkinnedMeshRenderer 每张图集页一个 `<页>@<模式>.mat`(要带贴图),被遮罩遮住的是 `<页>@clip@<模式>.mat`,用
+  `AnimatorGoMaskedMesh.shader` —— 它也加了这两个属性,默认值 One / OneMinusSrcAlpha 就是改之前的 normal(逐通道相同),旧材质不受影响。
+  ⚠️ SpriteRenderer 那个不能叫 `<骨架>@<模式>.mat`:默认皮肤只有一页时页名就是骨架名,两个材质撞成一个文件,
+  SkinnedMeshRenderer 拿到不带贴图的那个(端到端测试抓到的)
+- 每个 slot 报一条 info,写明它的渲染器用的哪个着色器
+- 读回(第 16 节):材质的 `_SrcBlend` / `_DstBlend` 正好是上表某一行,就读成 slot 的 `blend`
+
+**实测**(`tools/unity/AnimatorGoProbeBlend.cs`:背景已知,四种 texel(含全透明)× 两种渲染器颜色 ×
+{SpriteRenderer、被遮的 SpriteRenderer、SkinnedMeshRenderer、被遮的 SkinnedMeshRenderer},渲染到 RenderTexture 读像素和公式比):
+
+| 工程 | 结果 |
+|---|---|
+| URP + Linear(验证工程) | 17 种组合与公式差 ≤ 1/255(按线性空间算) |
+| URP + Gamma(MergeCooking2 就是 Gamma) | ≤ 0.9/255(按 gamma 空间算) |
+| 内置 + Gamma | ≤ 0.8/255。被遮的 SkinnedMeshRenderer 内置管线本来就遮不住(第 17 节),不测 |
+
+全透明的 texel 用 multiply 画,背景原样不变 —— Godot 的 `CanvasItemMaterial` MUL 就是在这儿涂黑的(GODOT.md 第 13 节)。
+管线默认的 sprite 材质也在探针里画一行 normal 作参照,与自带着色器的 normal 一致。
+⚠️ 探针里内置管线的参照材质要用 `GetBuiltinExtraResource<Material>("Sprites-Default.mat")`(导出引用的就是它);
+`new Material(Shader.Find("Sprites/Default"))` 在内置管线的批处理里画出来是品红(实测),不是着色器的问题。
+
+⚠️ **Linear 色彩空间的工程,所有混合(包括 normal)都在线性空间做**,而 Spine 编辑器 / Godot 2D 在 gamma 空间 ——
+半透明叠加的地方偏亮,additive 最明显(探针里同一格按两种空间算差到 62/255)。这是工程设置,spine-unity 在 Linear 工程里也一样,
+不归导出管;不透明处的 multiply 两种空间结果相同(乘法和幂运算可交换)。要和 Spine 一模一样就用 Gamma 工程。
+另外 SkinnedMeshRenderer 的 slot 颜色烘在顶点色里,**Unity 在 Linear 工程里不把顶点色换成线性**(探针按这个算才对得上),
+带颜色的这类网格在 Linear 工程里颜色会稍微偏 —— 不是这次改的,记一笔。
+
+**验证**:
+
+- 端到端测试:MX2_cat 的 slot 轮流改成四种模式,URP / 内置各导一遍,逐个渲染器查材质(着色器 GUID、因子、带不带贴图)、
+  info 写的着色器、`runtime`;MC2 的 Easter_card(被遮的 SpriteRenderer)、rukou_pet(被遮的 SkinnedMeshRenderer)、34500、
+  Multiple_Energy 同样查;读回后 slot 的 blend 与原来逐个相同
+- Unity 自检通过。新加一项「材质的着色器在不在」:把 `AnimatorGoRuntime/` 删掉,每个用到它的渲染器都报出来(否则是品红、控制台不报)
+- 5 个样本按 Animator 渲染,与旧版逐帧比,变的只有混合部件:Easter_card 兔子脚下的影子从发白的雾变成压暗的草地,
+  hot_air_balloon 脸上的暗部、rukou_pet 被遮的影子同理(颜色压暗、不再发灰发浑)。34500 的影子差不到 8 级 —— 它几乎是黑的
+  (rgb ≈ 0.2)、alpha ≤ 0.11,黑色的 multiply 和 normal 本来就一样;Multiple_Energy 的粒子 additive 比 normal 只多 dst·a,
+  验证工程的深色背景上看不出。内置 + Gamma 与 URP + Gamma 逐帧差 ≤ 3 级,除了内置管线遮不住 SkinnedMeshRenderer 的那两处(已报 approximated)
+- MC2 全部 535 个骨架导出成功(试运行)
+
+## 19. 待确认
 
 - `.anim` 里驱动 `SpriteResolver` 的曲线具体形态(尚无样本)。
   目前换 attachment 走的是**一个 attachment 一个物体 + `m_IsActive` 阶梯曲线**,

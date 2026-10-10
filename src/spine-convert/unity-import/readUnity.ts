@@ -2,6 +2,7 @@ import type { Atlas, AtlasPage, AtlasRegion } from '../../core/atlas.ts'
 import { decodePng, type Image } from '../../unity/png.ts'
 import { parseMesh, skinWeights } from '../../unity/writeMesh.ts'
 import { SPRITE_SKIN_SCRIPT_GUID } from '../../unity/writePrefab.ts'
+import { BLEND_FACTORS, type SpineBlend } from '../../unity/writeMaterial.ts'
 import { spriteRecord } from '../../unity/spriteMeta.ts'
 import { list, map, num, parseUnityYaml, parseYamlDocument, ref, str, vec, type UnityObject, type UnityRef, type YamlMap, type YamlValue } from '../../unity/yaml.ts'
 import { IssueCollector, type ConversionIssue } from '../types.ts'
@@ -405,7 +406,7 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
   }
   const slotOfNode = new Map(rendererNodes.map((n) => [n.id, slotOfGroup.get(groupOf.get(n.id)!)!]))
 
-  interface SlotInfo { name: string; bone: string; rep: TransformNode; color: string | null; attachment: string | null }
+  interface SlotInfo { name: string; bone: string; rep: TransformNode; color: string | null; attachment: string | null; blend: SpineBlend | null }
   const slots = new Map<string, SlotInfo>()
   const skins = new Map<string, Json>()
   /** 物体 id → slot / 皮肤 / 每张图的键名 */
@@ -483,6 +484,16 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
     return { name: sprite.name, json: { type: 'mesh', path: regionName, uvs, triangles: [...sprite.indices], vertices, hull: 0, width: rw, height: rh } }
   }
 
+  /**
+   * 渲染器的混合模式:材质的 `_SrcBlend` / `_DstBlend` 正好是 Spine 某种模式的因子(我们导出的 AnimatorGoBlend 材质就是)才算;
+   * 默认 sprite 材质(不在目录里)和别的材质都按 normal
+   */
+  const blendOfRenderer = (r: UnityObject): SpineBlend | null => {
+    const guid = ref(list(r.data['m_Materials'])[0]).guid
+    const path = guid === null ? undefined : pathOfGuid.get(guid)
+    return path === undefined || !files.has(path) ? null : blendOfMaterial(text(path))
+  }
+
   for (const n of rendererNodes) {
     const r = renderer(n)!
     const p = parsed.get(n.id)!
@@ -491,8 +502,10 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
     const slotBone = slotBoneOf(n)
     let slot = slots.get(slotName)
     if (slot === undefined) {
-      slot = { name: slotName, bone: slotBone, rep: n, color: null, attachment: null }
+      slot = { name: slotName, bone: slotBone, rep: n, color: null, attachment: null, blend: blendOfRenderer(r) }
       slots.set(slotName, slot)
+    } else if (slot.blend !== blendOfRenderer(r)) {
+      issues.add('approximated', `node.${n.path}`, `同一个 slot 的渲染器混合模式不一致(${slot.blend ?? 'normal'} / ${blendOfRenderer(r) ?? 'normal'}),按第一个`)
     }
     const skinJson = skins.get(skin) ?? {}
     skins.set(skin, skinJson)
@@ -887,6 +900,7 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
       const j: Json = { name: s.name, bone: s.bone }
       if (s.color !== null && s.color !== 'ffffffff') j['color'] = s.color
       if (s.attachment !== null) j['attachment'] = s.attachment
+      if (s.blend !== null) j['blend'] = s.blend
       return j
     }),
     skins: [...skins.entries()]
@@ -1029,6 +1043,15 @@ function textureOfMaterial(matText: string): string | null {
     if (Object.keys(tex).length > 0) return ref(tex['m_Texture']).guid
   }
   return null
+}
+
+/** 材质的混合因子(`_SrcBlend` / `_DstBlend`)是 Spine 的哪种混合模式;对不上任何一种(含没写)是 null */
+function blendOfMaterial(matText: string): SpineBlend | null {
+  const mat = parseUnityYaml(matText).find((o) => o.type === 'Material')
+  const floats = new Map<string, number>()
+  for (const e of list(map(mat?.data['m_SavedProperties'])['m_Floats'])) for (const [k, v] of Object.entries(map(e))) floats.set(k, num(v))
+  const src = floats.get('_SrcBlend'), dst = floats.get('_DstBlend')
+  return (Object.keys(BLEND_FACTORS) as SpineBlend[]).find((b) => BLEND_FACTORS[b].src === src && BLEND_FACTORS[b].dst === dst) ?? null
 }
 
 /** controller 里 Base Layer 的 state 顺序 → .anim 文件路径的次序 */

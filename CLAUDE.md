@@ -107,6 +107,12 @@ deform 变成 Blend Shape。绑完又改过顶点的网格,**同一根骨骼在 
 SkinnedMeshRenderer 要用自带的 `AnimatorGoMaskedMesh.shader`(URP 自带的在 SRP Batcher 下遮不住它),CLI 拷进 `AnimatorGoRuntime/`。
 范围按排序值生效、Sorting Group 隔不开(实测)。详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 17 节。
 
+**slot 混合模式 → 自带着色器的材质**:additive / multiply / screen 的 slot 挂 `AnimatorGoBlend.shader`(URP)/ `AnimatorGoBlendBuiltin.shader`(内置)
+的材质,混合因子取 Spine 自己的(材质属性 `_SrcBlend` / `_DstBlend`,着色器输出预乘颜色),CLI 用到才拷进 `AnimatorGoRuntime/`;被遮的
+SkinnedMeshRenderer 用 `AnimatorGoMaskedMesh`(同样两个属性,默认值就是 normal)。探针 `tools/unity/AnimatorGoProbeBlend.cs` 读像素和公式比。
+⚠️ Linear 工程里所有混合(含 normal)都在线性空间做,和 Spine / Godot 的 gamma 空间不同,半透明叠加偏亮 —— 是工程设置,不归导出管。
+详见 [docs/UNITY-2D.md](docs/UNITY-2D.md) 第 18 节。
+
 导出到 Godot 4(Godot 4.7 原生节点 + AnimationPlayer,零运行时脚本):
 
 ```bash
@@ -179,7 +185,8 @@ Defaults,最接近运行时);`_FOCUS=<物体名>` 放大看局部;`_HIDE=a,b` �
 连 `SaveAsPrefabAsset` 都写出 `m_Script: {fileID: 0}`,日志里只有一条 named pipe 的 warning。
 换成长路径(`C:/Users/zhe.huang/...`)一切正常。scratchpad 目录默认就是短名,要自己展开。
 另外工程路径**别太深**:scratchpad 下的工程,`Library/PackageCache/` 里 inputsystem 的 uxml 会超过 260 字符,
-日志里一片 `DirectoryNotFoundException` / `Host type is not matching`。不影响自检和渲染,但会把真报错淹掉。
+日志里一片 `DirectoryNotFoundException` / `Host type is not matching`。⚠️ 不只是噪音:`com.unity.collections` 的 ILSupport.dll 也超长,
+Burst 加载失败,SpriteSkin 校验抛异常、渲染工具直接挂(2026-10-10 实测)—— 要渲染的临时工程放到路径短的地方(如 `%TEMP%/agb/`)。
 
 ⚠️ **验产物一律要 Play 起来看,setup 姿势的静态对比不算数。** 皮肤全导出、挂图节点初始全亮、
 逐帧绘制顺序、预乘 alpha —— 四个 bug 全是「场景里看着好的,一播就露馅」。

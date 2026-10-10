@@ -6,11 +6,17 @@
 //   2. 去掉 sprite 专用的翻转和颜色(unity_SpriteProps / unity_SpriteColor):不走合批时它们是 0,顶点塌成一点、颜色全黑
 // 不直接用 Mesh2D-Unlit-Default:它背面剔除(Spine 的三角形朝向不固定,骨骼一翻转就没了)、写深度(透明的地方也会挡住
 // 后画的、更远的 sprite)、不乘顶点色(slot 的静态颜色烘在顶点色里)—— 三条都实测过
+//
+// 混合因子是材质属性(与 AnimatorGoBlend.shader 相同,docs/UNITY-2D.md 第 18 节),输出预乘颜色。默认 One / OneMinusSrcAlpha
+// 就是 normal —— 与改之前的 SrcAlpha OneMinusSrcAlpha(颜色)、One OneMinusSrcAlpha(alpha)逐通道相同,旧材质不受影响。
+// 被遮的 multiply / additive / screen 部件(rukou_pet 的影子)用它
 Shader "AnimatorGo/Sprite-Unlit-Masked"
 {
     Properties
     {
         _MainTex ("Sprite Texture", 2D) = "white" {}
+        [Enum(UnityEngine.Rendering.BlendMode)] _SrcBlend ("Src Blend", Float) = 1
+        [Enum(UnityEngine.Rendering.BlendMode)] _DstBlend ("Dst Blend", Float) = 10
         [HideInInspector] _Color ("Tint", Color) = (1,1,1,1)
         [HideInInspector] _White ("Breaks SRP batching", Color) = (1,1,1,1)
     }
@@ -19,7 +25,7 @@ Shader "AnimatorGo/Sprite-Unlit-Masked"
     {
         Tags {"Queue" = "Transparent" "RenderType" = "Transparent" "RenderPipeline" = "UniversalPipeline" }
 
-        Blend SrcAlpha OneMinusSrcAlpha, One OneMinusSrcAlpha
+        Blend [_SrcBlend] [_DstBlend], One [_DstBlend]
         Cull Off
         ZWrite Off
 
@@ -65,7 +71,8 @@ Shader "AnimatorGo/Sprite-Unlit-Masked"
 
             half4 UnlitFragment(Varyings input) : SV_Target
             {
-                return CommonUnlitFragment(input, input.color);
+                half4 c = CommonUnlitFragment(input, input.color);
+                return half4(c.rgb * c.a, c.a);
             }
             ENDHLSL
         }

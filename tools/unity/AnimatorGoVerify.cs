@@ -87,6 +87,7 @@ public static class AnimatorGoVerify
                     root.GetComponents<Component>().Select(c => c == null ? "(missing script)" : c.GetType().Name)));
                 problems += CheckSkins(root, report);
                 problems += CheckSkinnedMeshes(root, report);
+                problems += CheckShaders(root, report);
                 problems += CheckClips(root, path, report);
                 report.AppendLine();
             }
@@ -187,6 +188,29 @@ public static class AnimatorGoVerify
         }
 
         report.AppendLine($"  SkinnedMeshRenderer {renderers.Length} 个,形变目标共 {shapes} 个,有问题 {bad.Count} 个");
+        foreach (string line in bad) report.AppendLine($"    ✗ {line}");
+        return bad.Count;
+    }
+
+    /// 渲染器材质的着色器在不在、编不编得过。混合模式和被遮的 SkinnedMeshRenderer 的材质用的是自带着色器
+    /// (tools/unity/runtime/,导出时拷进 AnimatorGoRuntime/)—— 没拷进工程的话材质找不到着色器,画出来是品红,控制台不报
+    static int CheckShaders(GameObject root, StringBuilder report)
+    {
+        var bad = new List<string>();
+        int custom = 0;
+        foreach (Renderer r in root.GetComponentsInChildren<Renderer>(true))
+        {
+            if (r is SpriteMask) continue;
+            Material m = r.sharedMaterial;
+            if (m == null) continue; // 带脚本模式的换装件,切到时才装
+            Shader shader = m.shader;
+            if (shader != null && shader.name.StartsWith("AnimatorGo/")) custom++;
+            if (shader == null || shader.name == "Hidden/InternalErrorShader")
+                bad.Add($"{r.name}:材质 {m.name} 找不到着色器(AnimatorGoRuntime/ 没拷进工程?),画出来是品红");
+            else if (ShaderUtil.ShaderHasError(shader) || !shader.isSupported)
+                bad.Add($"{r.name}:着色器 {shader.name} 编译出错或当前平台不支持");
+        }
+        if (custom > 0 || bad.Count > 0) report.AppendLine($"  用自带着色器的渲染器 {custom} 个,着色器有问题 {bad.Count} 个");
         foreach (string line in bad) report.AppendLine($"    ✗ {line}");
         return bad.Count;
     }

@@ -106,7 +106,7 @@ function findUnityProject(outDir: string): string | null {
 }
 
 /**
- * 共用的运行时文件(带脚本模式的 AnimatorGoSkins.cs、被遮罩遮住的 SkinnedMeshRenderer 用的着色器),随产物拷进工程
+ * 共用的运行时文件(带脚本模式的 AnimatorGoSkins.cs、混合模式和被遮罩遮住的 SkinnedMeshRenderer 用的着色器),随产物拷进工程
  * **一次**(放在输出目录下 AnimatorGoRuntime/,不放每个骨架目录 —— 同一个类出现两次就编译不过,同一个 GUID 出现两次
  * Unity 会改掉一个)。`.meta` 带固定 GUID,prefab / 材质靠它认。内容没变就不碰
  */
