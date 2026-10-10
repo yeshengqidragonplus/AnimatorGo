@@ -107,9 +107,10 @@ export interface UnityExportOptions {
    */
   readonly qualityLevels?: readonly QualityLevel[]
   /**
-   * 目标工程的色彩空间(`ProjectSettings/ProjectSettings.asset` 的 `m_ActiveColorSpace`),默认 `linear`。
+   * 目标工程的色彩空间(`ProjectSettings/ProjectSettings.asset` 的 `m_ActiveColorSpace`)。
    * 只影响走 SkinnedMeshRenderer 的网格:颜色烘进顶点色,而顶点色 Unity 不做 sRGB 换算(实测,见 colorSpace.ts),
    * 线性工程要先换成线性值。SpriteRenderer 的 `m_Color` 两种工程都原样写。
+   * 不给 = 不知道:按 Linear(URP 工程的默认)写,有带颜色的这类网格就报 approximated。
    */
   readonly colorSpace?: ColorSpace
   /**
@@ -2296,12 +2297,15 @@ export function exportToUnity(
   }
   if (tintedMeshes.length > 0) {
     issues.add(
-      'info',
+      options.colorSpace === undefined ? 'approximated' : 'info',
       'skinnedMesh',
       `${tintedMeshes.length} 个走 SkinnedMeshRenderer 的网格带颜色(slot × attachment),烘进顶点色;` +
-        (colorSpace === 'linear'
-          ? '按 Linear 工程换成线性值(Unity 不对顶点色做 sRGB 换算)—— Gamma 工程要用 --color-space gamma 重新导出'
-          : '按 Gamma 工程原样写 —— Linear 工程里会偏亮,要用 --color-space linear 重新导出'),
+        (options.colorSpace === undefined
+          ? '不知道目标工程的色彩空间,按 Linear 换成线性值(Unity 不对顶点色做 sRGB 换算)—— Gamma 工程里会偏暗。' +
+            '输出到工程里(自动认)或加 --color-space'
+          : colorSpace === 'linear'
+            ? '按 Linear 工程换成线性值(Unity 不对顶点色做 sRGB 换算)—— Gamma 工程要用 --color-space gamma 重新导出'
+            : '按 Gamma 工程原样写 —— Linear 工程里会偏亮,要用 --color-space linear 重新导出'),
     )
   }
 

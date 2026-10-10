@@ -21,7 +21,7 @@ import type { ColorSpace } from '../unity/colorSpace.ts'
  * 我们导出(`pnpm unity`)、又在 Unity 里改过的可以读;别人做的(骨骼上直接挂图、`m_IsActive` 显隐、
  * `m_Sprite` 逐帧换图)也可以读。`--ppu` 要与导出时一致;别人的角色就是想要的 Spine 像素 / Unity 单位。
  * `--skin` 不给就用 prefab 里亮着的那套皮肤。`--color-space` 不给就从目录往上找工程的设置(SkinnedMeshRenderer 的顶点色在
- * 线性工程里是线性值,读回要换算),不在工程里按 linear。
+ * 线性工程里是线性值,读回要换算),不在工程里按 linear 并报出来。
  *
  * - `--to godot`:Godot 4 场景(`pnpm godot` 同一个写出器)
  * - `--to json`:Spine 4.1 JSON + `.atlas` + 贴图
@@ -79,13 +79,13 @@ function main(): void {
     return
   }
   const files = readUnityDir(parsed.input)
-  const colorSpace = parsed.colorSpace ?? detectColorSpace(parsed.input)?.space ?? 'linear'
-  const imported = importUnity(files, { pixelsPerUnit: parsed.ppu, colorSpace })
+  const colorSpace = parsed.colorSpace ?? detectColorSpace(parsed.input)?.space ?? null
+  const imported = importUnity(files, { pixelsPerUnit: parsed.ppu, ...(colorSpace === null ? {} : { colorSpace }) })
   const name = imported.name
   // 自检:写出的 Spine JSON 要能被自己的读取器读通
   const part = fromJson(imported.json)
   console.log(`Unity → ${parsed.to === 'godot' ? 'Godot 4' : 'Spine 4.1 JSON'}:${basename(parsed.input)}`)
-  console.log(`  骨骼 ${part.bones.length},slot ${part.slots.length},皮肤 ${part.skins.length},动画 ${part.animations.length},色彩空间 ${colorSpace}`)
+  console.log(`  骨骼 ${part.bones.length},slot ${part.slots.length},皮肤 ${part.skins.length},动画 ${part.animations.length},色彩空间 ${colorSpace ?? '不知道(按 linear)'}`)
   for (const issue of imported.issues) console.log(describe(issue))
 
   const dir = join(parsed.out, name)

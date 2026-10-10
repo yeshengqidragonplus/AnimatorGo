@@ -2063,12 +2063,15 @@ describe('attachment 颜色:乘进节点颜色,颜色曲线按 attachment 颜色
     expect(exportWith('linear').files.find((f) => f.path === 'c@cloth.asset')!.content).toBe(textOf('c@cloth.asset'))
   })
 
-  it('有损的照报:SkinnedMeshRenderer 上的颜色动画 loss;带颜色的 SkinnedMeshRenderer 网格说明按哪种色彩空间写的', () => {
-    expect(result.issues.some((i) => i.level === 'loss' && i.path === 'color.cloth')).toBe(true)
-    expect(result.issues.some((i) => i.level === 'info' && i.path === 'skinnedMesh' && i.message.includes('Linear'))).toBe(true)
+  it('有损的照报:SkinnedMeshRenderer 上的颜色动画 loss;带颜色的 SkinnedMeshRenderer 网格说明按哪种色彩空间写的,不知道就报近似', () => {
+    const linear = exportWith('linear')
+    expect(linear.issues.some((i) => i.level === 'loss' && i.path === 'color.cloth')).toBe(true)
+    expect(linear.issues.some((i) => i.level === 'info' && i.path === 'skinnedMesh' && i.message.includes('Linear'))).toBe(true)
     expect(exportWith('gamma').issues.some((i) => i.level === 'info' && i.path === 'skinnedMesh' && i.message.includes('Gamma'))).toBe(true)
     // SpriteRenderer 上乘常数是精确的,不该多出近似
-    expect(result.issues.filter((i) => i.level === 'approximated')).toEqual([])
+    expect(linear.issues.filter((i) => i.level === 'approximated')).toEqual([])
+    // 不知道工程的色彩空间:按 Linear 写(产物与 linear 相同,上面查过),但要报出来
+    expect(result.issues.filter((i) => i.level === 'approximated').map((i) => i.path)).toEqual(['skinnedMesh'])
   })
 })
 

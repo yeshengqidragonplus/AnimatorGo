@@ -238,10 +238,10 @@ function main(): void {
   }
 
   const detectedSpace = parsed.colorSpace === null ? detectColorSpace(parsed.out) : null
-  const colorSpace: ColorSpace = parsed.colorSpace ?? detectedSpace?.space ?? 'linear'
+  const colorSpace: ColorSpace | null = parsed.colorSpace ?? detectedSpace?.space ?? null
   if (parsed.colorSpace !== null) console.log(`色彩空间:${colorSpace}(命令行指定)`)
   else if (detectedSpace !== null) console.log(`色彩空间:${colorSpace}(认自 ${detectedSpace.from})`)
-  else console.log(`色彩空间:输出目录不在 Unity 工程里,按 linear(只影响 SkinnedMeshRenderer 的顶点色;Gamma 工程加 --color-space gamma)`)
+  else console.log(`色彩空间:输出目录不在 Unity 工程里(或读不出),按 linear —— 只影响带颜色的 SkinnedMeshRenderer 网格,会报出来;Gamma 工程加 --color-space gamma`)
   for (const line of describeClashes(plan, root, parsed.out)) console.log(line)
   console.log()
 
@@ -318,7 +318,7 @@ function main(): void {
         renderPipeline: pipeline,
         skinQuality: parsed.skinQuality,
         ...(qualityLevels === null ? {} : { qualityLevels }),
-        colorSpace,
+        ...(colorSpace === null ? {} : { colorSpace }),
         skins: parsed.skins,
         assetFolder,
         ...(parsed.skin === null ? {} : { skin: parsed.skin }),

@@ -750,3 +750,41 @@ describe('attachment 颜色读回:同一 slot 下颜色不同的物体 → slot 
     expect(imported.issues.some((x) => x.level === 'approximated' && /(^|\.)color\[swap\]$/.test(x.path))).toBe(true)
   })
 })
+
+describe('SkinnedMeshRenderer 的顶点色读回:按工程色彩空间换回 sRGB', () => {
+  // cloth 有 deform → SkinnedMeshRenderer,颜色(slot × attachment)烘在顶点色里
+  const json = {
+    skeleton: { hash: 'x', spine: '4.1.23', x: 0, y: 0, width: 64, height: 64 },
+    bones: [{ name: 'root' }],
+    slots: [{ name: 'cloth', bone: 'root', attachment: 'cloth', color: 'c0c0c0ff' }],
+    skins: [{
+      name: 'default',
+      attachments: { cloth: { cloth: { type: 'mesh', color: 'd1c1a4ff', uvs: [0, 0, 1, 0, 1, 1, 0, 1], triangles: [0, 1, 2, 0, 2, 3], vertices: [0, 0, 16, 0, 16, 16, 0, 16], hull: 4, width: 16, height: 16 } } },
+    }],
+    animations: { wave: { attachments: { default: { cloth: { cloth: { deform: [{}, { time: 0.5, vertices: [3, 0] }, { time: 1 }] } } } } } },
+  }
+  const part = fromJson(json)
+  const atlas = parseAtlas(['p.png', 'size: 32, 32', 'cloth', '  bounds: 0, 0, 16, 16', ''].join('\n'))
+  const sources = new Map<string, Image>([['p.png', { width: 32, height: 32, data: new Uint8Array(32 * 32 * 4).fill(255) }]])
+  const filesOf = (colorSpace: 'linear' | 'gamma') =>
+    new Map(exportToUnity(part, atlas, sources, { name: 'x', pixelsPerUnit: PPU, renderPipeline: 'urp', colorSpace }).files.map((f) => [f.path, f.content]))
+  const want = [0xc0 * 0xd1, 0xc0 * 0xc1, 0xc0 * 0xa4].map((v) => v / 255 / 255)
+
+  for (const colorSpace of ['linear', 'gamma'] as const) {
+    it(`⭐ ${colorSpace}:导出时怎么写的就怎么读回,颜色与原来相同,不报近似`, () => {
+      const imported = importUnity(filesOf(colorSpace), { pixelsPerUnit: PPU, colorSpace })
+      expect(imported.issues.filter((i) => i.path === 'SkinnedMeshRenderer')).toEqual([])
+      const back = fromJson(imported.json)
+      const slot = unpackRgba(back.slots[0]!.color)
+      const own = unpackRgba((back.skins[0]!.slots[0]!.attachments[0]!.data['color'] as number | undefined) ?? -1)
+      want.forEach((v, k) => expect(Math.abs(slot[k]! * own[k]! - v), `通道 ${k}`).toBeLessThan(1.01 / 255))
+    })
+  }
+
+  it('不知道工程的色彩空间:按 Linear 读,报 approximated(写明是哪个物体)', () => {
+    const imported = importUnity(filesOf('linear'), { pixelsPerUnit: PPU })
+    const issue = imported.issues.find((i) => i.path === 'SkinnedMeshRenderer')
+    expect(issue?.level).toBe('approximated')
+    expect(issue!.message).toContain('cloth')
+  })
+})

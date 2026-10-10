@@ -50,8 +50,8 @@ export interface UnityImportOptions {
   /** Unity 单位 → Spine 像素。与导出时的 `--ppu` 一致,默认 100 */
   readonly pixelsPerUnit?: number
   /**
-   * 工程的色彩空间,默认 `linear`。SkinnedMeshRenderer 的颜色在 Mesh 的顶点色里,线性工程里 Unity 把它当线性值用
-   * (不做 sRGB 换算,见 colorSpace.ts),读回时换回 sRGB
+   * 工程的色彩空间。SkinnedMeshRenderer 的颜色在 Mesh 的顶点色里,线性工程里 Unity 把它当线性值用
+   * (不做 sRGB 换算,见 colorSpace.ts),读回时换回 sRGB。不给 = 不知道:按 Linear 读,有带颜色的这类网格就报 approximated
    */
   readonly colorSpace?: ColorSpace
 }
@@ -424,6 +424,8 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
   const attachmentOf = new Map<string, { slot: string; skin: string; keyOfSprite: Map<string | null, string> }>()
   /** 物体 id → 渲染器的颜色(sRGB,与 m_Color 同一个意思):SpriteRenderer 的 m_Color,SkinnedMeshRenderer 的顶点色 */
   const nodeColor = new Map<string, Rgba>()
+  /** 不知道色彩空间时,顶点色带颜色的 SkinnedMeshRenderer(按 Linear 读了) */
+  const tintedMeshes: string[] = []
   const skinnedMeshes = new Map<string, { shapes: { name: string; deltas: { index: number; x: number; y: number }[] }[]; bindposes: Affine[]; boneOfIndex: string[]; weights: { bone: number; weight: number }[][]; flatStart: number[] }>()
 
   /** SpriteRenderer 的一张图 → Spine mesh(顶点在 slot 骨骼的局部坐标里) */
@@ -588,6 +590,7 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
     })
     const c = mesh.colors[0]
     nodeColor.set(n.id, c === undefined ? { r: 1, g: 1, b: 1, a: 1 } : fromVertexColor(c, colorSpace))
+    if (c !== undefined && options.colorSpace === undefined && Math.min(c.r, c.g, c.b) < 1) tintedMeshes.push(n.path)
     const key = uniqueKey(p.key)
     bySlot[key] = {
       type: 'mesh', path: regionName,
@@ -596,6 +599,14 @@ export function importUnity(input: ReadonlyMap<string, string | Uint8Array>, opt
     }
     keyOfSprite.set(null, key)
     skinnedMeshes.set(n.id, { shapes: mesh.blendShapes, bindposes: mesh.bindposes, boneOfIndex, weights: weights.map((ws) => ws.filter((w) => w.weight > 0)), flatStart })
+  }
+  if (tintedMeshes.length > 0) {
+    issues.add(
+      'approximated',
+      'SkinnedMeshRenderer',
+      `${tintedMeshes.length} 个 SkinnedMeshRenderer 的顶点色带颜色(${tintedMeshes.join('、')}),不知道工程的色彩空间,按 Linear 换回 sRGB —— ` +
+        'Gamma 工程的角色读出来会偏亮。目录放在工程里读(自动认)或加 --color-space',
+    )
   }
   const setupSpriteOf = (n: TransformNode): string | null => (renderer(n)!.type === 'SpriteRenderer' ? spriteId(ref(renderer(n)!.data['m_Sprite'])) : null)
 

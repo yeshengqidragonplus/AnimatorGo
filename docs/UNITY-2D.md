@@ -1019,8 +1019,9 @@ wave 的影子是沙色。它们所在的 slot **全都有颜色动画**(闪烁�
 
 `m_Color` 当 sRGB,Unity 自己换成线性;顶点色原样交给着色器,等于当线性值。Spine 的颜色是 sRGB,所以**线性工程要把 rgb 先换成
 线性值再写顶点色**(`src/unity/colorSpace.ts`,alpha 不动),Gamma 工程原样写。导出时从输出目录往上找
-`ProjectSettings/ProjectSettings.asset` 的 `m_ActiveColorSpace`,不在工程里按 Linear(URP 工程的默认),`--color-space linear|gamma` 可以指定;
-带颜色的 SkinnedMeshRenderer 网格报一条 info 说按哪种写的。
+`ProjectSettings/ProjectSettings.asset` 的 `m_ActiveColorSpace`,`--color-space linear|gamma` 可以指定;带颜色的 SkinnedMeshRenderer
+网格报一条 info 说按哪种写的。不在工程里(或读不出)就按 Linear(URP 工程的默认)写,但报 **approximated** —— 猜的不能说成确定的
+(两个并行分支各做了一版,一版默认 Linear 只报 info、一版默认 Gamma 报近似,合并时取「Linear + 报近似」)。
 
 之前一直原样写 —— MC2 里本来就有 12 个走 SkinnedMeshRenderer 的网格带 slot 颜色(car 的轮胎 `b8b8b8`、FeminArt `c4c4c4`),
 线性工程里都偏亮(`b8b8b8` 画成 `dcdcdc` 左右)。线性值存 8 位,很暗的颜色会差几级(sRGB `10` 读回 `0d`),肉眼看不出。
@@ -1030,7 +1031,7 @@ wave 的影子是沙色。它们所在的 slot **全都有颜色动画**(闪烁�
 Unity 每个渲染器各有各的颜色;Spine 是 slot 颜色 × 每个 attachment 一个**固定**颜色。读回时(`readUnity.ts`)每个通道取「全程最亮」的
 物体当参照,slot 颜色和颜色动画取它的,其余物体与它的比例写成各自 attachment 的颜色(≤ 1,写得进字节)。我们的产物就是这么来的,
 读回精确。Unity 里单独改过某一件、与同 slot 的不成比例的,Spine 表达不了,按参照物体读并报 approximated —— 之前是静默取第一个物体。
-SkinnedMeshRenderer 的顶点色按工程色彩空间换回 sRGB(`pnpm from-unity --color-space`,不给就往上找工程)。`unityEval.ts` 的
+SkinnedMeshRenderer 的顶点色按工程色彩空间换回 sRGB(`pnpm from-unity --color-space`,不给就往上找工程;找不到按 Linear 读,带颜色的这类网格报 approximated)。`unityEval.ts` 的
 `colorAt` 也把 SkinnedMeshRenderer 算进来了(顶点色换回 sRGB),读回端的颜色用例逐物体比,不再只比每个 slot 的第一个物体。
 
 ### 19.3 验证

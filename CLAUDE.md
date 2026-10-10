@@ -349,7 +349,7 @@ render/   薄适配层。PixiJS / Godot / Unity / Cocos 各一个
   见 [UNITY-2D.md](docs/UNITY-2D.md) 第 10 节
 - ⚠️ **attachment 自己也有颜色**,Spine 画的时候乘在 slot 颜色上 —— Unity 导出乘进每个挂图节点的颜色,颜色曲线跟着缩放。
   ⚠️ **SkinnedMeshRenderer 的顶点色在线性工程里 Unity 不做 sRGB 换算**(`m_Color` 做,实测同一个 `808080` 顶点色画成 `bcbcbc`),
-  线性工程要先换成线性值再写,色彩空间从工程的 `ProjectSettings.asset` 认。见 [UNITY-2D.md](docs/UNITY-2D.md) 第 19 节
+  线性工程要先换成线性值再写,色彩空间从工程的 `ProjectSettings.asset` 认(认不出按 Linear,报 approximated)。见 [UNITY-2D.md](docs/UNITY-2D.md) 第 19 节
 - ⚠️ **SkinnedMeshRenderer 不会自动带 sprite 的纹理**,挂默认材质是纯白;每张图集页要写
   一个引用了它的 `.mat`。渲染器 `m_Quality` 写 4,但工程 Quality 的 Skin Weights 是上限 ——
   真实工程 Low/Medium 档只有 2 根,这些网格在那几档照样只用 2 根

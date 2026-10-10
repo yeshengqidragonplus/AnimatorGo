@@ -16,7 +16,7 @@ export type ColorSpace = 'linear' | 'gamma'
 export function parseColorSpace(text: string): ColorSpace | null {
   const m = /^ {2}m_ActiveColorSpace: (\d+)/m.exec(text)
   if (m === null) return null
-  return m[1] === '0' ? 'gamma' : 'linear'
+  return m[1] === '0' ? 'gamma' : m[1] === '1' ? 'linear' : null
 }
 
 /** sRGB 编码值 → 线性值(0..1,标准分段曲线,与 Unity 的 Mathf.GammaToLinearSpace 相同) */
