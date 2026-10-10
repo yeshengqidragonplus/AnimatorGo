@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
 import { readSkeletonPart, type SkeletonPart } from '../../spine-format/binary/readSkeleton.ts'
 import type { AnimationData } from '../../spine-format/binary/readAnimations.ts'
 import { fromJson } from '../../spine-format/json/fromJson.ts'
@@ -507,6 +507,46 @@ interface PsdTruth {
   sprites: { key: string; name: string; rect: number[]; pivot: number[]; ppu: number; vertices: number[]; pixels: number | null }[]
   clips: { name: string; samples: { t: number; world: Record<string, number[]> }[] }[]
 }
+/** 读一个 PSD 示例:角色目录里这个 .psb 和能绑上它的 .anim,按 Unity 导入的规则展开 */
+function loadPsdSample(sampleDir: string, psbName: string, truth: PsdTruth) {
+  const all = readUnityDir(`${PSD_SAMPLES}/${sampleDir}`)
+  const files = new Map<string, string | Uint8Array>()
+  for (const [p, c] of all) {
+    if (p.endsWith(`/${psbName}`) || p.endsWith(`/${psbName}.meta`)) files.set(p, c)
+    if (p.endsWith('.anim') && typeof c === 'string') {
+      const name = str(parseUnityYaml(c).find((o) => o.type === 'AnimationClip')?.data['m_Name'])
+      if (truth.clips.some((k) => k.name === name)) {
+        files.set(p, c)
+        files.set(`${p}.meta`, all.get(`${p}.meta`)!)
+      }
+    }
+  }
+  const ex = expandPsdImports(files).files
+  const prefabPath = [...ex.keys()].find((p) => p.endsWith('.prefab'))!
+  const objects = parseUnityYaml(ex.get(prefabPath) as string)
+  const byId = new Map(objects.map((o) => [o.fileID, o]))
+  const transforms = objects.filter((o) => o.type === 'Transform')
+  type T = (typeof transforms)[number]
+  const nameOf = (t: T) => str(byId.get(ref(t.data['m_GameObject']).fileID)!.data['m_Name'])
+  const pathOf = (t: T): string => {
+    const father = ref(t.data['m_Father']).fileID
+    if (father === '0') return ''
+    const parent = pathOf(byId.get(father)!)
+    return parent === '' ? nameOf(t) : `${parent}/${nameOf(t)}`
+  }
+  const order: T[] = []
+  const walk = (t: T) => {
+    order.push(t)
+    for (const c of list(t.data['m_Children'])) walk(byId.get(ref(c).fileID)!)
+  }
+  walk(transforms.find((t) => ref(t.data['m_Father']).fileID === '0')!)
+  const componentsOf = (t: T) => list(byId.get(ref(t.data['m_GameObject']).fileID)!.data['m_Component']).map((c) => byId.get(ref(map(c)['component']).fileID)!)
+  const metaPath = [...ex.keys()].find((p) => p.endsWith('.png.meta'))!
+  const importer = map(parseYamlDocument(ex.get(metaPath) as string)['TextureImporter'])
+  const atlasImage = decodePng(ex.get(metaPath.slice(0, -'.meta'.length)) as Uint8Array)
+  return { ex, byId, order, pathOf, componentsOf, importer, atlasImage }
+}
+
 const truths = existsSync(PSD_TRUTH) ? readdirSync(PSD_TRUTH).filter((f) => f.endsWith('.json')) : []
 for (const file of truths) {
   const truth = JSON.parse(readFileSync(`${PSD_TRUTH}/${file}`, 'utf8')) as PsdTruth
@@ -514,44 +554,15 @@ for (const file of truths) {
   const sampleDir = rel.slice(0, rel.indexOf('/Sprites/'))
   const psbName = rel.slice(rel.lastIndexOf('/') + 1)
   describe.skipIf(!existsSync(`${PSD_SAMPLES}/${rel}`))(`PSD Importer 的角色 → Spine(${rel})`, () => {
-    // 角色目录:这个 .psb 和能绑上它的 .anim
-    const all = readUnityDir(`${PSD_SAMPLES}/${sampleDir}`)
-    const files = new Map<string, string | Uint8Array>()
-    for (const [p, c] of all) {
-      if (p.endsWith(`/${psbName}`) || p.endsWith(`/${psbName}.meta`)) files.set(p, c)
-      if (p.endsWith('.anim') && typeof c === 'string') {
-        const name = str(parseUnityYaml(c).find((o) => o.type === 'AnimationClip')?.data['m_Name'])
-        if (truth.clips.some((k) => k.name === name)) {
-          files.set(p, c)
-          files.set(`${p}.meta`, all.get(`${p}.meta`)!)
-        }
-      }
-    }
-    const ex = expandPsdImports(files).files
-    const prefabPath = [...ex.keys()].find((p) => p.endsWith('.prefab'))!
-    const objects = parseUnityYaml(ex.get(prefabPath) as string)
-    const byId = new Map(objects.map((o) => [o.fileID, o]))
-    const transforms = objects.filter((o) => o.type === 'Transform')
-    type T = (typeof transforms)[number]
-    const nameOf = (t: T) => str(byId.get(ref(t.data['m_GameObject']).fileID)!.data['m_Name'])
-    const pathOf = (t: T): string => {
-      const father = ref(t.data['m_Father']).fileID
-      if (father === '0') return ''
-      const parent = pathOf(byId.get(father)!)
-      return parent === '' ? nameOf(t) : `${parent}/${nameOf(t)}`
-    }
-    const order: T[] = []
-    const walk = (t: T) => {
-      order.push(t)
-      for (const c of list(t.data['m_Children'])) walk(byId.get(ref(c).fileID)!)
-    }
-    walk(transforms.find((t) => ref(t.data['m_Father']).fileID === '0')!)
-    const componentsOf = (t: T) => list(byId.get(ref(t.data['m_GameObject']).fileID)!.data['m_Component']).map((c) => byId.get(ref(map(c)['component']).fileID)!)
-    const metaPath = [...ex.keys()].find((p) => p.endsWith('.png.meta'))!
-    const importer = map(parseYamlDocument(ex.get(metaPath) as string)['TextureImporter'])
-    const atlasImage = decodePng(ex.get(metaPath.slice(0, -'.meta'.length)) as Uint8Array)
+    // 样本必须在 beforeAll 里读:skip 掉的 suite 收集用例时 describe 体照样执行,示例在 UnityAnimationGo/Library 里
+    // (gitignore 掉的,worktree 里没有),在 describe 体里读会 ENOENT,整个文件「no tests」,别的用例全被盖住
+    let psd: ReturnType<typeof loadPsdSample>
+    beforeAll(() => {
+      psd = loadPsdSample(sampleDir, psbName, truth)
+    })
 
     it('⭐ 生成的物体与 Unity 一致:层级顺序、名字、局部位置 / 旋转、排序、蒙皮骨骼', () => {
+      const { byId, order, pathOf, componentsOf } = psd
       expect(order.map(pathOf)).toEqual(truth.nodes.map((n) => n.path))
       order.forEach((t, i) => {
         const n = truth.nodes[i]!
@@ -570,6 +581,7 @@ for (const file of truths) {
     })
 
     it('⭐ sprite 与 Unity 一致:rect、顶点(Unity 单位,相对轴心);rect 内可见像素逐字节相同', () => {
+      const { importer, atlasImage } = psd
       const sheet = list(map(importer['spriteSheet'])['sprites']).map(map)
       const ppu = num(importer['spritePixelsToUnits'])
       for (const s of truth.sprites) {
@@ -601,7 +613,7 @@ for (const file of truths) {
     })
 
     it('⭐ 动画取样与 Unity 的 SampleAnimation 一致(各物体相对根物体的世界矩阵)', () => {
-      const scene = loadUnityScene(ex)
+      const scene = loadUnityScene(psd.ex)
       let checked = 0
       for (const clip of truth.clips) {
         for (const sample of clip.samples) {
@@ -619,7 +631,7 @@ for (const file of truths) {
 
     it('⭐ 读成 Spine 后与 Unity 的规则逐点一致(顶点 + 画了哪些、先后)', () => {
       // IK 示例的动画驱动的是场景里的 IK 目标(不在 prefab 里),Unity 也绑不上 —— 只比 setup
-      expect(compareWithUnity(ex)).toBeGreaterThan(truth.clips.length > 0 ? 10 : 0)
+      expect(compareWithUnity(psd.ex)).toBeGreaterThan(truth.clips.length > 0 ? 10 : 0)
     })
   })
 }
