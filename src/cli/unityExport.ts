@@ -254,7 +254,7 @@ function main(): void {
   const versions = new Map<string, number>()
 
   const tally = (map: Map<string, Tally>, level: string, message: string, file: string) => {
-    const key = `${level} ${normalize(message)}`
+    const key = `${level}\0${normalize(message)}`
     let row = map.get(key)
     if (row === undefined) {
       row = { level, sample: message, count: 0, files: new Set() }
