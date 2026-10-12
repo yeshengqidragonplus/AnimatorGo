@@ -487,7 +487,7 @@ Spine 画 attachment 用 slot 颜色 × attachment 自己的颜色;Unity 导出�
 同 slot 下不成比例的报近似(之前静默取第一个物体)。
 
 顶点色这件事有两个分支同时做了(另一版只修顶点色、没修 attachment 颜色),合并时取了这一版,另一版的「不知道色彩空间就报近似」
-和 `colorSpace.test.ts` 移植过来;另一版的分支 `claude/peaceful-allen-1cde36` 没有合进来。
+和 `colorSpace.test.ts` 移植过来,其余与这一版重复,分支已删。
 
 ### ⚠️ 两个渲染工具都画错过(2026-10-09 修)
 
