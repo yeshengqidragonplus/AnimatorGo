@@ -1,4 +1,4 @@
-# 开发进度与交接(2026-10-10)
+# 开发进度与交接(2026-11-04)
 
 ## 产品定位
 
@@ -345,11 +345,10 @@ Unity batchmode 自检 + `angry` 三套皮肤各渲两帧肉眼看(见下)。
 路线已定(2026-09-09,见 [DECISIONS.md](DECISIONS.md)):**Spine → Unity 先做正常动画,
 VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
-1. **Cocos 原生节点 + 动画剪辑**(用户定:不用 Cocos 自带的 Spine 组件)。**等用户装好 Cocos Creator 再开始**(2026-10-08)。
-   已定:目标 **3.8.x**(2.x 2023 年起停更);**先探针再定加权网格**。Cocos 2D 的 Sprite 没有骨骼蒙皮,而 MergeCooking2 的
-   535 个骨架里 **278 个(52%)有加权网格**、170 个有 deform,只有图片部件的 164 个 —— 只做刚性部件等于一半角色明显不对。
-   计划:图片部件 + 不加权网格走 2D 原生(Sprite、Sorting2D 管绘制顺序);同时实测 3D 的 SkinnedMeshRenderer(带 morph 形变)
-   放进 2D(UIMeshRenderer,或 3D 相机 + Sorting)行不行,行就像 Unity 那样让加权网格走它,不行再商量
+1. **Cocos:加权网格 / deform / 遮罩的脚本组件**(用户定,2026-11-04;见下文「Spine → Cocos:图片部件」)。
+   `UIRenderer` 子类 + 自定义 assembler,CPU 蒙皮,和 Sprite 一起批处理、一起被 Sorting2D 排序;deform 按 Spine 原公式
+   「先加偏移再蒙皮」,每顶点骨骼数不限;遮罩用它画进 stencil。图片部件那条路已经通了,这一步做完 Cocos 就齐了。
+   ~~Cocos 原生节点 + 动画剪辑,等用户装好 Cocos Creator 再开始~~ 已开始(2026-11-03)
 2. `.skel` 里往返验不出的区域:path 约束里同类型字段的语义顺序(字节布局已由 99 个真实文件确认,
    见 [SPINE-BINARY.md](SPINE-BINARY.md) 第 9 节)
 3. **VAT 出口** —— 极限性能时才需要。来源有两个:Spine 直出,以及 Unity 正常动画烘焙。
@@ -399,6 +398,30 @@ pnpm from-unity <Unity 产物目录> --to godot|json [--out 目录] [--ppu 100] 
 | 与原 Spine 粗检 | setup 在 Unity 导出自己的分流判据内 |
 | Unity YAML 解析器 | 3000 个真实 Unity 文件(45975 个对象)0 异常 |
 | Unity → Godot 渲染 | MX2_cat 与 Spine 直出 Godot 的渲染一致 |
+
+### ✅ Spine → Cocos Creator 3.8:图片部件(2026-11-04)
+
+`pnpm cocos`:原生节点 + `cc.Animation` + `.anim`,零脚本。每个骨架一个目录(prefab、每条动画一个 `.anim`、`images/` 每个区域
+一张 PNG + 自动图集 `.pac`,各带 `.meta`),拖进工程 `assets/` 就播。细节全在 [COCOS.md](COCOS.md)。
+
+**先探针后实现**(2026-11-03,探针工程在本机 `%TEMP%/agc/probe`):`.anim` 能驱动位移 / 旋转 / 缩放、换图、`active`、
+`Sorting2D.sortingOrder` 阶梯、不透明度;Sprite 自己有混合因子;glTF 蒙皮网格 + morph 通过 `UIMeshRenderer` 放进 UI 能画能动,
+**但它不参与 `Sorting2D` 排序** —— 场景里一有 Sorting2D,3D 网格的先后就不受控;而挂在骨骼下的 Sprite 又必须靠 Sorting2D 按
+Spine 绘制顺序画。Cocos 2D 本身没有蒙皮,这是根上的缺口。三条路比过(性能 / 效果 / 可编辑 / 现成工具),用户定了
+**图片部件原生 + 加权网格走脚本组件**;另外 glTF 子资源 id 是按名字算的 5 位哈希(asset-db 加密),20 多种哈希没对上,也走不通。
+
+- 坐标:Spine 像素 = Cocos 单位、Y 朝上、角度逆时针,不用换算。region 四角和 Spine 差 < 0.05 像素
+- 曲线:`cc.RealCurve` 开了权重后控制点是绝对的,Spine 贝塞尔逐点还原(Unity 那边得退化报近似的「控制点贴端点」这里精确);
+  引擎按 1e-6 秒认同一时刻的键,采样时刻和关键帧靠太近的只留一个(Female staff 抓到过 3e-7 秒的两个键)
+- 网格先按矩形 Sprite 画:图上的点按最小二乘仿射摆到顶点上,残差报出来;加权网格按权重最大的骨骼画、deform 不动、遮罩不裁,都报 loss
+- 剪辑名 = 文件名(资源库按文件名起,`_name` 不算数,实测):文件就叫 `<动画>.anim`,`play('idle')` 才对得上
+- 端到端测试(`cocosEval.ts` 按 Cocos 的规则算四角 / 显隐 / 先后 / 颜色):MX2_cat 4.1 / 3.8 + MC2 的 BBQ_grill、blackrichwoman、
+  customer_1、Female staff、Easter_card,72 个用例全过
+- 引擎里验:四个样本嵌进探针工程的场景、命令行构建 web 版、页面里定格到各时刻把帧 POST 给 `tools/cocos/collect.mjs`
+  存成 PNG 看 —— 猫、卡片、烧烤架(本身只有烟和火)、六套皮肤的角色都对,每个角色 1 个 draw call(Profiler)。
+  ⚠️ 浏览器面板藏着时 rAF 几乎不走,得在页面里 `setInterval(() => cc.director.tick(1/30), 33)` 自己驱动
+- 没做的:像素级和 Unity 逐帧比(采集端有了,渲染工具还没写);multiply / screen 的像素验证;多个角色重叠时 Sorting2D 全局排序会交错
+  (用不同 sorting layer,或根节点加 `cc.Mask` 隔开,待实测)
 
 ### 2026-10-10 并行分支合入 main
 

@@ -16,6 +16,7 @@
     "convert": "node --experimental-strip-types --no-warnings src/cli/spineConvert.ts",
     "unity": "node --experimental-strip-types --no-warnings src/cli/unityExport.ts",
     "godot": "node --experimental-strip-types --no-warnings src/cli/godotExport.ts",
+    "cocos": "node --experimental-strip-types --no-warnings src/cli/cocosExport.ts",
     "from-unity": "node --experimental-strip-types --no-warnings src/cli/fromUnity.ts"
   },
   "dependencies": {

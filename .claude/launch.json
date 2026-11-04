@@ -4,8 +4,36 @@
     {
       "name": "dev",
       "runtimeExecutable": "pnpm",
-      "runtimeArgs": ["dev"],
+      "runtimeArgs": [
+        "dev"
+      ],
       "port": 5173
+    },
+    {
+      "name": "cocos-probe",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "8081",
+        "--bind",
+        "127.0.0.1",
+        "--directory",
+        "C:/Users/zhe.huang/AppData/Local/Temp/agc/probe/build"
+      ],
+      "port": 8081
+    },
+    {
+      "name": "cocos-collect",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "tools/cocos/collect.mjs",
+        "--dir",
+        "C:/Users/zhe.huang/AppData/Local/Temp/agc/renders",
+        "--port",
+        "8082"
+      ],
+      "port": 8082
     }
   ]
 }
