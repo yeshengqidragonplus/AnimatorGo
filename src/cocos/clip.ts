@@ -8,7 +8,7 @@ import { realCurveJson, type RealKey } from './curve.ts'
  * `ComponentPath` 取节点上的组件,最后一段字符串是属性名。节点自己的 `position` / `eulerAngles` / `scale`
  * 用 VectorTrack(四个分量各一条 RealCurve,没动的分量留空,引擎会保留原值);`active` 这种离散的
  * 用 ObjectTrack(值序列,保持到下一键);`cc.Sorting2D.sortingOrder` 这种数值用 RealTrack;
- * `cc.Sprite.color` 用 ColorTrack(r g b a 四条,0..255)。
+ * `cc.Sprite.color` 用 ColorTrack(r g b a 四条,0..255);脚本组件的 `number[]` 属性(deform 的 shape 权重)用 RealArrayTrack。
  *
  * 都是实测过的(2026-11-03 的探针工程):位移 / 旋转 / 缩放、换图(spriteFrame)、active、
  * sortingOrder 阶梯、不透明度,全部能被 `.anim` 驱动。
@@ -21,6 +21,8 @@ export type Track =
   | { readonly kind: 'real'; readonly path: readonly PathStep[]; readonly keys: readonly RealKey[] }
   | { readonly kind: 'object'; readonly path: readonly PathStep[]; readonly times: readonly number[]; readonly values: readonly unknown[] }
   | { readonly kind: 'color'; readonly path: readonly PathStep[]; readonly channels: readonly (readonly RealKey[])[] }
+  /** 数值数组属性(AnimatorGoMesh.shapeWeights):每个元素一条 RealCurve,求值结果是一个 number[] 整个赋给属性 */
+  | { readonly kind: 'realArray'; readonly path: readonly PathStep[]; readonly channels: readonly (readonly RealKey[])[] }
 
 /** AnimationClip.WrapMode */
 export const WRAP_NORMAL = 1
@@ -63,6 +65,8 @@ function trackJson(t: Track): Json {
       }
     case 'color':
       return { __type__: 'cc.animation.ColorTrack', _binding: binding(t.path), _channels: t.channels.map((c) => channel(c)) }
+    case 'realArray':
+      return { __type__: 'cc.animation.RealArrayTrack', _binding: binding(t.path), _channels: t.channels.map((c) => channel(c)) }
   }
 }
 

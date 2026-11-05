@@ -10,14 +10,16 @@ import { drawOrderAt, slotAttachmentsAt } from '../../spine-eval/slots.ts'
 import { slotColorAt, unpackRgba } from '../../spine-eval/color.ts'
 import { lastPerProperty } from '../../spine-format/duplicateTimelines.ts'
 import { evaluateRealCurve, realKeys, CUBIC, CONSTANT } from '../../cocos/curve.ts'
-import { exportToCocos, meshVertexLocal, type AttachmentNode } from './export.ts'
+import { RUNTIME_SCRIPTS } from '../../cocos/ids.ts'
+import { clipCovers, clipMesh, createClipBuffers, skinVertices, triangulate } from '../../../tools/cocos/runtime/AnimatorGoSkinning.ts'
+import { exportToCocos, type AttachmentNode } from './export.ts'
 import { loadCocosScene, parseClip } from './cocosEval.ts'
 
 /**
  * Spine → Cocos 的**端到端校验**:把写出的 prefab 和 `.anim` 读回来,**按 Cocos 的规则**(cocosEval.ts)算出每个 Sprite
  * 画在哪、哪些亮着、先后、颜色,和 Spine 自己的求值比。产物「像 Cocos 文件」没有意义,要的是引擎按它的规则播出来和 Spine 一样。
  *
- * 图片部件要精确(0.05 像素);网格现在按矩形 Sprite 画,导出器报了残差,这里核对报出来的数兜得住。
+ * 图片部件、网格(AnimatorGoMesh,和运行时同一份蒙皮代码)、遮罩多边形都要精确(0.05 像素);谁被遮按 Spine 的绘制循环模拟出来比。
  */
 
 const SKELETON = 'res/spine/4.1/MX2_cat.skel.bytes'
@@ -71,52 +73,42 @@ function exportSample(sample: (typeof SAMPLES)[number]) {
     const named = part.skins.find((s) => s.name === skin)
     return named === undefined || !named.slots.some((e) => e.slot === n.slot && e.attachments.some((a) => a.key === n.key))
   }
-  /** 这条动画里有没有 deform 打在这个网格上(linkedmesh 跟着父网格变形,父网格可以在别的 slot 里) */
-  const skinName = (s: number | string) => (typeof s === 'number' ? (part.skins[s]?.name ?? String(s)) : s)
-  const deformed = (n: AttachmentNode, anim: AnimationData) => anim.timelines.some((t) => {
-    if (t.kind !== 'deform') return false
-    const d = t.frames[0] as { skin: number | string; attachment: string }
-    if (t.owner === n.slot && (d.attachment === n.key || d.attachment === n.attachment.name)) return true
-    return n.deformSource !== null && d.attachment === n.deformSource.key && skinName(d.skin) === n.deformSource.skin
-  })
-
   /**
-   * 某一时刻:每个 attachment 节点按 Cocos 规则画出来的位置 vs Spine。region 比四角;网格把每个顶点按
-   * 「图上的位置 → 节点局部 → 世界」算出来比(矩形近似,导出器报了残差)。返回超出容差最多的那个
+   * 某一时刻:每个 attachment 节点按 Cocos 规则画出来的位置 vs Spine。region 比四角;网格 / 遮罩比每个顶点
+   * (cocosEval 用运行时那份蒙皮代码按骨骼节点的世界矩阵算)。返回超出容差最多的那个
    */
   function worstAt(anim: AnimationData | null, t: number): { excess: number; where: string } {
     const kept = anim === null ? null : { ...anim, timelines: lastPerProperty(anim.timelines).kept }
     // Cocos 的节点没有斜切、只有完整继承,导出时忽略了(报近似);Spine 这边按同样的规则求值,别的地方必须精确
     const pose = kept === null ? setupPose(part, { unityCompatible: true }) : poseAt(part, kept, t, { unityCompatible: true })
-    const world = scene.worldAt(anim?.name ?? null, t)
+    const clipName = anim?.name ?? null
+    const world = scene.worldAt(clipName, t)
+    const meshes = scene.meshesAt(clipName, t)
+    const polygons = scene.clipPolygonsAt(clipName, t)
     let excess = -Infinity
     let where = ''
     for (const n of result.attachments) {
       if (n.frame !== undefined) continue
-      if (n.weightedOn !== null && anim !== null) continue
-      if (kept !== null && deformed(n, kept)) continue
-      const spine = attachmentVertices(part, atlas, n.attachment, n.skin, n.slot, pose, kept, t)
-      const m = world.get(n.path)!
-      const region = atlas.regions.get((n.attachment.data['path'] as string | null) ?? n.attachment.name)!
+      // linkedmesh 跟着父网格的 deform 时间轴变形:Spine 这边按父网格的键名找时间轴
+      const target = n.deformSource === null ? { a: n.attachment, skin: n.skin } : { a: { ...n.attachment, key: n.deformSource.key, name: n.deformSource.key }, skin: n.deformSource.skin }
+      const spine = attachmentVertices(part, atlas, target.a, target.skin, n.slot, pose, kept, t)
       let cocos: { x: number; y: number }[]
-      if (n.attachment.type === 'region') {
+      if (n.kind === 'sprite') {
         // Sprite 的矩形:UITransform 的大小和锚点(cocosEval.drawnAt 同一个算法,这里不管亮没亮)
+        const m = world.get(n.path)!
         const tr = scene.nodes.find((x) => x.path === n.path)!.transform!
         const l = -tr.anchorX * tr.width, rr = (1 - tr.anchorX) * tr.width, b = -tr.anchorY * tr.height, tp = (1 - tr.anchorY) * tr.height
         cocos = [[l, b], [rr, b], [rr, tp], [l, tp]].map(([px, py]) => ({ x: m.a * px! + m.b * py! + m.x, y: m.c * px! + m.d * py! + m.y }))
+      } else if (n.kind === 'mesh') {
+        cocos = meshes.get(n.path)!.vertices
       } else {
-        const uvs = n.attachment.data['uvs'] as number[]
-        cocos = spine.map((_, i) => {
-          const l = meshVertexLocal(n, region, uvs[i * 2]!, uvs[i * 2 + 1]!)
-          return { x: m.a * l.x + m.b * l.y + m.x, y: m.c * l.x + m.d * l.y + m.y }
-        })
+        cocos = polygons.get(n.path)!
       }
       expect(cocos.length, n.attachment.name).toBe(spine.length)
-      // 网格是矩形近似,导出器在 setup 下量的残差;动画里骨骼一缩放,误差也跟着缩放 —— 允许 20% 的余量
-      const allowed = n.attachment.type === 'region' ? 0.05 : n.residual * 1.2 + 0.1
+      const allowed = 0.05
       spine.forEach((p, i) => {
         const d = Math.hypot(p.x - cocos[i]!.x, p.y - cocos[i]!.y) - allowed
-        if (d > excess) { excess = d; where = `${n.attachment.name} 第 ${i} 个顶点 @${anim?.name ?? 'setup'} ${t.toFixed(3)} 偏 ${(d + allowed).toFixed(2)} 像素(允许 ${allowed.toFixed(2)})` }
+        if (d > excess) { excess = d; where = `${n.kind} ${n.attachment.name} 第 ${i} 个顶点 @${anim?.name ?? 'setup'} ${t.toFixed(3)} 偏 ${(d + allowed).toFixed(2)} 像素(允许 ${allowed.toFixed(2)})` }
       })
     }
     return { excess, where }
@@ -132,29 +124,49 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
     exported = exportSample(sample)
   })
 
-  it('每个画得出来的 attachment 都有节点(Sprite + UITransform + Sorting2D);根上挂着 Animation,每条动画一个 .anim', () => {
+  it('每个画得出来的 attachment 都有节点(图片 Sprite / 网格 AnimatorGoMesh,都带 UITransform + Sorting2D;遮罩 AnimatorGoClip);根上挂着 Animation,每条动画一个 .anim', () => {
     const { part, result, scene, files } = exported
-    const drawable = part.skins.flatMap((s) => s.slots.flatMap((e) => e.attachments.filter((a) => a.type === 'region' || a.type === 'mesh')))
+    const drawable = part.skins.flatMap((s) => s.slots.flatMap((e) => e.attachments.filter((a) => a.type === 'region' || a.type === 'mesh' || a.type === 'clipping')))
     expect(result.attachments.length).toBeGreaterThanOrEqual(drawable.length - result.issues.filter((i) => i.path.startsWith('region.')).length)
+    const clipPaths = result.attachments.filter((n) => n.kind === 'clip').map((n) => n.path)
     for (const n of result.attachments) {
       const node = scene.nodes.find((x) => x.path === n.path)!
       expect(node, n.path).toBeDefined()
-      expect(node.sprite, n.path).not.toBeNull()
+      if (n.kind === 'clip') {
+        expect(node.clip, n.path).not.toBeNull()
+        expect(node.clip!.counts.length).toBe(n.attachment.data['vertexCount'])
+        continue
+      }
       expect(node.transform, n.path).not.toBeNull()
       expect(node.sortingOrder, n.path).toBe(n.slot)
+      if (n.kind === 'sprite') {
+        expect(n.attachment.type).toBe('region')
+        expect(node.sprite, n.path).not.toBeNull()
+      } else {
+        expect(node.mesh, n.path).not.toBeNull()
+        const m = node.mesh!
+        expect(m.counts.length).toBe(n.attachment.type === 'region' ? 4 : n.attachment.data['vertexCount'])
+        expect(m.uvs.length).toBe(m.counts.length * 2)
+        expect(m.indices.length % 3).toBe(0)
+        expect(Math.max(...m.indices)).toBeLessThan(m.counts.length)
+        expect(m.influences.length).toBe(m.counts.reduce((a, b) => a + b, 0) * 4)
+        expect(m.shapeWeights.length * m.influences.length / 2).toBe(m.shapes.length)
+        // 可能被遮的网格认识全部遮罩
+        if (m.clips.length > 0) expect(m.clips).toEqual(clipPaths)
+      }
     }
     for (const anim of part.animations) expect(scene.clips.has(anim.name), anim.name).toBe(true)
     expect([...files.keys()].filter((p) => p.endsWith('.anim')).length).toBe(part.animations.length)
     expect([...files.keys()].filter((p) => p.endsWith('.png')).length).toBe(result.images.size)
   })
 
-  it('⭐ setup 姿势:按 Cocos 的规则算出的四角与 Spine 一致(图片部件 0.05 像素,网格在报出来的残差内)', () => {
+  it('⭐ setup 姿势:按 Cocos 的规则算出的四角 / 顶点与 Spine 一致(0.05 像素)', () => {
     const { worstAt } = exported
     const { excess, where } = worstAt(null, 0)
     expect(excess, where).toBeLessThanOrEqual(0)
   })
 
-  it('⭐ 每条动画的每个关键帧,以及相邻关键帧的中点:位置与 Spine 一致(贝塞尔走引擎的求值,精确)', () => {
+  it('⭐ 每条动画的每个关键帧,以及相邻关键帧的中点:位置与 Spine 一致(贝塞尔走引擎的求值;加权网格、deform、遮罩多边形都算)', () => {
     const { part, worstAt } = exported
     let worst = { excess: -Infinity, where: '' }
     for (const anim of part.animations) {
@@ -182,6 +194,7 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
       const drawnSlots = new Map<number, AttachmentNode[]>()
       for (const n of drawn) drawnSlots.set(n.slot, [...(drawnSlots.get(n.slot) ?? []), n])
       result.attachments.forEach((n) => {
+        if (n.kind === 'clip') return // 遮罩不画
         if (expectedKey[n.slot] !== n.key || !inSkin(n, initialSkin)) return
         const list = drawnSlots.get(n.slot) ?? []
         if (n.frame === undefined) expect(list.some((d) => d.path === n.path), `${n.path} @${anim?.name ?? 'setup'} ${t.toFixed(3)} 该亮没亮`).toBe(true)
@@ -192,6 +205,46 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
       const rank = new Map(order.map((slot, i) => [slot, i]))
       const ranks = drawn.map((n) => rank.get(n.slot)!)
       for (let i = 1; i < ranks.length; i++) expect(ranks[i]! >= ranks[i - 1]!, `@${anim?.name ?? 'setup'} ${t.toFixed(3)} 第 ${i} 个画的 ${drawn[i]!.path} 排在 ${drawn[i - 1]!.path} 后面,Spine 里相反`).toBe(true)
+    }
+    check(null, 0)
+    for (const anim of part.animations) for (const t of sampleTimesOf(anim)) check(anim, t)
+  })
+
+  it('⭐ 遮罩:每个时刻谁被哪个遮罩裁,和 Spine 的绘制循环一致;被裁的都是 AnimatorGoMesh', () => {
+    const { part, result, scene, initialSkin, inSkin } = exported
+    const clipNodes = result.attachments.filter((n) => n.kind === 'clip')
+    if (clipNodes.length === 0) return
+    const byPath = new Map(result.attachments.map((n) => [n.path, n]))
+    const check = (anim: AnimationData | null, t: number) => {
+      const kept = anim === null ? null : { ...anim, timelines: lastPerProperty(anim.timelines).kept }
+      const keys = slotAttachmentsAt(part, kept, t)
+      const order = drawOrderAt(part, kept, t)
+      // Spine 的绘制循环(SkeletonClipping):画到挂着遮罩的 slot 开始裁(已经在裁就忽略),之后每个 slot 都裁,画完 endSlot 结束
+      const expected = new Map<number, number>()
+      let clipping: number | null = null
+      let end = -1
+      for (const s of order) {
+        const clipNode = clipNodes.find((n) => n.slot === s && n.key === keys[s] && inSkin(n, initialSkin))
+        if (clipNode !== undefined) {
+          if (clipping === null) {
+            clipping = s
+            end = clipNode.attachment.data['endSlot'] as number
+          }
+          continue
+        }
+        if (clipping !== null) {
+          expected.set(s, clipping)
+          if (end === s) clipping = null
+        }
+      }
+      for (const d of scene.drawnAt(anim?.name ?? null, t)) {
+        const n = byPath.get(d.node.path)
+        if (n === undefined) continue
+        const want = expected.get(n.slot)
+        const got = d.clippedBy === null ? undefined : byPath.get(d.clippedBy.path)!.slot
+        expect(got, `${n.path} @${anim?.name ?? 'setup'} ${t.toFixed(3)} 该被 slot ${want} 的遮罩裁,实际 ${got}`).toBe(want)
+        if (want !== undefined) expect(d.kind, `${n.path} 被遮却不是网格`).toBe('mesh')
+      }
     }
     check(null, 0)
     for (const anim of part.animations) for (const t of sampleTimesOf(anim)) check(anim, t)
@@ -233,15 +286,13 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
     }
   })
 
-  it('有损的地方都报出来了:加权网格 / deform / 遮罩 / 约束各一条 loss,图片部件没有 loss', () => {
+  it('有损的地方都报出来了:约束一条 loss;网格 / 遮罩走脚本组件只报 info(runtime),不再是 loss;图片部件没有 loss', () => {
     const { part, result } = exported
     const kinds = new Set(result.issues.map((i) => `${i.level}:${i.path.split('.')[0]}`))
-    const hasWeighted = part.skins.some((s) => s.slots.some((e) => e.attachments.some((a) => a.type === 'mesh' && (a.data['vertices'] as { weighted: boolean }).weighted && new Set((a.data['vertices'] as { weights: { bone: number }[][] }).weights.flatMap((w) => w.map((x) => x.bone))).size > 1)))
-    const hasDeform = part.animations.some((a) => a.timelines.some((t) => t.kind === 'deform'))
-    const hasClipping = part.skins.some((s) => s.slots.some((e) => e.attachments.some((a) => a.type === 'clipping')))
-    if (hasWeighted) expect(kinds.has('loss:mesh')).toBe(true)
-    if (hasDeform) expect([...result.issues].some((i) => i.level === 'loss' && /deform\./.test(i.path))).toBe(true)
-    if (hasClipping) expect([...result.issues].some((i) => i.level === 'loss' && /clipping\./.test(i.path))).toBe(true)
+    const hasMesh = part.skins.some((s) => s.slots.some((e) => e.attachments.some((a) => a.type === 'mesh' || a.type === 'linkedmesh' || a.type === 'clipping')))
+    expect(result.runtime).toBe(hasMesh)
+    expect(kinds.has('info:runtime')).toBe(hasMesh)
+    expect(result.issues.filter((i) => i.level === 'loss' && /^(mesh|deform|clipping)\./.test(i.path))).toEqual([])
     if (part.ik.length > 0) expect(kinds.has('loss:ik')).toBe(true)
     expect(result.issues.filter((i) => i.level === 'loss' && i.path.startsWith('region.'))).toEqual([])
   })
@@ -249,7 +300,10 @@ describe.skipIf(!hasAssets || !existsSync(sample.skel) || !existsSync(sample.atl
   it('图:prefab 和动画引用的每个 spriteFrame 都有对应的 PNG,尺寸与 meta 一致', () => {
     const { result, scene, files } = exported
     const frames = new Set(result.images.size > 0 ? [...result.images.values()].map((i) => `${i.uuid}@f9941`) : [])
-    for (const n of scene.nodes) if (n.sprite !== null) expect(frames.has(n.sprite.spriteFrame), n.path).toBe(true)
+    for (const n of scene.nodes) {
+      if (n.sprite !== null) expect(frames.has(n.sprite.spriteFrame), n.path).toBe(true)
+      if (n.mesh !== null) expect(frames.has(n.mesh.spriteFrame), n.path).toBe(true)
+    }
     for (const img of result.images.values()) {
       const meta = JSON.parse(files.get(`${img.path}.meta`) as string) as { subMetas: Record<string, { userData: { width: number; height: number } }> }
       expect(meta.subMetas['f9941']!.userData.width).toBe(img.width)
@@ -307,5 +361,84 @@ describe('Spine 贝塞尔 → Cocos 加权切线(按引擎的求值公式)', () 
     expect(evaluateRealCurve(stepped, 1)).toBe(7)
     expect(evaluateRealCurve(stepped, -1)).toBe(3)
     expect(evaluateRealCurve(stepped, 5)).toBe(7)
+  })
+})
+
+// ─── 运行时的纯数学 ──────────────────────────────────────────────────────────
+
+/** 三角形列表的总面积(绝对值) */
+function trianglesArea(pos: ArrayLike<number>, idx: ArrayLike<number>, count: number): number {
+  let area = 0
+  for (let t = 0; t + 2 < count; t += 3) {
+    const [a, b, c] = [idx[t]!, idx[t + 1]!, idx[t + 2]!]
+    area += Math.abs((pos[b * 2]! - pos[a * 2]!) * (pos[c * 2 + 1]! - pos[a * 2 + 1]!) - (pos[b * 2 + 1]! - pos[a * 2 + 1]!) * (pos[c * 2]! - pos[a * 2]!)) / 2
+  }
+  return area
+}
+
+describe('Cocos 运行时的纯数学(tools/cocos/runtime/AnimatorGoSkinning.ts,引擎里跑的就是这份)', () => {
+  it('蒙皮:两根骨骼各一半权重落在两者之间;deform 先加偏移再蒙皮(Spine 同序)', () => {
+    // 骨骼 0 恒等;骨骼 1 平移 (10, 0) 再转 90°:x' = −y + 10,y' = x
+    const mats = [1, 0, 0, 1, 0, 0, 0, -1, 1, 0, 10, 0]
+    const counts = [2]
+    const influences = [0, 2, 0, 0.5, 1, 2, 0, 0.5]
+    const out = new Float32Array(2)
+    skinVertices(counts, influences, mats, null, out)
+    expect([...out]).toEqual([6, 1])
+    // 偏移逐影响:骨骼 0 的影响 +(1, 0),骨骼 1 的 +(0, 1)
+    skinVertices(counts, influences, mats, [1, 0, 0, 1], out)
+    expect(out[0]).toBeCloseTo((3 + 9) / 2, 6)
+    expect(out[1]).toBeCloseTo((0 + 2) / 2, 6)
+  })
+
+  it('裁剪:正方形按三角形遮罩裁,面积等于交集,裁出来的点的 uv 按位置插值', () => {
+    const pos = [0, 0, 10, 0, 10, 10, 0, 10]
+    const uv = [0, 1, 1, 1, 1, 0, 0, 0]
+    const idx = [0, 1, 2, 0, 2, 3]
+    const poly = [0, 0, 10, 0, 0, 10]
+    const tris: number[] = []
+    triangulate(poly, 3, tris)
+    const out = createClipBuffers()
+    clipMesh(pos, uv, idx, 6, poly, tris, out)
+    expect(out.truncated).toBe(false)
+    expect(trianglesArea(out.pos, out.idx, out.indexCount)).toBeCloseTo(50, 6)
+    for (let i = 0; i < out.vertexCount; i++) {
+      expect(out.uv[i * 2]).toBeCloseTo(out.pos[i * 2]! / 10, 6)
+      expect(out.uv[i * 2 + 1]).toBeCloseTo(1 - out.pos[i * 2 + 1]! / 10, 6)
+      // 都在遮罩里
+      expect(out.pos[i * 2]! + out.pos[i * 2 + 1]!).toBeLessThanOrEqual(10 + 1e-6)
+    }
+    // 遮罩顺时针给也一样
+    clipMesh(pos, uv, idx, 6, [0, 0, 0, 10, 10, 0], [0, 1, 2], out)
+    expect(trianglesArea(out.pos, out.idx, out.indexCount)).toBeCloseTo(50, 6)
+    // 完全在外面:什么都不剩
+    clipMesh(pos, uv, idx, 6, [20, 20, 30, 20, 20, 30], [0, 1, 2], out)
+    expect(out.indexCount).toBe(0)
+  })
+
+  it('三角化:凹多边形(L 形)切成的三角形面积加起来等于多边形', () => {
+    const L = [0, 0, 10, 0, 10, 4, 4, 4, 4, 10, 0, 10]
+    const tris: number[] = []
+    triangulate(L, 6, tris)
+    expect(tris.length).toBe(4 * 3)
+    expect(trianglesArea(L, tris, tris.length)).toBeCloseTo(10 * 4 + 4 * 6, 6)
+  })
+
+  it('遮罩范围:遮罩之后到 endSlot 为止;endSlot 不在后面(或就是自己)就到最后', () => {
+    expect(clipCovers(3, 6, 4)).toBe(true)
+    expect(clipCovers(3, 6, 6)).toBe(true)
+    expect(clipCovers(3, 6, 7)).toBe(false)
+    expect(clipCovers(3, 6, 3)).toBe(false)
+    expect(clipCovers(3, 6, 2)).toBe(false)
+    expect(clipCovers(3, 1, 99)).toBe(true)
+    expect(clipCovers(3, 3, 99)).toBe(true)
+  })
+
+  it('运行时脚本的 .meta 里的 uuid 和 ids.ts 的常量一致(prefab 里的组件靠它认类)', () => {
+    for (const [name, uuid] of Object.entries(RUNTIME_SCRIPTS)) {
+      const meta = JSON.parse(readFileSync(`tools/cocos/runtime/${name}.ts.meta`, 'utf8')) as { uuid: string; importer: string }
+      expect(meta.uuid, name).toBe(uuid)
+      expect(meta.importer).toBe('typescript')
+    }
   })
 })

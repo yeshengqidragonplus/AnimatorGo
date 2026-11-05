@@ -1,4 +1,4 @@
-# 开发进度与交接(2026-11-04)
+# 开发进度与交接(2026-11-06)
 
 ## 产品定位
 
@@ -345,9 +345,10 @@ Unity batchmode 自检 + `angry` 三套皮肤各渲两帧肉眼看(见下)。
 路线已定(2026-09-09,见 [DECISIONS.md](DECISIONS.md)):**Spine → Unity 先做正常动画,
 VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
-1. **Cocos:加权网格 / deform / 遮罩的脚本组件**(用户定,2026-11-04;见下文「Spine → Cocos:图片部件」)。
-   `UIRenderer` 子类 + 自定义 assembler,CPU 蒙皮,和 Sprite 一起批处理、一起被 Sorting2D 排序;deform 按 Spine 原公式
-   「先加偏移再蒙皮」,每顶点骨骼数不限;遮罩用它画进 stencil。图片部件那条路已经通了,这一步做完 Cocos 就齐了。
+1. **Cocos 的收尾**:原生平台(JSB)的 2D 批处理在 C++ 里,不调 JS 的 `fillBuffers`,`AnimatorGoMesh` 还没适配(只验过 Web);
+   像素级和 Unity 的渲染工具逐帧比;multiply / screen 的像素验证;多个角色重叠时 Sorting2D 全局排序会交错(不同 sorting layer
+   或 `cc.Mask` 隔开,待实测)。
+   ~~加权网格 / deform / 遮罩的脚本组件~~ 已做(2026-11-06),见下文
    ~~Cocos 原生节点 + 动画剪辑,等用户装好 Cocos Creator 再开始~~ 已开始(2026-11-03)
 2. `.skel` 里往返验不出的区域:path 约束里同类型字段的语义顺序(字节布局已由 99 个真实文件确认,
    见 [SPINE-BINARY.md](SPINE-BINARY.md) 第 9 节)
@@ -413,7 +414,7 @@ Spine 绘制顺序画。Cocos 2D 本身没有蒙皮,这是根上的缺口。三�
 - 坐标:Spine 像素 = Cocos 单位、Y 朝上、角度逆时针,不用换算。region 四角和 Spine 差 < 0.05 像素
 - 曲线:`cc.RealCurve` 开了权重后控制点是绝对的,Spine 贝塞尔逐点还原(Unity 那边得退化报近似的「控制点贴端点」这里精确);
   引擎按 1e-6 秒认同一时刻的键,采样时刻和关键帧靠太近的只留一个(Female staff 抓到过 3e-7 秒的两个键)
-- 网格先按矩形 Sprite 画:图上的点按最小二乘仿射摆到顶点上,残差报出来;加权网格按权重最大的骨骼画、deform 不动、遮罩不裁,都报 loss
+- ~~网格先按矩形 Sprite 画~~ 2026-11-06 起全部走 `AnimatorGoMesh`(见下一节)
 - 剪辑名 = 文件名(资源库按文件名起,`_name` 不算数,实测):文件就叫 `<动画>.anim`,`play('idle')` 才对得上
 - 端到端测试(`cocosEval.ts` 按 Cocos 的规则算四角 / 显隐 / 先后 / 颜色):MX2_cat 4.1 / 3.8 + MC2 的 BBQ_grill、blackrichwoman、
   customer_1、Female staff、Easter_card,72 个用例全过
@@ -422,6 +423,24 @@ Spine 绘制顺序画。Cocos 2D 本身没有蒙皮,这是根上的缺口。三�
   ⚠️ 浏览器面板藏着时 rAF 几乎不走,得在页面里 `setInterval(() => cc.director.tick(1/30), 33)` 自己驱动
 - 没做的:像素级和 Unity 逐帧比(采集端有了,渲染工具还没写);multiply / screen 的像素验证;多个角色重叠时 Sorting2D 全局排序会交错
   (用不同 sorting layer,或根节点加 `cc.Mask` 隔开,待实测)
+
+### ✅ Spine → Cocos Creator 3.8:网格 / deform / 遮罩的脚本组件(2026-11-06)
+
+`tools/cocos/runtime/` 三个 TypeScript(`AnimatorGoMesh` UIRenderer 子类 + 自定义 assembler、`AnimatorGoClip`、纯数学的
+`AnimatorGoSkinning`),CLI 拷到输出目录 `AnimatorGoRuntime/` 一份。细节在 [COCOS.md](COCOS.md) 第 11 节。
+
+- 顶点照 Spine 原样存(每顶点若干个「骨骼节点 + 局部坐标 + 权重」),CPU 蒙皮;deform 的每个关键帧一个 shape,`shapeWeights` 走
+  RealArrayTrack,「先加偏移再蒙皮」。不用反解绑定姿势、不截骨骼数 —— Unity / Godot 那两套麻烦这里都没有
+- 遮罩:`AnimatorGoClip` 带多边形 + 绘制顺序里的起止,被遮的网格每帧按 Spine 的规则挑遮罩、CPU 上裁三角形(Sutherland–Hodgman,
+  和 SkeletonClipping 同一个算法);遮罩范围里的图片部件也改走 AnimatorGoMesh。没用 `cc.Mask`
+- 和 Sprite 同一批(同一个内置材质),每个角色 1 个 draw call;`color` / 混合因子从 UIRenderer 继承
+- 端到端测试 `cocosEval.ts` **import 运行时那份蒙皮代码**按骨骼节点世界矩阵算顶点,和 Spine 逐点比(0.05 像素);谁被裁按 Spine 的
+  绘制循环模拟出来比。84 个用例全过(全仓库 708)
+- 引擎里验(2026-11-06):Easter_card(41 网格 + 14 被遮图片 + 遮罩)、customer_1(加权 deform)、MX2_cat 各两条动画四个时刻都对;
+  组件关掉再开、节点 active 切换几何不坏。踩的坑:① 脚本的类 id 是 23 字符的压缩 uuid(前 5 个十六进制原样),按引擎 decodeUuid
+  的 22 字符写法构建会报 Missing class;② 渲染器的顶点容量记在组件上,关掉再开 chunk 换了就越界,一屏尖刺 —— 改成按 chunk 算;
+  ③ 浏览器面板藏着时 rAF 不走、引擎初始化都卡住,用 `probe.html` 把 rAF 换成 setTimeout;探针相机只清深度,鬼影骗了一小时
+- 没做的:原生平台(JSB)没适配;像素级和 Unity 比;multiply / screen 像素验证;多角色 Sorting2D 交错
 
 ### 2026-10-10 并行分支合入 main
 

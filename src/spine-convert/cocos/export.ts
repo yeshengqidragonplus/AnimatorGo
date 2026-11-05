@@ -4,8 +4,8 @@ import type { AnimationData, Timeline } from '../../spine-format/binary/readAnim
 import type { Atlas, AtlasRegion } from '../../core/atlas.ts'
 import { encodePng, type Image } from '../../unity/png.ts'
 import { detectPremultiplied, unpremultiply } from '../unity/alpha.ts'
-import { resolveLinkedMeshes } from '../unity/linkedMesh.ts'
-import { fitAffine } from '../unity/mesh.ts'
+import { resolveLinkedMeshes, type TimelineParent } from '../unity/linkedMesh.ts'
+import { rangeIn } from '../clipping.ts'
 import { toAbsoluteBezier } from '../../spine-format/bezier.ts'
 import { describeTimeline, DUPLICATE_TIMELINE_MESSAGE, lastPerProperty } from '../../spine-format/duplicateTimelines.ts'
 import { applyPoint, invert, setupLocals, setupPose, type Affine, type BoneLocal } from '../../spine-eval/pose.ts'
@@ -13,26 +13,30 @@ import { drawOrderOf, layerOfSlot, type DrawOrderOffset } from '../../spine-eval
 import { sequenceCycle, sequenceFrameAt, sequenceRegionName, sequenceSteps, type SequenceKey } from '../../spine-eval/sequence.ts'
 import { slotColorAt, unpackRgba, type Rgba } from '../../spine-eval/color.ts'
 import { IssueCollector, type ConversionIssue } from '../types.ts'
-import { cocosUuid, spriteFrameUuid } from '../../cocos/ids.ts'
-import { animation, BLEND, PrefabDoc, sorting2D, sprite, uiTransform } from '../../cocos/json.ts'
+import { CLIP_CLASS, cocosUuid, MESH_CLASS, spriteFrameUuid } from '../../cocos/ids.ts'
+import { animation, BLEND, clipComponent, meshRenderer, PrefabDoc, sorting2D, sprite, uiTransform } from '../../cocos/json.ts'
 import { CONSTANT, realKeys, type RealKey, type Segment } from '../../cocos/curve.ts'
 import { clipJson, type PathStep, type Track } from '../../cocos/clip.ts'
 import { animationClipMeta, AUTO_ATLAS_CONTENT, autoAtlasMeta, directoryMeta, imageMeta, prefabMeta } from '../../cocos/meta.ts'
 
 /**
- * Spine(中转模型)→ Cocos Creator 3.8 的原生节点 + `cc.Animation` + `.anim`,零运行时脚本。
+ * Spine(中转模型)→ Cocos Creator 3.8 的原生节点 + `cc.Animation` + `.anim`。图片部件零脚本;网格 / deform / 遮罩走两个
+ * 脚本组件(`tools/cocos/runtime/`,CLI 拷到输出目录 `AnimatorGoRuntime/`)。
  *
- * 产物:`<名字>.prefab`、每条动画一个 `<名字>@<动画>.anim`、`images/` 里每个图集区域一张 PNG(+ 自动图集 `.pac`),
+ * 产物:`<名字>.prefab`、每条动画一个 `<动画>.anim`、`images/` 里每个图集区域一张 PNG(+ 自动图集 `.pac`),
  * 各自带 `.meta`。拖进工程的 `assets/` 就能用:拖 prefab 进 Canvas,`playOnLoad` 播第一条动画。
  *
  * 坐标:Spine 的像素就是 Cocos UI 的单位,Y 朝上、角度逆时针为正,都和 Spine 一致,不用换算。
  *
  * 结构(和 Unity / Godot 导出同一个思路,见 docs/COCOS.md):
  * - 骨骼 → 普通节点,位移 / 旋转 / 缩放就是 Spine 的 setup 值。Cocos 没有斜切,shearX 折进旋转,shearY ≠ shearX 的报近似
- * - 每个 attachment 一个节点,挂在骨骼下:`cc.UITransform` + `cc.Sprite` + `cc.Sorting2D`。
+ * - 每个 attachment 一个节点,挂在 slot 的骨骼下:`cc.UITransform` + `cc.Sprite` + `cc.Sorting2D`。
  *   换图 = 节点 `active`;绘制顺序 = `sortingOrder`(slot 下标,挪过位的 slot 一条阶梯轨道);颜色 = Sprite 的 `color`;
  *   混合模式 = Sprite 自己的 src / dst 混合因子
- * - 图片部件精确;网格先按矩形 Sprite 画(报近似 / 损失),等 CPU 蒙皮的脚本组件做好再改走它(docs/COCOS.md 第 1 节)
+ * - 网格(加权、deform 都算)→ `AnimatorGoMesh`(UIRenderer 子类,CPU 蒙皮,和 Sprite 同一条批处理管线、同样被 Sorting2D 排):
+ *   顶点照 Spine 原样存(每顶点若干个「骨骼 + 局部坐标 + 权重」),deform 的每个关键帧一个 shape,权重走 RealArrayTrack
+ * - clipping 遮罩 → `AnimatorGoClip`(多边形同样的表达 + 它在绘制顺序里的起止),被遮的网格在 CPU 上裁三角形;
+ *   遮罩范围里的图片部件也改走 AnimatorGoMesh(Sprite 裁不了)
  *
  * ⚠️ 挂在骨骼下的部件只能靠 `cc.Sorting2D` 按 Spine 的绘制顺序画(不然按层级顺序),工程要开 `sorting-2d` 功能。
  */
@@ -65,14 +69,14 @@ export interface CocosExportResult {
   readonly images: ReadonlyMap<string, CocosImage>
   /** 每个画得出来的 attachment 对应的节点(端到端测试用) */
   readonly attachments: readonly AttachmentNode[]
+  /** 用到了脚本组件(网格 / 遮罩):AnimatorGoRuntime/ 要一起拷进工程 */
+  readonly runtime: boolean
 }
 
 const DEG = Math.PI / 180
 /** 阶梯跳变前补的那个键离跳变多远(秒)。要大于引擎认「同一时刻」的 1e-6 */
 const STEP_EPSILON = 1e-4
 const SAMPLE_FPS = 30
-/** 网格按矩形画,拟合残差超过这个就报近似 */
-const MESH_TOLERANCE = 0.5
 
 // ─── 名字 ────────────────────────────────────────────────────────────────────
 
@@ -138,15 +142,6 @@ function regionImage(src: Image, region: AtlasRegion): Image {
   return { width: w, height: h, data }
 }
 
-function cropImage(src: Image, x: number, y: number, w: number, h: number): Image {
-  const data = new Uint8Array(w * h * 4)
-  for (let ty = 0; ty < h; ty++) {
-    const srcRow = (y + ty) * src.width + x
-    data.set(src.data.subarray(srcRow * 4, (srcRow + w) * 4), ty * w * 4)
-  }
-  return { width: w, height: h, data }
-}
-
 function premultiply(src: Image): Image {
   const data = new Uint8Array(src.data)
   for (let i = 0; i < data.length; i += 4) {
@@ -158,14 +153,7 @@ function premultiply(src: Image): Image {
   return { width: src.width, height: src.height, data }
 }
 
-interface Crop {
-  readonly x: number
-  readonly y: number
-  readonly width: number
-  readonly height: number
-}
-
-/** 写出的图,按「区域 + 裁剪 + 预乘」去重;文件名由区域名来,撞了加序号 */
+/** 写出的图,按「区域 + 预乘」去重;文件名由区域名来,撞了加序号 */
 class Images {
   readonly entries = new Map<string, CocosImage>()
   private readonly files = new Set<string>()
@@ -177,17 +165,15 @@ class Images {
     this.pages = pages
   }
 
-  get(region: AtlasRegion, crop: Crop | null, pma: boolean): CocosImage | null {
+  get(region: AtlasRegion, pma: boolean): CocosImage | null {
     const page = this.pages.get(region.page)
     if (page === undefined) return null
-    const key = `${region.name}${crop === null ? '' : `@${crop.x},${crop.y},${crop.width},${crop.height}`}${pma ? '@pma' : ''}`
+    const key = `${region.name}${pma ? '@pma' : ''}`
     const hit = this.entries.get(key)
     if (hit !== undefined) return hit
     let image = regionImage(page, region)
-    if (crop !== null) image = cropImage(image, crop.x, crop.y, crop.width, crop.height)
     if (pma) image = premultiply(image)
     let stem = region.name.replace(/[\\/:*?"<>|]/g, '_')
-    if (crop !== null) stem += `@${crop.x}_${crop.y}`
     if (pma) stem += '@pma'
     let file = stem
     for (let n = 2; this.files.has(file.toLowerCase()); n++) file = `${stem}_${n}`
@@ -232,59 +218,6 @@ function regionPlacement(a: Attachment, region: AtlasRegion): Placement {
   }
 }
 
-/**
- * 网格按矩形画:图上的点 →(最小二乘仿射)→ 骨骼局部,仿射拆成旋转 + 缩放给节点,斜切丢掉。
- * 只用到图的一部分的网格(共用一张图的 linkedmesh 常见)按 uv 包围盒裁图。
- * 返回残差(每个顶点按这个矩形画出来的位置和 Spine 的差,取最大)—— 脚本组件做好之前,网格就先这样
- */
-function meshPlacement(local: readonly { x: number; y: number }[], uvs: readonly number[], region: AtlasRegion): { placement: Placement; crop: Crop | null; residual: number } {
-  const n = local.length
-  // uv(相对未裁剪原图,左上原点)→ 裁剪区域里的像素坐标(左上原点)
-  const px = (i: number) => uvs[i * 2]! * region.originalWidth - region.offsetX
-  const py = (i: number) => uvs[i * 2 + 1]! * region.originalHeight - (region.originalHeight - region.offsetY - region.height)
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
-  for (let i = 0; i < n; i++) {
-    minX = Math.min(minX, px(i)); maxX = Math.max(maxX, px(i))
-    minY = Math.min(minY, py(i)); maxY = Math.max(maxY, py(i))
-  }
-  const cx = Math.max(0, Math.floor(minX - 1e-6))
-  const cy = Math.max(0, Math.floor(minY - 1e-6))
-  const cw = Math.min(region.width, Math.ceil(maxX + 1e-6)) - cx
-  const ch = Math.min(region.height, Math.ceil(maxY + 1e-6)) - cy
-  const full = cx === 0 && cy === 0 && cw === region.width && ch === region.height
-  const crop: Crop | null = full || cw <= 0 || ch <= 0 ? null : { x: cx, y: cy, width: cw, height: ch }
-  const w = crop?.width ?? region.width
-  const h = crop?.height ?? region.height
-  const ox = crop?.x ?? 0
-  const oy = crop?.y ?? 0
-  // 图的局部坐标:左下原点、Y 朝上 —— 锚点 (0,0) 的 Sprite 矩形就是 [0,w]×[0,h]
-  const src = local.map((_, i) => ({ x: px(i) - ox, y: oy + h - py(i) }))
-  const M = fitAffine(src, local)
-  let placement: Placement
-  if (M === null) {
-    // 退化(顶点太少 / 共线):不转不缩,对上重心
-    let dx = 0, dy = 0
-    for (let i = 0; i < n; i++) { dx += (local[i]!.x - src[i]!.x) / n; dy += (local[i]!.y - src[i]!.y) / n }
-    placement = { x: dx, y: dy, rotation: 0, scaleX: 1, scaleY: 1, width: w, height: h, anchorX: 0, anchorY: 0 }
-  } else {
-    const scaleX = Math.hypot(M.a, M.c)
-    const rotation = Math.atan2(M.c, M.a) / DEG
-    const scaleY = (M.a * M.d - M.b * M.c) / scaleX
-    placement = { x: M.x, y: M.y, rotation, scaleX, scaleY, width: w, height: h, anchorX: 0, anchorY: 0 }
-  }
-  const cos = Math.cos(DEG * placement.rotation)
-  const sin = Math.sin(DEG * placement.rotation)
-  let residual = 0
-  for (let i = 0; i < n; i++) {
-    const sx = src[i]!.x * placement.scaleX
-    const sy = src[i]!.y * placement.scaleY
-    const x = cos * sx - sin * sy + placement.x
-    const y = sin * sx + cos * sy + placement.y
-    residual = Math.max(residual, Math.hypot(x - local[i]!.x, y - local[i]!.y))
-  }
-  return { placement, crop, residual }
-}
-
 /** 加权网格的顶点换到某一根骨骼的局部坐标(setup 姿势下) */
 function verticesInBone(verts: Vertices, bone: number, setup: readonly Affine[]): { x: number; y: number }[] {
   const inv = invert(setup[bone]!)
@@ -301,13 +234,78 @@ function verticesInBone(verts: Vertices, bone: number, setup: readonly Affine[])
   })
 }
 
-/** 加权网格挂在哪根骨骼上:权重加起来最大的那根 */
-function dominantBone(verts: Vertices): number {
-  const total = new Map<number, number>()
-  for (const entry of verts.weights) for (const w of entry) total.set(w.bone, (total.get(w.bone) ?? 0) + w.weight)
-  let best = -1, bestWeight = -1
-  for (const [bone, weight] of total) if (weight > bestWeight) { best = bone; bestWeight = weight }
-  return best
+interface VertexSource {
+  /** 用到的骨骼(骨架下标),影响里的骨骼下标指向它 */
+  readonly bones: number[]
+  readonly counts: number[]
+  /** [骨骼局部下标, x, y, 权重] × 影响 */
+  readonly influences: number[]
+}
+
+/** Spine 的顶点 → 运行时(AnimatorGoSkinning.ts)的表达。没加权的全挂在 slot 的骨骼上 */
+function vertexSource(verts: Vertices, slotBone: number): VertexSource {
+  if (!verts.weighted) return rigidSource(pairs(verts.positions), slotBone)
+  const bones: number[] = []
+  const counts: number[] = []
+  const influences: number[] = []
+  for (const entry of verts.weights) {
+    counts.push(entry.length)
+    for (const w of entry) {
+      let i = bones.indexOf(w.bone)
+      if (i < 0) {
+        i = bones.length
+        bones.push(w.bone)
+      }
+      influences.push(i, w.x, w.y, w.weight)
+    }
+  }
+  return { bones, counts, influences }
+}
+
+function rigidSource(points: readonly { x: number; y: number }[], bone: number): VertexSource {
+  const influences: number[] = []
+  for (const p of points) influences.push(0, p.x, p.y, 1)
+  return { bones: [bone], counts: points.map(() => 1), influences }
+}
+
+const pairs = (flat: readonly number[]): { x: number; y: number }[] => Array.from({ length: flat.length / 2 }, (_, i) => ({ x: flat[i * 2]!, y: flat[i * 2 + 1]! }))
+
+/**
+ * region attachment 当网格画:四角在 slot 骨骼局部的位置(Spine 的 UpdateRegion:左下、右下、右上、左上,
+ * 和 spine-eval/vertices.ts 同一个公式)和各角的区域相对 uv(s 向右、t 向下)
+ */
+function regionQuad(a: Attachment, region: AtlasRegion): { local: { x: number; y: number }[]; uvs: number[] } {
+  const d = a.data as Record<string, number>
+  const w = d['width']!, h = d['height']!
+  const lx = (-w / 2 + (region.offsetX / region.originalWidth) * w) * d['scaleX']!
+  const ly = (-h / 2 + (region.offsetY / region.originalHeight) * h) * d['scaleY']!
+  const lx2 = (w / 2 - ((region.originalWidth - region.offsetX - region.width) / region.originalWidth) * w) * d['scaleX']!
+  const ly2 = (h / 2 - ((region.originalHeight - region.offsetY - region.height) / region.originalHeight) * h) * d['scaleY']!
+  const cos = Math.cos(DEG * d['rotation']!), sin = Math.sin(DEG * d['rotation']!)
+  const local = [[lx, ly], [lx2, ly], [lx2, ly2], [lx, ly2]].map(([x, y]) => ({ x: x! * cos - y! * sin + d['x']!, y: y! * cos + x! * sin + d['y']! }))
+  return { local, uvs: [0, 1, 1, 1, 1, 0, 0, 0] }
+}
+
+/** 网格的 uv(相对未裁剪的原图,左上原点)→ 相对裁剪后区域的 (s, t)。可能略出 0..1(顶点落在裁掉的透明边上),和 Spine 一样 */
+function meshUvs(uvs: readonly number[], region: AtlasRegion): number[] {
+  const out: number[] = []
+  for (let i = 0; i * 2 < uvs.length; i++) {
+    out.push((uvs[i * 2]! * region.originalWidth - region.offsetX) / region.width)
+    out.push((uvs[i * 2 + 1]! * region.originalHeight - (region.originalHeight - region.offsetY - region.height)) / region.height)
+  }
+  return out
+}
+
+/** 顶点的包围盒 → UITransform 的大小 / 锚点(只给编辑器画个框,渲染不用它) */
+function bounds(points: readonly { x: number; y: number }[]): { width: number; height: number; anchorX: number; anchorY: number } {
+  if (points.length === 0) return { width: 1, height: 1, anchorX: 0.5, anchorY: 0.5 }
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+  for (const p of points) {
+    minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x)
+    minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y)
+  }
+  const width = Math.max(maxX - minX, 1), height = Math.max(maxY - minY, 1)
+  return { width, height, anchorX: -minX / width, anchorY: -minY / height }
 }
 
 function regionNameOf(a: Attachment): string {
@@ -447,14 +445,26 @@ export interface AttachmentNode {
   readonly path: string
   /** 节点颜色里 attachment 自己那一份(slot 颜色动画要乘它) */
   readonly ownColor: Rgba
-  /** 网格:图裁掉的那一块(左上原点);region 和整张图的网格为 null */
-  readonly crop: Crop | null
-  /** 网格按矩形画的拟合残差(像素);region 为 0 */
-  readonly residual: number
-  /** 加权网格(两根以上骨骼):按这根骨骼画的 */
-  readonly weightedOn: number | null
+  /** sprite = cc.Sprite(图片部件);mesh = AnimatorGoMesh;clip = AnimatorGoClip */
+  readonly kind: AttachmentKind
+  /** 网格 / 遮罩上的 deform;没有为 null */
+  readonly deform: MeshDeform | null
   /** linkedmesh:deform 时间轴打在父网格上(皮肤 + 键名),这个节点跟着父网格变形 */
-  readonly deformSource: { readonly skin: string; readonly key: string } | null
+  readonly deformSource: TimelineParent | null
+}
+
+export type AttachmentKind = 'sprite' | 'mesh' | 'clip'
+
+/** 一个网格 / 遮罩的 deform:去重后的 shape(平铺偏移,逐影响 x,y,与 Spine 的 deform 时间轴同一个布局)和每条动画里的帧序列 */
+export interface MeshDeform {
+  readonly shapes: readonly (readonly number[])[]
+  readonly perAnim: ReadonlyMap<string, DeformSeq>
+}
+
+export interface DeformSeq {
+  readonly frames: readonly Record<string, unknown>[]
+  /** 每帧对应的 shape 下标;−1 = 没有形变(setup) */
+  readonly shape: readonly number[]
 }
 
 function setupVisible(slot: { attachmentName: string | null }, node: { key: string; frame?: { index: number; sequence: Sequence } }): boolean {
@@ -521,98 +531,126 @@ export function exportToCocos(input: SkeletonPart, atlas: Atlas, sources: Readon
   const attachmentNodes: AttachmentNode[] = []
   const nodesOfSlot = new Map<number, AttachmentNode[]>()
   const wrapperCount = { n: 0 }
-  const meshesReported = new Set<string>()
+  const keptOf = new Map(part.animations.map((anim) => [anim.name, lastPerProperty(anim.timelines).kept] as const))
+  // 可能被遮罩盖住的 slot(setup 和所有绘制顺序关键帧下都算):它们的图片部件也得走 AnimatorGoMesh,Sprite 裁不了
+  const clippedSlots = potentiallyClipped(part, keptOf)
+  const meshComps = new Map<AttachmentNode, number>()
+  const clipComps: number[] = []
+  const stats = { meshes: 0, weighted: 0, deformed: 0, quads: 0, clips: 0 }
+
+  const register = (info: AttachmentNode) => {
+    attachmentNodes.push(info)
+    nodesOfSlot.set(info.slot, [...(nodesOfSlot.get(info.slot) ?? []), info])
+  }
+  /** 节点挂在 slot 的骨骼下;和皮肤有关的再包一层按皮肤开关的节点 */
+  const placeUnder = (skin: (typeof part.skins)[number], slotIndex: number, key: string, base: string, common: { skin: string; slot: number; key: string }): number => {
+    let parent = boneNode[part.slots[slotIndex]!.bone]!
+    const skinDependent = named.length > 0 && (skin !== defaultSkin || overridden.has(`${slotIndex}/${key}`))
+    if (skinDependent) {
+      parent = doc.node({ name: names.claim(parent, `${base} (${skin.name})`), parent, active: shownInSkin(common, initialSkin) })
+      wrapperCount.n++
+    }
+    return parent
+  }
 
   const emit = (skin: (typeof part.skins)[number], slotIndex: number, a: Attachment, frame?: { index: number; sequence: Sequence }) => {
     const slot = part.slots[slotIndex]!
+    const blend = BLEND_OF_MODE[slot.blendMode]
+    if (blend === undefined) issues.loss(`slot.${slot.name}`, `不认识的混合模式 ${slot.blendMode},按 normal 画`)
+    const b = blend ?? BLEND_OF_MODE[0]!
+    const ownColor = unpackRgba(a.data['color'] as number)
+    const slotColor = unpackRgba(slot.color)
+    let base = a.key === slot.name ? slot.name : `${slot.name}__${a.key}`
+    if (frame !== undefined) base += ` #${frame.sequence.start + frame.index}`
+    const common = { slot: slotIndex, skin: skin.name, key: a.key, attachment: a, ownColor, ...(frame === undefined ? {} : { frame }) }
+    const deformSource = timelineParents.get(a) ?? null
+
+    // 遮罩:没有图,只有多边形 + 它在绘制顺序里的起止
+    if (a.type === 'clipping') {
+      const verts = a.data['vertices'] as Vertices
+      const source = vertexSource(verts, slot.bone)
+      const deform = deformOf(part, keptOf, common, verts, deformSource)
+      const parent = placeUnder(skin, slotIndex, a.key, base, common)
+      const node = doc.node({ name: names.claim(parent, base), parent, active: setupVisible(slot, common) })
+      clipComps.push(clipComponent(doc, node, {
+        bones: source.bones.map((i) => boneNode[i]!), counts: source.counts, influences: source.influences,
+        shapes: deform?.shapes.flat() ?? [], shapeCount: deform?.shapes.length ?? 0,
+        order: slotIndex, endOrder: a.data['endSlot'] as number,
+      }))
+      stats.clips++
+      register({ ...common, kind: 'clip', path: doc.pathOf(node), deform, deformSource })
+      return
+    }
+
     const regionName = frame === undefined ? regionNameOf(a) : sequenceRegionName(regionNameOf(a), frame.sequence, frame.index)
     const region = atlas.regions.get(regionName)
     if (region === undefined) {
       issues.loss(`region.${regionName}`, `图集里没有 "${regionName}",这个部件不会显示`)
       return
     }
-    const blend = BLEND_OF_MODE[slot.blendMode]
-    if (blend === undefined) {
-      issues.loss(`slot.${slot.name}`, `不认识的混合模式 ${slot.blendMode},按 normal 画`)
-    }
-    const b = blend ?? BLEND_OF_MODE[0]!
-    const ownColor = unpackRgba(a.data['color'] as number)
-    const slotColor = unpackRgba(slot.color)
-    let base = a.key === slot.name ? slot.name : `${slot.name}__${a.key}`
-    if (frame !== undefined) base += ` #${frame.sequence.start + frame.index}`
-
-    let placement: Placement
-    let crop: Crop | null = null
-    let bone = slot.bone
-    let residual = 0
-    let weightedOn: number | null = null
-    if (a.type === 'region') {
-      placement = regionPlacement(a, region)
-    } else {
-      const count = a.data['vertexCount'] as number
-      const uvs = a.data['uvs'] as number[]
-      const verts = a.data['vertices'] as Vertices
-      let local: { x: number; y: number }[]
-      if (!verts.weighted) {
-        local = []
-        for (let i = 0; i < count; i++) local.push({ x: verts.positions[i * 2]!, y: verts.positions[i * 2 + 1]! })
-      } else {
-        bone = dominantBone(verts)
-        local = verticesInBone(verts, bone, setup)
-        const bones = new Set(verts.weights.flatMap((e) => e.map((w) => w.bone)))
-        if (bones.size > 1) {
-          weightedOn = bone
-          if (!meshesReported.has(`w/${a.name}`)) {
-            meshesReported.add(`w/${a.name}`)
-            issues.loss(`mesh.${a.name}`, `加权网格(${bones.size} 根骨骼)还没转:按挂在 "${part.bones[bone]!.name}" 上的矩形画,不随别的骨骼变形 —— CPU 蒙皮的脚本组件做好后改走它`)
-          }
-        }
-      }
-      const fit = meshPlacement(local, uvs, region)
-      placement = fit.placement
-      crop = fit.crop
-      residual = fit.residual
-      if (!meshesReported.has(a.name) && weightedOn === null) {
-        meshesReported.add(a.name)
-        issues.add(fit.residual > MESH_TOLERANCE ? 'approximated' : 'info', `mesh.${a.name}`,
-          `网格按矩形 Sprite 画(图上的点按最小二乘仿射摆到顶点上,斜切丢掉),顶点最多差 ${fit.residual.toFixed(1)} 像素 —— 脚本组件做好后改走它`)
-      }
-    }
-    const image = images.get(region, crop, b.pma)
+    const image = images.get(region, b.pma)
     if (image === null) return
+    const color = to255(mulColor(slotColor, ownColor))
 
-    const common = { slot: slotIndex, skin: skin.name, key: a.key, attachment: a, ownColor, ...(frame === undefined ? {} : { frame }) }
-    let parent = boneNode[bone]!
-    const skinDependent = named.length > 0 && (skin !== defaultSkin || overridden.has(`${slotIndex}/${a.key}`))
-    if (skinDependent) {
-      parent = doc.node({ name: names.claim(parent, `${base} (${skin.name})`), parent, active: shownInSkin(common, initialSkin) })
-      wrapperCount.n++
+    // 图片部件:cc.Sprite,零脚本
+    if (a.type === 'region' && !clippedSlots.has(slotIndex)) {
+      const placement = regionPlacement(a, region)
+      const parent = placeUnder(skin, slotIndex, a.key, base, common)
+      const node = doc.node({
+        name: names.claim(parent, base), parent,
+        x: placement.x, y: placement.y, rotation: placement.rotation, scaleX: placement.scaleX, scaleY: placement.scaleY,
+        active: setupVisible(slot, common),
+      })
+      uiTransform(doc, node, placement.width, placement.height, placement.anchorX, placement.anchorY)
+      sprite(doc, node, { spriteFrame: spriteFrameUuid(image.uuid), color, srcBlend: b.src, dstBlend: b.dst })
+      sorting2D(doc, node, slotIndex)
+      register({ ...common, kind: 'sprite', path: doc.pathOf(node), deform: null, deformSource: null })
+      return
     }
-    const node = doc.node({
-      name: names.claim(parent, base), parent,
-      x: placement.x, y: placement.y, rotation: placement.rotation, scaleX: placement.scaleX, scaleY: placement.scaleY,
-      active: setupVisible(slot, common),
+
+    // 网格(或遮罩范围里的图片部件):AnimatorGoMesh。节点是 slot 骨骼下的一个恒等节点,顶点自己带骨骼
+    let source: VertexSource
+    let uvs: number[]
+    let indices: number[]
+    let local: { x: number; y: number }[]
+    let deform: MeshDeform | null = null
+    if (a.type === 'region') {
+      const quad = regionQuad(a, region)
+      source = rigidSource(quad.local, slot.bone)
+      uvs = quad.uvs
+      indices = [0, 1, 2, 0, 2, 3]
+      local = quad.local
+      stats.quads++
+    } else {
+      const verts = a.data['vertices'] as Vertices
+      source = vertexSource(verts, slot.bone)
+      uvs = meshUvs(a.data['uvs'] as number[], region)
+      indices = a.data['triangles'] as number[]
+      local = verts.weighted ? verticesInBone(verts, slot.bone, setup) : pairs(verts.positions)
+      deform = deformOf(part, keptOf, common, verts, deformSource)
+      stats.meshes++
+      if (source.bones.length > 1) stats.weighted++
+      if (deform !== null) stats.deformed++
+    }
+    const parent = placeUnder(skin, slotIndex, a.key, base, common)
+    const node = doc.node({ name: names.claim(parent, base), parent, active: setupVisible(slot, common) })
+    const box = bounds(local)
+    uiTransform(doc, node, box.width, box.height, box.anchorX, box.anchorY)
+    const comp = meshRenderer(doc, node, {
+      spriteFrame: spriteFrameUuid(image.uuid), color, srcBlend: b.src, dstBlend: b.dst,
+      bones: source.bones.map((i) => boneNode[i]!), counts: source.counts, influences: source.influences, uvs, indices,
+      shapes: deform?.shapes.flat() ?? [], shapeCount: deform?.shapes.length ?? 0,
     })
-    uiTransform(doc, node, placement.width, placement.height, placement.anchorX, placement.anchorY)
-    sprite(doc, node, { spriteFrame: spriteFrameUuid(image.uuid), color: to255(mulColor(slotColor, ownColor)), srcBlend: b.src, dstBlend: b.dst })
     sorting2D(doc, node, slotIndex)
-    const info: AttachmentNode = { ...common, path: doc.pathOf(node), crop, residual, weightedOn, deformSource: timelineParents.get(a) ?? null }
-    attachmentNodes.push(info)
-    nodesOfSlot.set(slotIndex, [...(nodesOfSlot.get(slotIndex) ?? []), info])
+    const info: AttachmentNode = { ...common, kind: 'mesh', path: doc.pathOf(node), deform, deformSource }
+    register(info)
+    if (clippedSlots.has(slotIndex)) meshComps.set(info, comp)
   }
 
-  const clippingSeen = new Set<string>()
   for (const skin of part.skins) {
     for (const entry of skin.slots) {
       for (const a of entry.attachments) {
-        if (a.type === 'clipping') {
-          if (!clippingSeen.has(a.name)) {
-            clippingSeen.add(a.name)
-            issues.loss(`clipping.${a.name}`, 'clipping 遮罩还没转(等脚本组件一起做),被遮的部件按整张画')
-          }
-          continue
-        }
-        if (a.type !== 'region' && a.type !== 'mesh') {
+        if (a.type !== 'region' && a.type !== 'mesh' && a.type !== 'clipping') {
           if (a.type !== 'boundingbox' && a.type !== 'point' && a.type !== 'path') issues.loss(`attachment.${a.name}`, `不支持的 attachment 类型 ${a.type}`)
           continue
         }
@@ -622,6 +660,16 @@ export function exportToCocos(input: SkeletonPart, atlas: Atlas, sources: Readon
       }
     }
   }
+  // 可能被遮的网格认识全部遮罩,运行时按绘制顺序挑正盖着自己的那个
+  for (const comp of meshComps.values()) doc.objects[comp]!['clips'] = clipComps.map((c) => doc.ref(c))
+  const runtime = stats.meshes + stats.quads + stats.clips > 0
+  if (runtime) {
+    issues.add('info', 'runtime', `${stats.meshes} 个网格(加权 ${stats.weighted}、deform ${stats.deformed})走 AnimatorGoMesh(CPU 蒙皮的脚本组件)`
+      + (stats.clips > 0 ? `,${stats.clips} 个遮罩走 AnimatorGoClip` : '')
+      + (stats.quads > 0 ? `,遮罩范围里的 ${stats.quads} 个图片部件也改走 AnimatorGoMesh(只有它会被裁)` : '')
+      + ' —— 脚本在 AnimatorGoRuntime/,要一起拷进工程')
+  }
+  if (stats.clips > 1) issues.add('info', 'clipping', '多个遮罩:同一部件同时被几个盖住时按先画的那个裁(Spine 同时也只认一个遮罩)')
   part.slots.forEach((slot, i) => {
     if (slot.darkColor !== -1) issues.loss(`slot.${slot.name}`, '两色染色(dark color)在 Cocos 里没有对应物,只保留亮色')
     const b = BLEND_OF_MODE[slot.blendMode]
@@ -642,7 +690,6 @@ export function exportToCocos(input: SkeletonPart, atlas: Atlas, sources: Readon
   const files: CocosFile[] = []
   const clipUuids: string[] = []
   const bonePath = boneNode.map((n) => doc.pathOf(n))
-  const deformReported = new Set<string>()
   for (const anim of part.animations) {
     const tracks: Track[] = []
     const { kept, dropped } = lastPerProperty(anim.timelines)
@@ -650,15 +697,7 @@ export function exportToCocos(input: SkeletonPart, atlas: Atlas, sources: Readon
       for (const d of dropped) if (!d.identical) issues.add('approximated', describeTimeline(part, d.timeline), DUPLICATE_TIMELINE_MESSAGE)
       tracks.push(...boneTracks(part, kept, bonePath, locals, is38, issues))
       tracks.push(...slotTracks(part, anim, kept, nodesOfSlot, is38, issues))
-      for (const t of kept) {
-        if (t.kind === 'deform') {
-          const owner = (t.frames[0] as { attachment: string }).attachment
-          if (!deformReported.has(owner)) {
-            deformReported.add(owner)
-            issues.loss(`deform.${owner}`, 'deform 顶点动画还没转(等脚本组件),网格按不变形画')
-          }
-        }
-      }
+      tracks.push(...deformTracks(anim, attachmentNodes, is38))
       if (kept.some((t) => t.kind === 'event')) issues.loss('events', 'Spine 事件没有转(Cocos 的动画事件要有脚本里的方法接)')
     })
     const uuid = cocosUuid(`${name}/anim/${anim.name}`)
@@ -684,17 +723,130 @@ export function exportToCocos(input: SkeletonPart, atlas: Atlas, sources: Readon
     if (options.skipImages !== true) files.push({ path: img.path, content: encodePng(img.image) })
     files.push({ path: `${img.path}.meta`, content: imageMeta(img.uuid, img.path.replace(/^images\//, '').replace(/\.png$/, ''), img.width, img.height) })
   }
-  return { files, issues: issues.all, images: images.entries, attachments: attachmentNodes }
+  return { files, issues: issues.all, images: images.entries, attachments: attachmentNodes, runtime }
 }
 
-/** 网格顶点在图上的位置 → 节点局部坐标(锚点 (0,0) 的矩形,左下原点、Y 朝上)—— 端到端测试按它算「这个顶点该画在哪」 */
-export function meshVertexLocal(node: AttachmentNode, region: AtlasRegion, u: number, v: number): { x: number; y: number } {
-  const px = u * region.originalWidth - region.offsetX
-  const py = v * region.originalHeight - (region.originalHeight - region.offsetY - region.height)
-  const ox = node.crop?.x ?? 0
-  const oy = node.crop?.y ?? 0
-  const h = node.crop?.height ?? region.height
-  return { x: px - ox, y: oy + h - py }
+// ─── 网格 / 遮罩的 deform ─────────────────────────────────────────────────────
+
+const skinNameOf = (part: SkeletonPart, s: number | string): string => (typeof s === 'number' ? (part.skins[s]?.name ?? String(s)) : s)
+
+/** 一帧的 deform 偏移展开成整条(Spine 存的是从 start 起的一段) */
+function flatOffsets(f: Record<string, unknown>, flatLength: number): number[] {
+  const out = new Array<number>(flatLength).fill(0)
+  const v = (f['vertices'] as number[] | undefined) ?? []
+  const start = Number(f['start'] ?? 0)
+  v.forEach((x, k) => { if (start + k < flatLength) out[start + k] = x })
+  return out
+}
+
+/**
+ * 打在这个网格 / 遮罩上的 deform:每条动画里的帧序列,帧去重成 shape(同样的偏移只存一份;全零 = setup,不占 shape)。
+ * 目标按「皮肤 + slot + 键名」认(几套皮肤同键名各有各的);linkedmesh 跟着父网格(`source`)的时间轴变形。
+ */
+function deformOf(part: SkeletonPart, keptOf: ReadonlyMap<string, readonly Timeline[]>, node: { slot: number; skin: string; key: string; attachment: Attachment }, verts: Vertices, source: TimelineParent | null): MeshDeform | null {
+  const flatLength = verts.weighted ? verts.weights.reduce((n, w) => n + w.length * 2, 0) : verts.positions.length
+  const shapes: number[][] = []
+  const index = new Map<string, number>()
+  const perAnim = new Map<string, DeformSeq>()
+  for (const anim of part.animations) {
+    for (const t of keptOf.get(anim.name) ?? []) {
+      if (t.kind !== 'deform' || t.owner !== node.slot) continue
+      const rec = t.frames[0] as unknown as { skin: number | string; attachment: string; frames: Record<string, unknown>[] }
+      const skin = skinNameOf(part, rec.skin)
+      const own = skin === node.skin && (rec.attachment === node.key || rec.attachment === node.attachment.name)
+      const inherited = source !== null && skin === source.skin && rec.attachment === source.key
+      if (!own && !inherited) continue
+      const shape = rec.frames.map((f) => {
+        const flat = flatOffsets(f, flatLength)
+        if (flat.every((x) => x === 0)) return -1
+        const key = flat.map((x) => x.toFixed(4)).join(',')
+        let i = index.get(key)
+        if (i === undefined) {
+          i = shapes.length
+          shapes.push(flat)
+          index.set(key, i)
+        }
+        return i
+      })
+      perAnim.set(anim.name, { frames: rec.frames, shape })
+      break
+    }
+  }
+  return shapes.length === 0 ? null : { shapes, perAnim }
+}
+
+/**
+ * 一条动画里 shape 权重的曲线:第 k 条通道在打到 shape k 的帧上是 1、别的帧 0,帧间走 Spine 这一帧的曲线
+ * (deform 的曲线是 0..1 的进度,两版一致)。两条相邻通道一升一降用同一条曲线,混出来 = (1−p)·δₖ + p·δₖ₊₁,正是 Spine 的插值。
+ * 第一帧之前是 setup(0),最后一帧之后保持。没有 deform 的动画也写一条全 0 的 —— 切动画时 Cocos 不会把没键的属性回 setup
+ */
+function shapeChannels(seq: DeformSeq | undefined, shapeCount: number, is38: boolean): RealKey[][] {
+  const zero = (): RealKey[] => realKeys([0], [0], [undefined])
+  if (seq === undefined) return Array.from({ length: shapeCount }, zero)
+  const frames = seq.frames
+  const times = frames.map((f) => Number(f['time'] ?? 0))
+  return Array.from({ length: shapeCount }, (_, k) => {
+    const vals = seq.shape.map((s) => (s === k ? 1 : 0))
+    if (vals.every((v) => v === 0)) return zero()
+    const keyTimes: number[] = []
+    const values: number[] = []
+    const segs: (Segment | undefined)[] = []
+    if (times[0]! > 0) {
+      keyTimes.push(0)
+      values.push(0)
+      segs.push({ curve: 'stepped' })
+    }
+    frames.forEach((f, j) => {
+      const v0 = vals[j]!
+      let seg: Segment | undefined
+      if (j + 1 < frames.length) {
+        const v1 = vals[j + 1]!
+        const curve = f['curve']
+        if (curve === 'stepped') seg = { curve: 'stepped' }
+        else if (curve === 'bezier' && v0 !== v1) {
+          const raw = (f['beziers'] as number[][])[0]!
+          const b = is38 ? toAbsoluteBezier(raw, times[j]!, 0, times[j + 1]!, 1) : raw
+          seg = { curve: 'bezier', c: [b[0]!, v0 + (v1 - v0) * b[1]!, b[2]!, v0 + (v1 - v0) * b[3]!] }
+        } else seg = { curve: 'linear' }
+      }
+      const t = times[j]!
+      if (keyTimes.length > 0 && Math.abs(keyTimes[keyTimes.length - 1]! - t) < 1e-6) {
+        values[values.length - 1] = v0
+        segs[segs.length - 1] = seg
+        return
+      }
+      keyTimes.push(t)
+      values.push(v0)
+      segs.push(seg)
+    })
+    return realKeys(keyTimes, values, segs)
+  })
+}
+
+/** 每个带 shape 的网格 / 遮罩一条 `shapeWeights` 的 RealArrayTrack */
+function deformTracks(anim: AnimationData, nodes: readonly AttachmentNode[], is38: boolean): Track[] {
+  const out: Track[] = []
+  for (const n of nodes) {
+    if (n.deform === null) continue
+    const channels = shapeChannels(n.deform.perAnim.get(anim.name), n.deform.shapes.length, is38)
+    out.push({ kind: 'realArray', path: [{ node: n.path }, { component: n.kind === 'clip' ? CLIP_CLASS : MESH_CLASS }, 'shapeWeights'], channels })
+  }
+  return out
+}
+
+/** 可能被遮罩盖住的 slot:setup 和每条动画的每个绘制顺序关键帧下,遮罩 slot 之后到 endSlot 为止的(Spine 的规则,clipping.ts 的 rangeIn) */
+function potentiallyClipped(part: SkeletonPart, keptOf: ReadonlyMap<string, readonly Timeline[]>): Set<number> {
+  const clips: { slot: number; end: number }[] = []
+  for (const skin of part.skins) for (const e of skin.slots) for (const a of e.attachments) if (a.type === 'clipping') clips.push({ slot: e.slot, end: a.data['endSlot'] as number })
+  const out = new Set<number>()
+  if (clips.length === 0) return out
+  const orders: number[][] = [part.slots.map((_, i) => i)]
+  for (const kept of keptOf.values()) {
+    const tl = kept.find((t) => t.kind === 'drawOrder')
+    for (const f of tl?.frames ?? []) orders.push(drawOrderOf(part.slots.length, (f['offsets'] as DrawOrderOffset[] | undefined) ?? []))
+  }
+  for (const c of clips) for (const o of orders) for (const s of rangeIn(o, c.slot, c.end)) out.add(s)
+  return out
 }
 
 // ─── 各类时间轴 ──────────────────────────────────────────────────────────────
@@ -828,8 +980,9 @@ function slotTracks(part: SkeletonPart, anim: AnimationData, timelines: readonly
     const colors = times.map((time) => slotColorAt(list, setupColor, time, is38))
     if (curved) issues.add('approximated', `color[${slot.name}]`, `颜色曲线按 ${SAMPLE_FPS} fps 采样成线性关键帧`)
     for (const node of nodes) {
+      if (node.kind === 'clip') continue
       const channels = [0, 1, 2, 3].map((k) => linearKeys(times, colors.map((c) => to255(mulColor(c, node.ownColor))[k]!)))
-      out.push({ kind: 'color', path: [{ node: node.path }, { component: 'cc.Sprite' }, 'color'], channels })
+      out.push({ kind: 'color', path: [{ node: node.path }, { component: node.kind === 'sprite' ? 'cc.Sprite' : MESH_CLASS }, 'color'], channels })
     }
   }
 
@@ -840,10 +993,23 @@ function slotTracks(part: SkeletonPart, anim: AnimationData, timelines: readonly
       t: Number(f['time'] ?? 0),
       layer: layerOfSlot(drawOrderOf(part.slots.length, (f['offsets'] as DrawOrderOffset[] | undefined) ?? [])),
     }))
+    /** 这个 slot 在绘制顺序里的位置随时间的阶梯;没挪过位就 null */
+    const orderKeys = (s: number): RealKey[] | null => {
+      if (s < 0 || s >= part.slots.length || layers.every((l) => l.layer[s] === s)) return null
+      return stepKeys([{ t: 0, v: s }, ...layers.map((l) => ({ t: l.t, v: l.layer[s]! }))])
+    }
     for (let s = 0; s < part.slots.length; s++) {
-      if (layers.every((l) => l.layer[s] === s)) continue
-      const keys = stepKeys([{ t: 0, v: s }, ...layers.map((l) => ({ t: l.t, v: l.layer[s]! }))])
-      for (const node of nodesOfSlot.get(s) ?? []) out.push({ kind: 'real', path: [{ node: node.path }, { component: 'cc.Sorting2D' }, 'sortingOrder'], keys })
+      const keys = orderKeys(s)
+      for (const node of nodesOfSlot.get(s) ?? []) {
+        if (node.kind !== 'clip') {
+          if (keys !== null) out.push({ kind: 'real', path: [{ node: node.path }, { component: 'cc.Sorting2D' }, 'sortingOrder'], keys })
+          continue
+        }
+        // 遮罩的起止跟着绘制顺序走
+        if (keys !== null) out.push({ kind: 'real', path: [{ node: node.path }, { component: CLIP_CLASS }, 'order'], keys })
+        const endKeys = orderKeys(node.attachment.data['endSlot'] as number)
+        if (endKeys !== null) out.push({ kind: 'real', path: [{ node: node.path }, { component: CLIP_CLASS }, 'endOrder'], keys: endKeys })
+      }
     }
   }
   return out

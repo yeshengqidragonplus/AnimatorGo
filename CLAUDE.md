@@ -131,7 +131,7 @@ Godot 侧的验证:`tools/godot/` 的探针 / 自检 / 渲染脚本拷进一个 
 `E:/Tools/Godot_v4.7.2-stable_win64/Godot_v4.7.2-stable_win64_console.exe`(`--import` 先导入贴图;
 渲染不能加 `--headless`,采样时刻与 Unity 的渲染工具相同,两边能逐帧对照)。端到端测试把写出的 `.tscn` 读回来按 Godot 的规则算顶点,和 Spine 求值逐点比。
 
-导出到 Cocos Creator 3.8(原生节点 + `cc.Animation` + `.anim`,图片部件零脚本):
+导出到 Cocos Creator 3.8(原生节点 + `cc.Animation` + `.anim`,图片部件零脚本;网格 / deform / 遮罩走自带的两个脚本组件):
 
 ```bash
 pnpm cocos <骨架文件或目录> [--out 目录] [--atlas 图集] [--skin 初始皮肤] [--dry-run]
@@ -139,16 +139,22 @@ pnpm cocos <骨架文件或目录> [--out 目录] [--atlas 图集] [--skin 初�
 
 每个骨架一个目录(prefab + 每条动画一个 `.anim` + `images/` 每个区域一张 PNG + 自动图集),整个拷进工程 `assets/` 就能用。
 Spine 的像素 = Cocos 的单位、Y 朝上、角度逆时针,不用换算。⚠️ **挂在骨骼下的部件只能靠 `cc.Sorting2D` 按 Spine 绘制顺序画**
-(工程要开 sorting-2d),而 3D 蒙皮网格走 `UIMeshRenderer` 不参与它的排序 —— 所以加权网格 / deform / 遮罩**要一个 CPU 蒙皮的脚本组件**
-(用户定,2026-11-04,还没做;现在加权网格按权重最大的骨骼画、deform 不动、遮罩不裁,都报 loss)。曲线:`cc.RealCurve` 开了权重后
+(工程要开 sorting-2d),而 3D 蒙皮网格走 `UIMeshRenderer` 不参与它的排序 —— 所以网格(加权、deform)和遮罩走
+`tools/cocos/runtime/` 的 `AnimatorGoMesh`(UIRenderer 子类,CPU 蒙皮,顶点照 Spine 原样存、每顶点骨骼数不限,和 Sprite 同一批)
+/ `AnimatorGoClip`(遮罩多边形 + 绘制顺序里的起止,被遮的网格在渲染器里裁三角形),CLI 拷到输出目录 `AnimatorGoRuntime/` 一份;
+遮罩范围里的图片部件也改走 AnimatorGoMesh。⚠️ prefab 里脚本组件的 `__type__` 是脚本 uuid 的 23 字符压缩形式(`ids.ts` 的
+`compressUuid`,对照构建产物定的),一个文件只能有一个 Component。⚠️ 渲染器的顶点容量按 chunk 自己算,不能记在组件上
+(关掉再开 chunk 会换,记错了索引指到别的网格,一屏尖刺)。只验过 Web 管线,原生平台没适配。曲线:`cc.RealCurve` 开了权重后
 控制点是绝对的,Spine 贝塞尔逐点还原;引擎按 1e-6 秒认同一时刻的键。图的两个子资源 id 固定 `@6c48a` / `@f9941`,别的子资源
 (glTF 网格等)的 id 是按名字算的哈希、没找到算法。剪辑名 = 文件名。详见 [docs/COCOS.md](docs/COCOS.md)。
 
 Cocos 侧的验证:本机编辑器 `C:/ProgramData/cocos/editors/Creator/3.8.8/CocosCreator.exe`(引擎源码在它的
 `resources/resources/3d/engine/`,写法一律照源码),`--project <工程> --build "configPath=<json>"` 命令行构建 web 版,
-`.claude/launch.json` 的 `cocos-probe` 起静态服务在浏览器面板里看,`cocos-collect`(`tools/cocos/collect.mjs`)收页面 POST 过来的帧。
-⚠️ 浏览器面板藏着时页面的 rAF 被节流到几乎不走,场景加载和渲染都停 —— 在页面里 `setInterval(() => cc.director.tick(1/30), 33)`
-自己驱动。端到端测试把写出的 prefab 和 `.anim` 读回来按 Cocos 的规则算四角 / 显隐 / 先后 / 颜色,和 Spine 求值比。
+`.claude/launch.json` 的 `cocos-probe` 起静态服务在浏览器面板里看,`cocos-collect`(`tools/cocos/collect.mjs`)收页面 POST 过来的帧,
+探针工程的生成脚本在 `tools/cocos/probe/`。⚠️ 浏览器面板藏着时页面的 rAF 不走,引擎初始化卡在等第一帧 —— 打开构建目录旁的
+`probe.html`(把 `requestAnimationFrame` 换成 `setTimeout` 再加载 `index.js`);探针场景的相机要清颜色(`_clearFlags=7`),不然
+面板藏着时绘制缓冲不清、截图全是上一帧的鬼影。端到端测试把写出的 prefab 和 `.anim` 读回来按 Cocos 的规则算四角 / 网格顶点 /
+谁被裁 / 显隐 / 先后 / 颜色(网格顶点 import 运行时那份蒙皮代码算),和 Spine 求值比。
 
 Unity 角色读回(我们导到 Unity、又在 Unity 里改过的,或别人在 Unity 里做的)→ Godot / Spine JSON:
 

@@ -32,7 +32,7 @@ export interface ClipGroup {
 }
 
 /** 被遮的 slot 有哪些:遮罩之后、到 endSlot 为止(endSlot 不在后面就到最后) */
-function rangeIn(order: readonly number[], slot: number, end: number): number[] {
+export function rangeIn(order: readonly number[], slot: number, end: number): number[] {
   const from = order.indexOf(slot)
   if (from < 0) return []
   const to = order.indexOf(end)

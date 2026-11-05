@@ -1,9 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { collectSkeletons, findAtlas, loadAtlas, readSkeleton, stemOf } from './skeletonInputs.ts'
 import { describeClashes, planOutputNames, skeletonContentKey } from './outputNames.ts'
 import { exportToCocos } from '../spine-convert/cocos/export.ts'
-import { cocosUuid } from '../cocos/ids.ts'
+import { cocosUuid, RUNTIME_DIR_UUID, RUNTIME_SCRIPTS } from '../cocos/ids.ts'
 import { directoryMeta } from '../cocos/meta.ts'
 import type { ConversionIssue } from '../spine-convert/types.ts'
 
@@ -15,6 +16,7 @@ import type { ConversionIssue } from '../spine-convert/types.ts'
  * ```
  *
  * 每个骨架一个目录(带 `.meta`):`<名字>.prefab`、每条动画一个 `.anim`、`images/` 里每个图集区域一张 PNG + 自动图集。
+ * 有网格 / 遮罩的骨架要脚本组件,运行时脚本(tools/cocos/runtime/)拷到输出目录下 `AnimatorGoRuntime/` **一次**。
  * 整个目录拷进 Cocos 工程的 `assets/` 就能用(或者 `--out` 直接指到 `assets/` 下面)。**不会覆盖输入** ——
  * 默认写到 `<输入目录>_cocos`。不同目录下的同名骨架怎么起名见 `outputNames.ts`。
  */
@@ -77,6 +79,21 @@ function insideAssets(out: string): boolean {
   return false
 }
 
+/**
+ * 运行时脚本随产物拷进工程一次(输出目录下 AnimatorGoRuntime/,不放每个骨架目录 —— 同一个类出现两次编译不过)。
+ * `.meta` 带固定 uuid(ids.ts 的 RUNTIME_SCRIPTS),prefab 里的组件靠它认类。内容没变就不碰
+ */
+function installRuntime(outDir: string): string {
+  const src = fileURLToPath(new URL('../../tools/cocos/runtime/', import.meta.url))
+  const dir = join(outDir, 'AnimatorGoRuntime')
+  mkdirSync(dir, { recursive: true })
+  writeIfChanged(`${dir}.meta`, directoryMeta(RUNTIME_DIR_UUID))
+  for (const name of Object.keys(RUNTIME_SCRIPTS)) {
+    for (const file of [`${name}.ts`, `${name}.ts.meta`]) writeIfChanged(join(dir, file), readFileSync(join(src, file)))
+  }
+  return dir
+}
+
 function writeIfChanged(target: string, content: string | Uint8Array): void {
   const bytes = typeof content === 'string' ? Buffer.from(content, 'utf8') : Buffer.from(content)
   // 内容没变就不碰 —— Cocos 编辑器开着时每次重写都会触发重新导入
@@ -108,6 +125,7 @@ function main(): void {
 
   let failed = 0
   let shared = 0
+  let runtimeInstalled = false
   const failedFiles = new Set<string>()
   const counts: Record<string, number> = {}
   for (const { file, name, sameAs, clashes } of plan) {
@@ -142,6 +160,10 @@ function main(): void {
         mkdirSync(join(dir, 'images'), { recursive: true })
         writeIfChanged(`${dir}.meta`, directoryMeta(cocosUuid(`${name}/dir`)))
         for (const out of result.files) writeIfChanged(join(dir, out.path), out.content)
+        if (result.runtime && !runtimeInstalled) {
+          runtimeInstalled = true
+          console.log(`    ℹ 运行时脚本已拷到 ${relative(parsed.out, installRuntime(parsed.out)) || '.'}/(AnimatorGoMesh / AnimatorGoClip),整个目录一起拷进工程`)
+        }
       }
       for (const issue of result.issues) counts[issue.level] = (counts[issue.level] ?? 0) + 1
       console.log(`    → ${result.files.length} 个文件,${part.animations.length} 条动画,${result.images.size} 张图`)

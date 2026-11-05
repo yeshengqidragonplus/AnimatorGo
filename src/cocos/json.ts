@@ -1,4 +1,4 @@
-import { fileId } from './ids.ts'
+import { CLIP_TYPE, fileId, MESH_TYPE } from './ids.ts'
 
 /**
  * Cocos Creator 的资源 JSON(prefab / scene / anim 都是这一种):一个对象数组,`__type__` 是类名,
@@ -173,5 +173,67 @@ export function animation(doc: PrefabDoc, node: number, clips: readonly string[]
     playOnLoad,
     _clips: clips.map((uuid) => ({ __uuid__: uuid })),
     _defaultClip: defaultClip === null ? null : { __uuid__: defaultClip },
+  })
+}
+
+// ── AnimatorGo 的运行时组件(tools/cocos/runtime/)──
+
+/** 网格 / 遮罩共用的顶点来源:骨骼节点 + 逐顶点影响 + deform shape(布局见 AnimatorGoSkinning.ts) */
+export interface VertexSourceFields {
+  /** 骨骼节点在文档里的下标 */
+  readonly bones: readonly number[]
+  readonly counts: readonly number[]
+  /** [骨骼局部下标, x, y, 权重] × 影响 */
+  readonly influences: readonly number[]
+  /** shape 平铺(每个 2 × 影响数) */
+  readonly shapes: readonly number[]
+  readonly shapeCount: number
+}
+
+export interface MeshFields extends VertexSourceFields {
+  readonly spriteFrame: string
+  readonly color: readonly [number, number, number, number]
+  readonly srcBlend: number
+  readonly dstBlend: number
+  /** 区域相对的 (s 向右, t 向下) × 顶点 */
+  readonly uvs: readonly number[]
+  readonly indices: readonly number[]
+}
+
+/** `AnimatorGoMesh`(UIRenderer 子类,字段顺序先父类的再自己的)。`clips` 留空,导出器最后统一填 */
+export function meshRenderer(doc: PrefabDoc, node: number, f: MeshFields): number {
+  return doc.component(node, MESH_TYPE, {
+    _visFlags: 0,
+    _customMaterial: null,
+    _srcBlendFactor: f.srcBlend,
+    _dstBlendFactor: f.dstBlend,
+    _color: rgba(f.color[0], f.color[1], f.color[2], f.color[3]),
+    _spriteFrame: { __uuid__: f.spriteFrame },
+    bones: f.bones.map((b) => doc.ref(b)),
+    counts: [...f.counts],
+    influences: f.influences.map(r),
+    uvs: f.uvs.map(r),
+    indices: [...f.indices],
+    shapes: f.shapes.map(r),
+    shapeWeights: new Array<number>(f.shapeCount).fill(0),
+    clips: [],
+  })
+}
+
+export interface ClipFields extends VertexSourceFields {
+  readonly order: number
+  readonly endOrder: number
+}
+
+/** `AnimatorGoClip`:遮罩多边形 + 它在绘制顺序里的起止 */
+export function clipComponent(doc: PrefabDoc, node: number, f: ClipFields): number {
+  return doc.component(node, CLIP_TYPE, {
+    bones: f.bones.map((b) => doc.ref(b)),
+    counts: [...f.counts],
+    influences: f.influences.map(r),
+    shapes: f.shapes.map(r),
+    shapeWeights: new Array<number>(f.shapeCount).fill(0),
+    order: f.order,
+    endOrder: f.endOrder,
   })
 }
