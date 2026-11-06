@@ -187,8 +187,8 @@ def clip(name, duration, tracks, wrap=WRAP_LOOP):
 
 
 # ── 场景 ──
-def scene(name, build):
-    """build(doc, canvas_node) 往画布下加东西"""
+def scene(name, build, after=None):
+    """build(doc, canvas_node) 往画布下加东西;after(doc, canvas_node) 最后再挂点东西(采帧组件)"""
     doc = Doc()
     sid = uid(f'scene/{name}')
     doc.add({'__type__': 'cc.SceneAsset', '_name': name, '_objFlags': 0, '_native': '', 'scene': doc.ref(1), 'asyncLoadAssets': False})
@@ -202,6 +202,8 @@ def scene(name, build):
                    _aperture=19, _shutter=7, _iso=0, _screenScale=1, _visibility=1108344832, _targetTexture=None)
     doc.comp(canvas, 'cc.Canvas', _cameraComponent=doc.ref(cam), _alignCanvasWithScreen=True)
     build(doc, canvas)
+    if after:
+        after(doc, canvas)
     g = doc.add({'__type__': 'cc.SceneGlobals', 'ambient': None, 'shadows': None, '_skybox': None, 'fog': None})
     doc.objs[g]['ambient'] = doc.ref(doc.add({'__type__': 'cc.AmbientInfo', '_skyColorHDR': {'__type__': 'cc.Vec4', 'x': 0.2, 'y': 0.5, 'z': 0.8, 'w': 0.520833125}, '_skyIllumHDR': 20000, '_groundAlbedoHDR': {'__type__': 'cc.Vec4', 'x': 0.2, 'y': 0.2, 'z': 0.2, 'w': 1}, '_skyColor': {'__type__': 'cc.Vec4', 'x': 0.2, 'y': 0.5, 'z': 0.8, 'w': 0.520833125}, '_skyIllum': 20000, '_groundAlbedo': {'__type__': 'cc.Vec4', 'x': 0.2, 'y': 0.2, 'z': 0.2, 'w': 1}}))
     doc.objs[g]['shadows'] = doc.ref(doc.add({'__type__': 'cc.ShadowsInfo', '_enabled': False, '_type': 0, '_normal': vec3(0, 1, 0), '_distance': 0, '_planeBias': 1, '_shadowColor': color(0, 0, 0, 76), '_maxReceived': 4, '_size': vec2(1024, 1024)}))

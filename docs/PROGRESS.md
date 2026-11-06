@@ -345,9 +345,9 @@ Unity batchmode 自检 + `angry` 三套皮肤各渲两帧肉眼看(见下)。
 路线已定(2026-09-09,见 [DECISIONS.md](DECISIONS.md)):**Spine → Unity 先做正常动画,
 VAT(GPU 顶点动画贴图)是终局、以后做。** 下面按依赖顺序:
 
-1. **Cocos 的收尾**:原生平台(JSB)的 2D 批处理在 C++ 里,不调 JS 的 `fillBuffers`,`AnimatorGoMesh` 还没适配(只验过 Web);
-   像素级和 Unity 的渲染工具逐帧比;multiply / screen 的像素验证;多个角色重叠时 Sorting2D 全局排序会交错(不同 sorting layer
-   或 `cc.Mask` 隔开,待实测)。
+1. **Cocos 的收尾**:像素级和 Unity 的渲染工具逐帧比;multiply / screen 的像素验证;多个角色重叠时 Sorting2D 全局排序会交错
+   (不同 sorting layer 或 `cc.Mask` 隔开,待实测)。
+   ~~原生平台(JSB)的适配~~ 已做(2026-11-06),见下文
    ~~加权网格 / deform / 遮罩的脚本组件~~ 已做(2026-11-06),见下文
    ~~Cocos 原生节点 + 动画剪辑,等用户装好 Cocos Creator 再开始~~ 已开始(2026-11-03)
 2. `.skel` 里往返验不出的区域:path 约束里同类型字段的语义顺序(字节布局已由 99 个真实文件确认,
@@ -440,7 +440,11 @@ Spine 绘制顺序画。Cocos 2D 本身没有蒙皮,这是根上的缺口。三�
   组件关掉再开、节点 active 切换几何不坏。踩的坑:① 脚本的类 id 是 23 字符的压缩 uuid(前 5 个十六进制原样),按引擎 decodeUuid
   的 22 字符写法构建会报 Missing class;② 渲染器的顶点容量记在组件上,关掉再开 chunk 换了就越界,一屏尖刺 —— 改成按 chunk 算;
   ③ 浏览器面板藏着时 rAF 不走、引擎初始化都卡住,用 `probe.html` 把 rAF 换成 setTimeout;探针相机只清深度,鬼影骗了一小时
-- 没做的:原生平台(JSB)没适配;像素级和 Unity 比;multiply / screen 像素验证;多角色 Sorting2D 交错
+- 原生平台(JSB),当天补上:C++ 批处理不调 JS 的 `fillBuffers`,改成 `updateRenderData` 里直接写 chunk 的共享顶点缓冲和 `chunk.ib`、
+  标 `isVertexPositionInWorld`(引擎 MotionStreak 的路子),顶点色按顶点填(`_useVertexOpacity`,透明度取 `node._uiProps.opacity`)。
+  用编辑器自带的原生模拟器跑命令行构出的 Windows 包验:p1 + 五个样本 64 帧,Web / 原生逐像素一致(最大差 3 个灰阶)。
+  坑:模拟器 workdir 没 `config.json` 时 `waitForConnect` 未初始化,卡在等调试器,窗口「未响应」
+- 没做的:像素级和 Unity 比;multiply / screen 像素验证;多角色 Sorting2D 交错
 
 ### 2026-10-10 并行分支合入 main
 

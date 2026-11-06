@@ -5,8 +5,8 @@ import sys
 
 from PIL import Image
 
-R = 'C:/Users/zhe.huang/AppData/Local/Temp/agc/renders'  # cocos-collect 的 --dir
-OUT = os.path.dirname(os.path.abspath(__file__))
+R = os.environ.get('AGC_RENDERS', 'C:/Users/zhe.huang/AppData/Local/Temp/agc/renders')  # cocos-collect 的 --dir(或它下面的 jsb/ web/ 子目录)
+OUT = os.environ.get('AGC_SHEET_OUT', os.path.dirname(os.path.abspath(__file__)))
 
 
 def content_box(im):

@@ -1,4 +1,5 @@
 import { _decorator, CCFloat, CCInteger, Node, SpriteFrame, UIRenderer, type RenderData, type IAssembler } from 'cc'
+import { JSB } from 'cc/env'
 import { AnimatorGoClip } from './AnimatorGoClip'
 import {
   MAT_STRIDE, MAX_INDICES, MAX_VERTICES, clipCovers, clipMesh, combineShapes, createClipBuffers, frameUv, influenceCount, skinVertices,
@@ -18,10 +19,14 @@ const { ccclass, property, executeInEditMode, serializable } = _decorator
  *
  * 被遮罩(`clips` 里某个 AnimatorGoClip 正生效且按绘制顺序盖住了自己)时在 CPU 上裁三角形,和 Spine 的 SkeletonClipping 一样。
  *
- * 每帧的流程:`lateUpdate`(骨骼动画已经更新完)标脏 → 引擎调 assembler.updateRenderData 算顶点、按需扩缓冲 →
- * 批处理时 fillBuffers 把顶点写进 2D 顶点缓冲、索引追加到网格缓冲。
- *
- * ⚠️ 只在 Web / 小游戏这类 JS 管线上验证过;原生平台的 2D 批处理在 C++ 里,不调 JS 的 fillBuffers,还没适配。
+ * 每帧的流程:`lateUpdate`(骨骼动画已经更新完)标脏 → 引擎调 assembler.updateRenderData 算顶点、按需扩缓冲 → 顶点(世界坐标、
+ * 换算后的 uv、顶点色)写进 2D 顶点缓冲、索引进网格缓冲。最后一步两种管线不一样:
+ *   - Web / 小游戏:批处理遍历节点树时调 assembler.fillBuffers,那里写顶点、追加索引;
+ *   - 原生(JSB):2D 批处理在 C++ 里,不调 JS 的 fillBuffers。所以顶点在 updateRenderData 里就写进顶点缓冲(JS 和 C++ 共享同一块内存),
+ *     索引写进 chunk 自带的索引数组,C++ 每帧原样拷进网格缓冲。渲染数据标了 isVertexPositionInWorld,C++ 不再拿节点矩阵乘一遍
+ *     (引擎自己的 MotionStreak 就这么走);顶点色标成按顶点填充(_useVertexOpacity),C++ 也不按 color 整体覆盖。
+ *     索引数组比这一帧多出来的部分填成退化三角形(三个顶点同一个),什么都不画。
+ * 顶点色的透明度取节点树级联后的值(自己的 color.a × 各级 UIOpacity),引擎遍历节点树时算好放在 node._uiProps.opacity。
  */
 @ccclass('AnimatorGoMesh')
 @executeInEditMode
@@ -81,6 +86,12 @@ export class AnimatorGoMesh extends UIRenderer {
   private _sorting: { sortingOrder: number } | null = null
   private _warned = false
 
+  constructor() {
+    super()
+    // 顶点色由自己写(透明度含级联的 UIOpacity),引擎不要再按 color 整体填 —— 原生的 C++ 批处理只认这个开关
+    this._useVertexOpacity = true
+  }
+
   public onEnable(): void {
     super.onEnable()
     this._sorting = this.node.getComponent('cc.Sorting2D') as unknown as { sortingOrder: number } | null
@@ -110,6 +121,10 @@ export class AnimatorGoMesh extends UIRenderer {
     if (!this._renderData) {
       const rd = assembler.createData(this)
       rd.material = this.getRenderMaterial(0)
+      if (JSB) {
+        // 顶点已经是世界坐标,C++ 批处理不要再乘节点矩阵(createData 之后才有 drawInfo;关掉再开会重新 createData,这里会再走一遍)
+        rd.renderDrawInfo.setVertexPositionInWorld(true)
+      }
       this._markForUpdateRenderData()
       this._updateColor()
     }
@@ -160,12 +175,12 @@ export class AnimatorGoMesh extends UIRenderer {
       this._indexCount = out.indexCount
     }
     // 容量按 chunk 自己算,不另外记:组件关掉再开(destroyRenderData → createData)chunk 会换成 4 个顶点的新块,
-    // 记在组件上的容量就对不上了 —— 实测写出去的顶点越界丢掉、索引指到别的网格的顶点,一屏尖刺
+    // 记在组件上的容量就对不上了 —— 实测写出去的顶点越界丢掉、索引指到别的网格的顶点,一屏尖刺。
+    // rd.dataLength(引擎自己那份逐顶点对象)一直是 createData 给的 4 个,顶点不经过它,不跟着扩
     const capV = rd.chunk ? rd.chunk.vb.length / rd.floatStride : 0
     if (this._vertexCount > capV || this._indexCount > this._ib.length) {
       const newV = Math.min(MAX_VERTICES, Math.max(this._vertexCount, capV))
       const newI = Math.min(MAX_INDICES, Math.max(this._indexCount, this._ib.length))
-      rd.dataLength = newV
       rd.resize(newV, newI)
       this._ib = new Uint16Array(newI)
     }
@@ -191,10 +206,52 @@ export class AnimatorGoMesh extends UIRenderer {
   }
 }
 
-/** 顶点格式 vfmtPosUvColor:x y z u v r g b a,共 9 个 float */
+/**
+ * 把这一帧的顶点写进 chunk 的顶点缓冲(格式 vfmtPosUvColor:x y z u v r g b a,共 9 个 float),返回写了几个。
+ * chunk 装不下就不画多出来的(正常不会到这里,_compute 已经按需扩过)
+ */
+function writeVertices(mesh: AnimatorGoMesh, rd: RenderData, frame: SpriteFrame): number {
+  const chunk = rd.chunk
+  const vb = chunk.vb
+  const stride = rd.floatStride
+  const uvs = frame.uv
+  const color = mesh.color
+  const r = color.r / 255, g = color.g / 255, b = color.b / 255
+  // 级联透明度:自己的 color.a × 各级 UIOpacity,引擎遍历节点树时算好的(Web 在 fillBuffers 之前算,原生是上一帧 C++ 算的)
+  const a = mesh.node._uiProps.opacity
+  const pos = mesh._pos
+  const uv = mesh._uv
+  const z = mesh._z
+  const n = Math.min(mesh._vertexCount, Math.floor(vb.length / stride))
+  for (let i = 0, o = 0; i < n; i++, o += stride) {
+    vb[o] = pos[i * 2]
+    vb[o + 1] = pos[i * 2 + 1]
+    vb[o + 2] = z
+    frameUv(uv[i * 2], uv[i * 2 + 1], uvs, vb, o + 3)
+    vb[o + 5] = r
+    vb[o + 6] = g
+    vb[o + 7] = b
+    vb[o + 8] = a
+  }
+  return n
+}
+
+/** 原生:顶点写进共享的顶点缓冲,索引写进 chunk 自带的索引数组(C++ 每帧按 chunk 的索引容量原样拷走,多出来的填退化三角形) */
+function fillNative(mesh: AnimatorGoMesh, rd: RenderData, frame: SpriteFrame): void {
+  const n = writeVertices(mesh, rd, frame)
+  const chunk = rd.chunk
+  const ib = chunk.ib as Uint16Array
+  const idx = mesh._idx
+  const base = chunk.vertexOffset
+  const ic = n < mesh._vertexCount ? 0 : Math.min(mesh._indexCount, ib.length)
+  for (let k = 0; k < ic; k++) ib[k] = base + idx[k]
+  for (let k = ic; k < ib.length; k++) ib[k] = base
+}
+
 const assembler: IAssembler = {
   createData(comp: UIRenderer): RenderData {
     const rd = comp.requestRenderData()
+    // dataLength 只是让引擎把自己那份逐顶点对象和原生侧的共享结构建起来,顶点不经过它,后面也不跟着扩
     rd.dataLength = 4
     rd.resize(4, 6)
     return rd
@@ -206,6 +263,7 @@ const assembler: IAssembler = {
     const frame = mesh.spriteFrame
     if (!rd || !frame) return
     mesh._compute(rd)
+    if (JSB) fillNative(mesh, rd, frame)
     rd.updateRenderData(mesh, frame)
   },
 
@@ -216,26 +274,7 @@ const assembler: IAssembler = {
     const frame = mesh.spriteFrame
     if (!rd || !rd.chunk || !frame) return
     const chunk = rd.chunk
-    const vb = chunk.vb
-    const stride = rd.floatStride
-    const uvs = frame.uv
-    const color = mesh.color
-    const r = color.r / 255, g = color.g / 255, b = color.b / 255, a = color.a / 255
-    const pos = mesh._pos
-    const uv = mesh._uv
-    const z = mesh._z
-    // chunk 装不下就不画多出来的(正常不会到这里,_compute 已经按需扩过)
-    const n = Math.min(mesh._vertexCount, Math.floor(vb.length / stride))
-    for (let i = 0, o = 0; i < n; i++, o += stride) {
-      vb[o] = pos[i * 2]
-      vb[o + 1] = pos[i * 2 + 1]
-      vb[o + 2] = z
-      frameUv(uv[i * 2], uv[i * 2 + 1], uvs, vb, o + 3)
-      vb[o + 5] = r
-      vb[o + 6] = g
-      vb[o + 7] = b
-      vb[o + 8] = a
-    }
+    const n = writeVertices(mesh, rd, frame)
     const idx = mesh._idx
     const ib = mesh._indexBuffer()
     const ic = n < mesh._vertexCount ? 0 : Math.min(mesh._indexCount, ib.length)
@@ -245,6 +284,6 @@ const assembler: IAssembler = {
   },
 
   updateColor(): void {
-    // 颜色每帧随顶点一起写(fillBuffers),这里不用做
+    // 颜色每帧随顶点一起写(writeVertices),这里不用做
   },
 }

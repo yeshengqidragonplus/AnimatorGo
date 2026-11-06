@@ -168,7 +168,7 @@ Easter_card(遮罩 + deform + 绘制顺序)。查:setup 和每个关键帧 / 中
 
 探针工程 `C:/Users/zhe.huang/AppData/Local/Temp/agc/probe`(生成脚本在 `tools/cocos/probe/`:`cocos_probe.py` 建工程和基础探针场景,
 `cocos_view.py <名字>…` 把 `assets/export/<名字>/` 的 prefab 节点树嵌进一个带 Canvas 的场景 `view_<名字>`(不走 PrefabInstance,
-角色缩到 0.3 倍)并登记到 build.json,`sheet.py` 把收到的帧拼成对照图):`pnpm cocos … --out <probe>/assets/export`,
+角色缩到 0.3 倍)、挂上采帧组件、按参数顺序串成一条链(也认 `p1`)并登记到 build*.json,`sheet.py` 把收到的帧拼成对照图):`pnpm cocos … --out <probe>/assets/export`,
 `CocosCreator.exe --project … --build "configPath=…/build.json"` 构建 web-desktop(约 25 秒),`.claude/launch.json` 的 `cocos-probe`
 起静态服务、`cocos-collect`(`tools/cocos/collect.mjs`)在 8082 收帧。
 
@@ -188,6 +188,18 @@ fetch('http://127.0.0.1:8082/save?name=x.png', { method: 'POST', body })
 2026-11-06 脚本组件:Easter_card(41 个网格 + 14 个被遮的图片部件 + 1 个遮罩)、customer_1(加权网格 deform,闭眼看得见)、
 MX2_cat 各两条动画四个时刻,网格、deform、遮罩都对;组件关掉再开、节点 active 切一下再截,几何不坏;每个角色 1 个 draw call
 (multiply 混合的 slot 要单独一批,Easter_card 是 3 个)。像素级和 Unity 的渲染工具逐帧比还没做(采集端有了,渲染工具还没写)。
+
+**原生(JSB)也能在本机验,不用装 Visual Studio**:编辑器自带编好的原生模拟器
+`resources/resources/3d/engine/native/simulator/Release/SimulatorApp-Win32.exe`(就是 JSB 运行时,C++ 批处理和真机同一份)。
+`build-windows.json`(`platform: windows`,`includeModules` 去掉 `gfx-*`)命令行构建:没有 VS 时 cmake 那步报错、退出码 34,
+但 `build/windows/data/`(`main.js`、`src/`、`assets/`、`jsb-adapter/`)已经齐了,模拟器直接跑它:
+`SimulatorApp-Win32.exe -workdir <…>/build/windows/data -entry main.js -resolution 960x640 -write-debug-log <日志路径>`。
+⚠️ **workdir 里要放一份 `config.json`**(拷 `native/tools/simulator/config.json`):模拟器找不到它时 `waitForConnect` 没初始化,
+实测卡在等调试器连接 —— 窗口「未响应」、CPU 时间 0、什么都不画。采帧两边同一套:`tools/cocos/probe/AgcCapture.ts`(`cocos_view.py`
+拷进工程、挂在每个场景的 Canvas 上)把相机渲到 RenderTexture,每条剪辑按四个时刻定格后 `readPixels` 把裸像素 POST 给 `collect.mjs`
+(它编成 PNG;GL 读出来是从下往上的,`--flip-web` / `--flip-jsb` 默认都翻),场景按 `next` 串起来,最后发 `all_done.txt`。
+`sheet.py` 认 `AGC_RENDERS` / `AGC_SHEET_OUT` 两个环境变量,分别对 `renders/web` 和 `renders/jsb` 拼表。
+2026-11-06:p1(Sprite 探针)+ 五个样本共 64 帧,Web 与原生逐像素比,最大差 2~3 个灰阶(纹理采样舍入),没有一个像素差过 24。
 
 ## 10. 转不过去的(都会报出来)
 
@@ -215,13 +227,18 @@ Spine 曲线,混出来 `(1−p)·δₖ + p·δₖ₊₁` 正是 Spine 的插值�
 **渲染器**(`AnimatorGoMesh.ts`,`UIRenderer` 子类 + 自己的 assembler):
 
 - 每帧 `lateUpdate` 标脏(骨骼动画在 lateUpdate 之前更新完;引擎只重算标了脏的渲染器),引擎在 `updateAllDirtyRenderers` 里调
-  assembler 的 `updateRenderData` → 蒙皮、(被遮就)裁剪、按需扩 chunk;批处理 `walk` 时 `fillBuffers` 把顶点写进 chunk 的
+  assembler 的 `updateRenderData` → 蒙皮、(被遮就)裁剪、按需扩 chunk;Web 上批处理 `walk` 时 `fillBuffers` 把顶点写进 chunk 的
   顶点缓冲(x y z u v r g b a,世界坐标,和 Sprite 一样)、索引用 `chunk.vertexAccessor.appendIndices` 追加
 - 材质就是内置的 `ui-sprite-material`,`color` 和混合因子从 UIRenderer 继承,prefab 里的字段和 Sprite 同名(`_color`、`_srcBlendFactor`…)
   —— 所以和 Sprite **同一批**:同一张图集的图片部件和网格一个 draw call
 - ⚠️ **容量按 chunk 自己算,不能记在组件上**:组件关掉再开,`destroyRenderData → createData` 会换成 4 个顶点的新 chunk,
   记在组件上的容量就对不上了 —— 写出去的顶点越界丢掉、索引指到别的网格的顶点,一屏尖刺(2026-11-06 实测中招)
-- ⚠️ 只在 Web / 小游戏这类 JS 管线上验证过。原生平台的 2D 批处理在 C++ 里,不调 JS 的 `fillBuffers`,还没适配
+- **原生平台(JSB)走另一条路**:C++ 的 `Batcher2d` 自己遍历节点树,不调 JS 的 `fillBuffers`,只用 `RenderData` 同步过去的共享内存 ——
+  chunk 的顶点缓冲(JS 写、C++ 直接用)和 chunk 自带的索引数组(`chunk.ib`,C++ 每帧按 `ibCount` 原样拷进网格缓冲)。所以 JSB 下顶点在
+  `updateRenderData` 里就写进 `chunk.vb`、索引写进 `chunk.ib`(容量多出来的部分填成退化三角形);渲染数据标 `setVertexPositionInWorld(true)`
+  让 C++ 不再拿节点矩阵乘一遍(引擎自己的 MotionStreak 就这么做,`native/cocos/2d/renderer/Batcher2d.cpp` 的 `handleComponentDraw`);
+  `_useVertexOpacity = true` 让 C++ 不按 `color` 整体覆盖顶点色(两个管线都这样,透明度自己取 `node._uiProps.opacity`,级联的 UIOpacity
+  就带上了)。2026-11-06 在原生模拟器里验过(第 9 节),和 Web 逐帧像素一致
 
 **遮罩**(`AnimatorGoClip.ts`,普通 Component):多边形同样的顶点表达(加权、deform 都行),每帧算成世界坐标再耳切三角化;
 `order` / `endOrder` 是遮罩 slot 和 endSlot 在绘制顺序里的位置(绘制顺序动画给它们写阶梯轨道),生效 = 节点激活(换图时间轴驱动)。

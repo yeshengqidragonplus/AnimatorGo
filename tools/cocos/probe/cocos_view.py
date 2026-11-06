@@ -1,18 +1,44 @@
-﻿"""把导出的 prefab 嵌进探针工程的场景里看(不走 PrefabInstance,直接把节点树搬进场景)。
+﻿"""把导出的 prefab 嵌进探针工程的场景里看(不走 PrefabInstance,直接把节点树搬进场景),并挂上采帧组件。
 
-用法:python cocos_view.py <export 目录下的骨架名>…
+用法:python cocos_view.py <名字>…    名字是 export 目录下的骨架名,或 p1(探针自己的 Sprite 场景)
   - 读 <probe>/assets/export/<名字>/<名字>.prefab
   - 写 <probe>/assets/view_<名字>.scene(Canvas + 相机 + 这棵节点树,角色缩到 0.3 倍好看全貌)
-  - build.json / build-legacy.json 的 scenes 加上这些场景,startScene 指到第一个
+  - 每个场景的 Canvas 挂 AgcCapture(tools/cocos/probe/AgcCapture.ts,拷进工程):定格采帧、POST 给 collect.mjs,
+    然后跳到参数里的下一个场景,最后一个发 all_done 标记
+  - build*.json 的 scenes 加上这些场景,startScene 指到第一个
 """
 import json
 import os
+import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cocos_probe import ROOT, fid, scene, write_json  # noqa: E402
+from cocos_probe import ROOT, fid, meta, p1, scene, uid, write_json  # noqa: E402
 
 SCALE = 0.3
+HERE = os.path.dirname(os.path.abspath(__file__))
+BASE64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+CAPTURE_UUID = uid('script/AgcCapture')
+
+
+def compress_uuid(u):
+    """脚本类在 prefab / 场景里的 __type__:uuid 的 23 字符压缩形式(同 src/cocos/ids.ts 的 compressUuid)"""
+    h = u.replace('-', '')
+    out = h[:5]
+    for i in range(5, 32, 3):
+        v = int(h[i:i + 3], 16)
+        out += BASE64[v >> 6] + BASE64[v & 63]
+    return out
+
+
+def install_capture():
+    dst = f'{ROOT}/assets/AgcCapture.ts'
+    shutil.copyfile(f'{HERE}/AgcCapture.ts', dst)
+    meta(dst, 'typescript', CAPTURE_UUID, ver='4.0.24')
+
+
+def capture(doc, canvas, tag, nxt):
+    doc.comp(canvas, compress_uuid(CAPTURE_UUID), tag=tag, steps=4, next=nxt, server='http://127.0.0.1:8082')
 
 
 def embed(doc, canvas, name):
@@ -53,12 +79,20 @@ def embed(doc, canvas, name):
 
 
 def main(names):
+    install_capture()
     scenes = []
-    for n in names:
-        sid = scene(f'view_{n}', lambda doc, canvas, n=n: embed(doc, canvas, n))
-        scenes.append({'url': f'db://assets/view_{n}.scene', 'uuid': sid})
-        print('scene', f'view_{n}', sid)
-    for fname in ('build.json', 'build-legacy.json'):
+    for k, n in enumerate(names):
+        sname = n if n == 'p1' else f'view_{n}'
+        nxt = names[k + 1] if k + 1 < len(names) else ''
+        nxt = nxt if nxt in ('', 'p1') else f'view_{nxt}'
+        after = lambda doc, canvas, n=n, nxt=nxt: capture(doc, canvas, n, nxt)
+        if n == 'p1':
+            sid = scene('p1', p1, after)
+        else:
+            sid = scene(sname, lambda doc, canvas, n=n: embed(doc, canvas, n), after)
+        scenes.append({'url': f'db://assets/{sname}.scene', 'uuid': sid})
+        print('scene', sname, sid, '→', nxt or '(end)')
+    for fname in ('build.json', 'build-legacy.json', 'build-windows.json'):
         p = f'{ROOT}/{fname}'
         if not os.path.exists(p):
             continue
